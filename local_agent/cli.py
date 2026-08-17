@@ -34,8 +34,19 @@ def _print_report(report) -> None:
     if report.plan:
         for index, step in enumerate(report.plan.steps, 1):
             print(f"  {index}. {step}")
+    if report.impact:
+        print("\nImpact Analysis:")
+        print(f"  Summary: {report.impact.summary}")
+        sorted_targets = sorted(report.impact.targets, key=lambda t: (-t.confidence, t.path))
+        for target in sorted_targets:
+            if target.confidence > 0.3 and target.role != "unrelated":
+                print(f"  - {target.path} ({target.role}, {target.risk} risk, {target.confidence:.0%} confidence)")
+                if target.reason:
+                    print(f"    Reason: {target.reason}")
     print(f"\nIterations: {report.iterations}")
     print(f"Changed files: {', '.join(sorted(set(report.changed_files))) or 'none'}")
+    if report.dry_run or report.approval_required:
+        print(f"Proposed diff:\n{report.proposed_diff or '(no changes proposed)'}")
     for result in report.executions:
         status = "PASS" if result.succeeded else "FAIL"
         print(f"{status}: {result.command} (exit {result.exit_code}, {result.duration_seconds:.2f}s)")
@@ -52,6 +63,16 @@ def _print_report(report) -> None:
     print(f"Result: {'COMPLETE' if report.completed else 'INCOMPLETE'}")
 
 
+def _approval_prompt(changes) -> bool:
+    added = sum(line.startswith("+") and not line.startswith("+++") for change in changes for line in change.diff.splitlines())
+    removed = sum(line.startswith("-") and not line.startswith("---") for change in changes for line in change.diff.splitlines())
+    print(f"\nAI proposes:\n{len(changes)} files modified/created\n{added} lines added\n{removed} lines removed")
+    try:
+        return input("Apply these changes? [y/N] ").strip().lower() in {"y", "yes"}
+    except EOFError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -61,7 +82,10 @@ def main(argv: list[str] | None = None) -> int:
             _print_context(Orchestrator(config, MockProvider()).analyze())
             return 0
         provider = build_provider(config)
-        report = Orchestrator(config, provider).run(args.task, progress=print)
+        print(f"Provider: {config.provider}")
+        print(f"Model: {config.model}")
+        print(f"Project: {config.project}")
+        report = Orchestrator(config, provider).run(args.task, progress=print, approval_callback=_approval_prompt)
         _print_report(report)
         return 0 if report.completed else 2
     except (ValueError, ProviderError, OSError) as exc:

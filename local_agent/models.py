@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import asdict, dataclass, field
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,51 @@ class ExecutionResult:
 
 
 @dataclass
+class RepositoryFile:
+    path: str
+    extension: str
+    size_bytes: int | None
+    line_count: int | None
+    language: str
+    is_test: bool
+    is_configuration: bool
+    is_documentation: bool
+    is_generated: bool
+    is_entry_point: bool
+
+
+@dataclass(frozen=True)
+class FileRelationship:
+    source: str
+    target: str
+    kind: str
+
+
+@dataclass
+class RepositoryMap:
+    root: str
+    project_metadata: dict[str, Any]
+    languages: list[str]
+    frameworks: list[str]
+    files: list[RepositoryFile]
+    directories: list[str]
+    tests: list[str]
+    configuration_files: list[str]
+    entry_points: list[str]
+    relationships: list[FileRelationship]
+    ignored_paths: list[dict[str, str]]
+    protected_paths: list[dict[str, str]]
+
+    def compact(self) -> dict[str, Any]:
+        return {
+            "root": self.root, "project_metadata": self.project_metadata, "languages": self.languages,
+            "frameworks": self.frameworks, "file_count": len(self.files), "directory_count": len(self.directories),
+            "test_file_count": len(self.tests), "entry_point_count": len(self.entry_points),
+            "relationship_count": len(self.relationships),
+        }
+
+
+@dataclass
 class ProjectContext:
     root: str
     directories: list[str] = field(default_factory=list)
@@ -43,6 +88,7 @@ class ProjectContext:
     metadata: dict[str, Any] = field(default_factory=dict)
     validation_commands: list[CommandSpec] = field(default_factory=list)
     git_status: str = ""
+    repository_map: RepositoryMap | None = None
 
     def compact(self) -> dict[str, Any]:
         return {
@@ -59,6 +105,7 @@ class ProjectContext:
             "metadata": self.metadata,
             "validation_commands": [c.display() for c in self.validation_commands],
             "git_status": self.git_status,
+            "repository_map": self.repository_map.compact() if self.repository_map else None,
         }
 
 
@@ -89,6 +136,24 @@ class FailureAnalysis:
 
 
 @dataclass
+class ChangeTarget:
+    path: str
+    role: Literal["create", "modify", "test", "architecture", "unrelated"]
+    confidence: float
+    reason: str
+    relationship: str | None = None
+    risk: Literal["low", "medium", "high"] = "low"
+
+
+@dataclass
+class ChangeImpact:
+    summary: str
+    targets: list[ChangeTarget]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"summary": self.summary, "targets": [asdict(t) for t in self.targets]}
+
+@dataclass
 class ReviewResult:
     verdict: str
     summary: str
@@ -105,3 +170,4 @@ class RunReport:
     changed_files: list[str] = field(default_factory=list)
     iterations: int = 0
     completed: bool = False
+    impact: ChangeImpact | None = None

@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 agent = "local_agent.cli:main"
+agent-ui = "local_agent.ui:main"
 
 [tool.setuptools.packages.find]
 include = ["local_agent*"]

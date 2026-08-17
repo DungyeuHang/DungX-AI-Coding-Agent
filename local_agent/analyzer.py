@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import tomllib
 from pathlib import Path
 
 from .git import GitIntegration
 from .models import CommandSpec, ProjectContext
+from .repository import RepositoryIntelligence
 
 
 IGNORED_DIRECTORIES = {
@@ -30,28 +30,7 @@ class RepositoryAnalyzer:
         self.git = GitIntegration(self.root)
 
     def analyze(self) -> ProjectContext:
-        context = ProjectContext(root=str(self.root))
-        files: list[Path] = []
-        for current, directories, names in os.walk(self.root):
-            directories[:] = sorted(name for name in directories if name not in IGNORED_DIRECTORIES)
-            current_path = Path(current)
-            if current_path != self.root:
-                context.directories.append(current_path.relative_to(self.root).as_posix())
-            for name in sorted(names):
-                if name in SECRET_NAMES or name.lower() in {item.lower() for item in SECRET_NAMES}:
-                    continue
-                path = current_path / name
-                relative = path.relative_to(self.root).as_posix()
-                files.append(path)
-                self._classify(relative, context)
-
-        context.directories = sorted(context.directories)
-        context.git_status = self.git.status()
-        context.metadata.update(self._detect_metadata(files))
-        context.metadata.update({"is_git_repository": self.git.is_repository(), "git_branch": self.git.branch(), "git_log": self.git.log()})
-        context.metadata["file_previews"] = self._file_previews(context)
-        context.validation_commands = self._validation_commands(context)
-        return context
+        return RepositoryIntelligence(self.root).scan()
 
     def _file_previews(self, context: ProjectContext) -> dict[str, str]:
         previews: dict[str, str] = {}
