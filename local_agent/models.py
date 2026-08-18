@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import datetime
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any, Literal, Self
 
 
@@ -201,6 +203,8 @@ class FailureAnalysis:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
+        # Make a copy to avoid mutating the caller's dict
+        data = dict(data)
         data["diagnostic_evidence"] = [ExecutionResult.from_dict(e) for e in data.get("diagnostic_evidence", [])]
         return cls(**data)
 
@@ -276,12 +280,12 @@ class Checkpoint:
     subtask_id: str
     timestamp: datetime.datetime
     current_state_description: str
-    files_changed: list[str]
-    repository_diff: str
-    validation_state: dict[str, Any]
-    last_provider_result: dict[str, Any] | None
-    next_recommended_action: str
-    continuation_context: dict[str, Any]
+    files_changed: list[str] = field(default_factory=list)
+    repository_diff: str = ""
+    validation_state: dict[str, Any] = field(default_factory=dict)
+    last_provider_result: dict[str, Any] | None = None
+    next_recommended_action: str = ""
+    continuation_context: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -296,8 +300,10 @@ class Checkpoint:
 @dataclass
 class Subtask:
     subtask_id: str
-    description: str
-    status: SubtaskStatus
+    description: str = ""
+    status: SubtaskStatus = SubtaskStatus.PENDING
+    created_at: datetime.datetime | None = None
+    updated_at: datetime.datetime | None = None
     dependencies: list[str] = field(default_factory=list)
     attempts: int = 0
     started_at: datetime.datetime | None = None
@@ -312,6 +318,10 @@ class Subtask:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["status"] = self.status.value
+        if self.created_at:
+            data["created_at"] = self.created_at.isoformat()
+        if self.updated_at:
+            data["updated_at"] = self.updated_at.isoformat()
         if self.started_at:
             data["started_at"] = self.started_at.isoformat()
         if self.completed_at:
@@ -321,6 +331,10 @@ class Subtask:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
         data["status"] = SubtaskStatus(data["status"])
+        if data.get("created_at"):
+            data["created_at"] = datetime.datetime.fromisoformat(data["created_at"])
+        if data.get("updated_at"):
+            data["updated_at"] = datetime.datetime.fromisoformat(data["updated_at"])
         if data.get("started_at"):
             data["started_at"] = datetime.datetime.fromisoformat(data["started_at"])
         if data.get("completed_at"):
@@ -358,6 +372,11 @@ class SubtaskModification:
 class AddSubtask:
     subtask: Subtask
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        # Required for PlanProposal deserialization
+        return cls(subtask=Subtask.from_dict(data["subtask"]))
+
 @dataclass
 class PlanProposal:
     reason: str
@@ -389,6 +408,7 @@ class Task:
     latest_checkpoint_id: str | None = None
     retry_info: dict[str, Any] = field(default_factory=dict)
     provider_execution_history: list[ProviderMetric] = field(default_factory=list)
+    outcome: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

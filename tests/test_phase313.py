@@ -13,7 +13,7 @@ from local_agent.models import (
     TaskStatus, ValidationPlan,
 )
 from local_agent.orchestrator import Orchestrator
-from local_agent.providers import AIProvider, MockProvider
+from local_agent.providers import AIProvider, MockProvider, QuotaExceededError
 from local_agent.storage import JsonFileStorage
 
 
@@ -68,7 +68,7 @@ class Phase313Tests(unittest.TestCase):
         # Arrange
         primary_fail = ExecutionResult("primary", 1, stderr="primary fail")
         secondary_success = ExecutionResult("secondary", 0, stdout="secondary ok")
-        MockCommandRunner.return_value.run.side_effect = [primary_fail, secondary_success]
+        MockCommandRunner.return_value.run.side_effect = [primary_fail, secondary_success, primary_fail]
 
         secondary_cmd = CommandSpec("secondary_cmd", ("npm", "run", "test:secondary"))
         validation_plan = ValidationPlan(commands=[], primary_commands=[CommandSpec("primary_cmd", ("npm", "test"))], secondary_commands=[secondary_cmd], skipped_commands=[], reasons=[], risk_level="low")
@@ -86,7 +86,7 @@ class Phase313Tests(unittest.TestCase):
 
         # Assert
         self.assertEqual(len(provider.select_diagnostic_command_calls), 1)
-        self.assertEqual(MockCommandRunner.return_value.run.call_count, 2) # Primary + Secondary
+        self.assertEqual(MockCommandRunner.return_value.run.call_count, 3) # Primary + Secondary + Primary (iteration 2)
         self.assertEqual(MockCommandRunner.return_value.run.call_args_list[1].args[0], secondary_cmd)
         
         # Check that evidence was passed to the repair call
@@ -98,37 +98,30 @@ class Phase313Tests(unittest.TestCase):
 
     def test_secondary_validation_is_bounded_by_config(self):
         # Arrange
-        MockCommandRunner.return_value.run.side_effect = [
-            ExecutionResult("primary", 1), # Primary fail
-            ExecutionResult("secondary1", 0), # Diagnostic 1
-            ExecutionResult("secondary2", 0), # Should not be called
-        ]
-
         cmd1 = CommandSpec("cmd1", ("npm", "run", "diag1"))
         cmd2 = CommandSpec("cmd2", ("npm", "run", "diag2"))
         validation_plan = ValidationPlan(commands=[], primary_commands=[CommandSpec("primary", ("npm", "test"))], secondary_commands=[cmd1, cmd2], skipped_commands=[], reasons=[], risk_level="low")
         
         provider = MockProviderWithDiagnostics(command_to_select=cmd1)
         config = self._get_config(max_iterations=2, max_secondary_validations_per_iteration=1) # Set budget to 1
-        orchestrator = Orchestrator(config, provider, self.storage)
 
-        with mock.patch.object(orchestrator, "validation_intelligence") as mock_vi, \
-             mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
-            MockCommandRunner.return_value.run.side_effect = [ExecutionResult("primary", 1), ExecutionResult("secondary1", 0)]
-            mock_vi.select_commands.return_value = validation_plan
+        with mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
+            orchestrator = Orchestrator(config, provider, self.storage)
+            with mock.patch.object(orchestrator, "validation_intelligence") as mock_vi:
+                MockCommandRunner.return_value.run.side_effect = [ExecutionResult("primary", 1), ExecutionResult("secondary1", 0), ExecutionResult("primary", 1)]
+                mock_vi.select_commands.return_value = validation_plan
 
-            # Act
-            task = self._create_task_with_plan()
-            orchestrator.run(task, "sub1")
+                # Act
+                task = self._create_task_with_plan()
+                orchestrator.run(task, "sub1")
 
-        # Assert
-        self.assertEqual(MockCommandRunner.return_value.run.call_count, 2) # Primary + 1 Diagnostic
-        self.assertEqual(len(provider.select_diagnostic_command_calls), 1) # Only asked once
+            # Assert
+            self.assertEqual(MockCommandRunner.return_value.run.call_count, 3) # Primary (iter 1) + Diagnostic (iter 1) + Primary (iter 2)
+            self.assertEqual(len(provider.select_diagnostic_command_calls), 1) # Only asked once because budget is exhausted
 
     def test_provider_hallucinated_command_is_rejected(self):
         # Arrange
         primary_fail = ExecutionResult("primary", 1)
-        MockCommandRunner.return_value.run.return_value = primary_fail
 
         secondary_cmd = CommandSpec("secondary_cmd", ("npm", "run", "test:secondary"))
         hallucinated_cmd = CommandSpec("hallucinated", ("rm", "-rf", "/"))
@@ -136,20 +129,20 @@ class Phase313Tests(unittest.TestCase):
         
         provider = MockProviderWithDiagnostics(command_to_select=hallucinated_cmd)
         config = self._get_config(max_iterations=2)
-        orchestrator = Orchestrator(config, provider, self.storage)
 
-        with mock.patch.object(orchestrator, "validation_intelligence") as mock_vi, \
-             mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
-            MockCommandRunner.return_value.run.return_value = primary_fail
-            mock_vi.select_commands.return_value = validation_plan
+        with mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
+            orchestrator = Orchestrator(config, provider, self.storage)
+            with mock.patch.object(orchestrator, "validation_intelligence") as mock_vi:
+                MockCommandRunner.return_value.run.return_value = primary_fail
+                mock_vi.select_commands.return_value = validation_plan
 
-            # Act
-            task = self._create_task_with_plan()
-            orchestrator.run(task, "sub1")
+                # Act
+                task = self._create_task_with_plan()
+                orchestrator.run(task, "sub1")
 
         # Assert
-        self.assertEqual(MockCommandRunner.return_value.run.call_count, 1) # Only primary validation runs
-        self.assertEqual(len(provider.select_diagnostic_command_calls), 1)
+        self.assertEqual(MockCommandRunner.return_value.run.call_count, 2) # Primary validation in both iterations
+        self.assertEqual(len(provider.select_diagnostic_command_calls), 2) # Asked in both iterations, both rejected
 
     def test_output_is_truncated(self):
         # Arrange
@@ -162,16 +155,16 @@ class Phase313Tests(unittest.TestCase):
         
         provider = MockProviderWithDiagnostics(command_to_select=secondary_cmd, fail_repair=True)
         config = self._get_config(max_iterations=2, max_diagnostic_output_bytes=100)
-        orchestrator = Orchestrator(config, provider, self.storage)
 
-        with mock.patch.object(orchestrator, "validation_intelligence") as mock_vi, \
-             mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
-            MockCommandRunner.return_value.run.side_effect = [primary_fail, secondary_result]
-            mock_vi.select_commands.return_value = validation_plan
+        with mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
+            orchestrator = Orchestrator(config, provider, self.storage)
+            with mock.patch.object(orchestrator, "validation_intelligence") as mock_vi:
+                MockCommandRunner.return_value.run.side_effect = [primary_fail, secondary_result, primary_fail]
+                mock_vi.select_commands.return_value = validation_plan
 
-            # Act
-            task = self._create_task_with_plan()
-            orchestrator.run(task, "sub1")
+                # Act
+                task = self._create_task_with_plan()
+                orchestrator.run(task, "sub1")
 
         # Assert
         repair_call = provider.generate_code_calls[1]
@@ -191,16 +184,16 @@ class Phase313Tests(unittest.TestCase):
         # Run 1: Fail primary, run diagnostic, then provider fails with QuotaExceededError
         provider1 = MockProviderWithDiagnostics(command_to_select=secondary_cmd)
         config = self._get_config(max_iterations=2)
-        orchestrator1 = Orchestrator(config, provider1, self.storage)
-        with mock.patch.object(orchestrator1, "validation_intelligence") as mock_vi, \
-             mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
-            mock_vi.select_commands.return_value = validation_plan
-            MockCommandRunner.return_value.run.side_effect = [primary_fail, secondary_success]
-            # The second call to generate_code (the repair) will fail
-            provider1.generate_code = mock.Mock(side_effect=[[FileOperation("modify", "src/app.py")], QuotaExceededError("quota fail")])
+        with mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
+            orchestrator1 = Orchestrator(config, provider1, self.storage)
+            with mock.patch.object(orchestrator1, "validation_intelligence") as mock_vi:
+                mock_vi.select_commands.return_value = validation_plan
+                MockCommandRunner.return_value.run.side_effect = [primary_fail, secondary_success]
+                # The second call to generate_code (the repair) will fail
+                provider1.generate_code = mock.Mock(side_effect=[[FileOperation("modify", "src/app.py", content="# initial code")], QuotaExceededError("quota fail")])
 
-            task = self._create_task_with_plan()
-            orchestrator1.run(task, "sub1")
+                task = self._create_task_with_plan()
+                orchestrator1.run(task, "sub1")
 
         # Assert after Run 1
         task_after_pause = self.storage.load_task(task.task_id)
@@ -213,14 +206,16 @@ class Phase313Tests(unittest.TestCase):
 
         # Run 2: Resume. The diagnostic should not run again.
         provider2 = MockProviderWithDiagnostics(command_to_select=secondary_cmd)
-        orchestrator2 = Orchestrator(config, provider2, self.storage)
-        with mock.patch.object(orchestrator2, "validation_intelligence") as mock_vi, \
-             mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
-            mock_vi.select_commands.return_value = validation_plan
-            # On resume, only the primary validation of the *new* patch runs.
-            MockCommandRunner.return_value.run.return_value = ExecutionResult("primary", 0)
+        with mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
+            orchestrator2 = Orchestrator(config, provider2, self.storage)
+            with mock.patch.object(orchestrator2, "validation_intelligence") as mock_vi, \
+                 mock.patch.object(orchestrator2, "reviewer") as mock_reviewer:
+                mock_vi.select_commands.return_value = validation_plan
+                mock_reviewer.review.return_value = ReviewResult("APPROVED", "All good", [])
+                # On resume, only the primary validation of the *new* patch runs.
+                MockCommandRunner.return_value.run.return_value = ExecutionResult("primary", 0)
 
-            orchestrator2.run(task_after_pause, "sub1")
+                orchestrator2.run(task_after_pause, "sub1")
 
         # Assert after Run 2
         # select_diagnostic_command should not have been called because the loop was resumed *after* the diagnostic phase

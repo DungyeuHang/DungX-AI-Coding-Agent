@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import datetime
 import logging
 import shlex
+import uuid
 from pathlib import Path
 
 from .coding_agent import CodingAgent, PatchValidationError, UnsafeModificationError
@@ -12,10 +14,12 @@ from .failure import FailureAnalyzer
 from .filesystem import ProjectFilesystem
 from .git import GitIntegration
 from .impact import ChangeImpactAnalyzer
-from .models import CommandSpec, FailureAnalysis, RunReport
+from .models import ChangeImpact, Checkpoint, CommandSpec, ExecutionResult, FailureAnalysis, Plan, PlanProposal, ProjectContext, RunReport, Subtask, SubtaskStatus, TaskStatus, ValidationPlan
 from .planner import Planner
-from .providers import AIProvider, ProviderError
+from .providers import AIProvider, ProviderError, QuotaExceededError, RateLimitError
+from .repository import RepositoryIntelligence
 from .reviewer import Reviewer
+from .validation import ValidationIntelligence
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +36,8 @@ class Orchestrator:
         self.reviewer = Reviewer(provider)
         self.impact_analyzer = ChangeImpactAnalyzer(config.project)
         self.runner = CommandRunner(config.project, config.command_timeout_seconds)
+        self.validation_intelligence = ValidationIntelligence(config.project)
+        self.storage = storage
 
     def analyze(self):
         return self.analyzer.analyze()
@@ -54,19 +60,22 @@ class Orchestrator:
             max_file_chars=self.config.max_context_file_bytes,
             max_tokens=self.config.max_context_tokens,
             dependency_depth=self.config.dependency_depth,
-        ).select(task, context)
+        ).select(task.objective, context)
 
         emit("[2.5/7] Analyzing change impact...")
-        impact = self.impact_analyzer.analyze(task, context)
+        impact = self.impact_analyzer.analyze(task.objective, context)
         context.metadata["change_impact"] = impact.to_dict()
 
         report = RunReport(project=context)
         report.impact = impact
+        current_subtask = next((s for s in (task.plan.subtasks if task.plan else []) if s.subtask_id == subtask_id), None)
+        task.current_subtask_id = subtask_id
+
         emit("[3/7] Creating implementation plan...")
         try:
-            plan = self.planner.create_plan(task, context)
+            plan = self.planner.create_subtask_plan(current_subtask, context)
         except ProviderError as exc:
-            self._record_provider_failure(report, exc, "planning provider request failed")
+            self._record_provider_failure(task, current_subtask, exc, "planning provider request failed")
             emit(f"[3/7] Provider stopped the run: {report.outcome}")
             return report
         report.plan = plan
@@ -75,146 +84,190 @@ class Orchestrator:
         failure: FailureAnalysis | None = None
         review = None
 
-        for iteration in range(1, self.config.max_iterations + 1):
-            report.iterations = iteration
-            emit("[4/7] Implementing changes..." if iteration == 1 else f"[5/7] Applying repair for iteration {iteration}...")
+        # If resuming from a paused state, reset status to allow completion
+        if task.status == TaskStatus.PAUSED and current_subtask is not None and current_subtask.latest_checkpoint_id:
+            task.status = TaskStatus.PENDING
+            current_subtask.status = SubtaskStatus.PENDING
+            current_subtask.completed_at = None
+
+        # Phase 3.14: Resume diagnostic / secondary-validation state from the latest checkpoint, if present.
+        current_diagnostic_evidence: list[ExecutionResult] = []
+        executed_diagnostic_names_this_iteration: list[str] = []
+        if current_subtask is not None and current_subtask.latest_checkpoint_id:
             try:
-                operations = self.provider.generate_code(task, plan, context, failure=failure, review=review)
-            except ProviderError as exc:
-                self._record_provider_failure(report, exc, "implementation provider request failed")
-                emit(f"[4/7] Provider stopped the run: {report.outcome}")
-                break
-            try:
-                prepared = coding_agent.prepare(operations, plan)
-            except PatchValidationError as exc:
-                failure = FailureAnalysis(
-                    "AI-generated patch failed strict validation",
-                    [exc.path],
-                    "Regenerate a patch that matches the original target file exactly.",
-                    category="PATCH_VALIDATION",
-                    details={
-                        "path": exc.path,
-                        "original_file": exc.original,
-                        "generated_patch": exc.patch,
-                        "validation_error": exc.reason,
-                    },
+                checkpoint = self.storage.load_checkpoint(current_subtask.latest_checkpoint_id)
+                current_diagnostic_evidence = [
+                    ExecutionResult.from_dict(d)
+                    for d in checkpoint.continuation_context.get("diagnostic_evidence", [])
+                ]
+                executed_diagnostic_names_this_iteration = list(
+                    checkpoint.continuation_context.get("executed_diagnostic_names_this_iteration", [])
                 )
-                report.failures.append(failure)
-                emit(f"[4/7] Rejected generated changes: {exc}")
-                if iteration < self.config.max_iterations:
-                    continue
-                break
-            except UnsafeModificationError as exc:
-                failure = FailureAnalysis("AI-generated change was rejected by the safety/patch validator", [], str(exc))
-                report.failures.append(failure)
-                emit(f"[4/7] Rejected generated changes: {exc}")
-                if iteration < self.config.max_iterations:
-                    continue
-                break
-            proposed_diff = "".join(change.diff for change in prepared)
-            if self.config.dry_run:
-                report.dry_run = True
-                report.proposed_diff = proposed_diff
-                emit(f"[4/7] Dry run: {len(prepared)} proposed file changes; no files written")
-                break
-            if prepared and self.config.approval == "always":
-                report.approval_required = True
-                approved = bool(approval_callback(prepared)) if approval_callback else False
-                if not approved:
-                    emit("[4/7] Changes not approved; stopping before write")
-                    report.proposed_diff = proposed_diff
-                    break
-            report.changed_files.extend(coding_agent.apply_prepared(prepared))
-            report.proposed_diff = coding_agent.diff()
-            self._create_checkpoint(task, current_subtask, "After code generation, before validation", context, report) # Checkpoint
+                # Load the last failure from checkpoint to continue repair iterations
+                last_failures = checkpoint.continuation_context.get("validation_state", {}).get("last_failures", [])
+                if last_failures:
+                    failure = FailureAnalysis.from_dict(last_failures[0])
+                else:
+                    failure = None
+            except FileNotFoundError:
+                pass  # Checkpoint may be missing if the task is new or corrupted
 
-            emit("[5/7] Running validation...")
-            executions = self._validate(validation_plan)
-            report.executions.extend(executions)
-            task.execution_history.extend([{"type": "execution", "subtask_id": current_subtask.subtask_id, "execution": exec.to_dict()} for exec in executions]) # Record executions
-            self.storage.save_task(task)
-            failed = next((result for result in executions if not result.succeeded), None)
-            if failed is not None:
-                emit("[5/7] Validation failed")
+        validation_plan = self.validation_intelligence.select_commands(
+            task.objective, impact, list(getattr(context, "validation_commands", None) or [])
+        )
 
-                # Phase 3.13: Dynamic Secondary Validation Execution
-                if self.config.max_secondary_validations_per_iteration > 0 and validation_plan.secondary_commands:
-                    emit("[5.1/7] Considering secondary validation...")
-                    
-                    # Diagnostic sub-loop
-                    for _ in range(self.config.max_secondary_validations_per_iteration - len(executed_diagnostic_names_this_iteration)):
-                        available_diagnostics = [cmd for cmd in validation_plan.secondary_commands if cmd.name not in executed_diagnostic_names_this_iteration]
-                        if not available_diagnostics:
-                            break
-
-                        selected_cmd_spec = self.provider.select_diagnostic_command(current_subtask.goal, plan, context, failed, available_diagnostics)
-
-                        if selected_cmd_spec is None or selected_cmd_spec not in available_diagnostics:
-                            emit("[5.2/7] Provider did not select a valid diagnostic command. Proceeding to repair.")
-                            break
-
-                        emit(f"[5.3/7] Executing selected diagnostic command: {selected_cmd_spec.display()}")
-                        diagnostic_result = self.runner.run(selected_cmd_spec)
-                        truncated_result = self._truncate_execution_result(diagnostic_result)
-                        
-                        current_diagnostic_evidence.append(truncated_result)
-                        executed_diagnostic_names_this_iteration.append(selected_cmd_spec.name)
-
-                        # Create a checkpoint after each diagnostic run to persist state
+        try:
+            for iteration in range(1, self.config.max_iterations + 1):
+                report.iterations = iteration
+                emit("[4/7] Implementing changes..." if iteration == 1 else f"[5/7] Applying repair for iteration {iteration}...")
+                try:
+                    operations = self.provider.generate_code(task, plan, context, failure=failure, review=review)
+                except ProviderError as exc:
+                    self._record_provider_failure(task, current_subtask, exc, "implementation provider request failed")
+                    emit(f"[4/7] Provider stopped the run: {report.outcome}")
+                    if isinstance(exc, (RateLimitError, QuotaExceededError)):
+                        task.status = TaskStatus.PAUSED
+                        current_subtask.status = SubtaskStatus.PAUSED
+                        current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                        # Create a checkpoint to preserve failure state and diagnostic state for resumption
                         extra_context = {
                             'diagnostic_evidence': [e.to_dict() for e in current_diagnostic_evidence],
                             'executed_diagnostic_names_this_iteration': executed_diagnostic_names_this_iteration
                         }
-                        self._create_checkpoint(task, current_subtask, f"After running diagnostic: {selected_cmd_spec.name}", context, report, extra_context=extra_context)
-
-                try:
-                    failure = self.failure_analyzer.analyze(failed, coding_agent.diff() or self.git.diff(), context, plan)
-                except ProviderError as exc:
-                    self._record_provider_failure(report, exc, "failure-analysis provider request failed")
-                    emit(f"[5/7] Provider stopped the run: {report.outcome}")
+                        self._create_checkpoint(task, current_subtask, f"Paused due to provider error during repair", context, report, extra_context=extra_context)
                     break
-                
-                # Attach diagnostic evidence to the failure analysis
-                failure.diagnostic_evidence = current_diagnostic_evidence
+                try:
+                    prepared = coding_agent.prepare(operations, plan)
+                except PatchValidationError as exc:
+                    failure = FailureAnalysis(
+                        "AI-generated patch failed strict validation",
+                        [exc.path],
+                        "Regenerate a patch that matches the original target file exactly.",
+                        category="PATCH_VALIDATION",
+                        details={
+                            "path": exc.path,
+                            "original_file": exc.original,
+                            "generated_patch": exc.patch,
+                            "validation_error": exc.reason,
+                        },
+                    )
+                    report.failures.append(failure)
+                    emit(f"[4/7] Rejected generated changes: {exc}")
+                    if iteration < self.config.max_iterations:
+                        continue
+                    break
+                except UnsafeModificationError as exc:
+                    failure = FailureAnalysis("AI-generated change was rejected by the safety/patch validator", [], str(exc))
+                    report.failures.append(failure)
+                    emit(f"[4/7] Rejected generated changes: {exc}")
+                    if iteration < self.config.max_iterations:
+                        continue
+                    break
+                proposed_diff = "".join(change.diff for change in prepared)
+                if self.config.dry_run:
+                    report.dry_run = True
+                    report.proposed_diff = proposed_diff
+                    emit(f"[4/7] Dry run: {len(prepared)} proposed file changes; no files written")
+                    break
+                if prepared and self.config.approval == "always":
+                    report.approval_required = True
+                    approved = bool(approval_callback(prepared)) if approval_callback else False
+                    if not approved:
+                        emit("[4/7] Changes not approved; stopping before write")
+                        report.proposed_diff = proposed_diff
+                        break
+                report.changed_files.extend(coding_agent.apply_prepared(prepared))
+                report.proposed_diff = coding_agent.diff()
+                self._create_checkpoint(task, current_subtask, "After code generation, before validation", context, report) # Checkpoint
 
-                # Phase 3.14: Propose a plan modification if the failure seems architectural
-                if failure.category in {"MISSING_DEPENDENCY", "ARCHITECTURAL_FLAW"}: # Example categories
-                    emit("[5.5/7] Failure suggests a planning issue. Proposing plan modification...")
-                    plan_proposal = self.provider.propose_plan_modification(task.objective, task.plan, failure)
-                    if plan_proposal:
-                        report.plan_proposal = plan_proposal
-                        # The orchestrator's job is done; it returns the proposal in the report.
-                        # The Scheduler will handle the task state transition.
-                        break # Exit the repair loop
+                emit("[5/7] Running validation...")
+                executions = self._validate(validation_plan)
+                report.executions.extend(executions)
+                task.execution_history.extend([{"type": "execution", "subtask_id": current_subtask.subtask_id, "execution": exec.to_dict()} for exec in executions]) # Record executions
+                self.storage.save_task(task)
+                failed = next((result for result in executions if not result.succeeded), None)
+                if failed is not None:
+                    emit("[5/7] Validation failed")
 
-                failure.category = failure.category or "VALIDATION_FAILURE"
-                report.failures.append(failure)
-                emit("[5/7] Analyzing failure...")
-                if iteration < self.config.max_iterations:
-                    continue
-                break
-            self._create_checkpoint(task, current_subtask, "After successful validation, before review", context, report) # Checkpoint
+                    # Phase 3.13: Dynamic Secondary Validation Execution
+                    if self.config.max_secondary_validations_per_iteration > 0 and validation_plan.secondary_commands:
+                        emit("[5.1/7] Considering secondary validation...")
+                    
+                        # Diagnostic sub-loop
+                        for _ in range(self.config.max_secondary_validations_per_iteration - len(executed_diagnostic_names_this_iteration)):
+                            available_diagnostics = [cmd for cmd in validation_plan.secondary_commands if cmd.name not in executed_diagnostic_names_this_iteration]
+                            if not available_diagnostics:
+                                break
 
-            emit("[6/7] Reviewing changes...")
-            try:
-                report.review = self.reviewer.review(current_subtask.goal, plan, coding_agent.diff() or self.git.diff(), context)
-            except (RateLimitError, QuotaExceededError) as exc: # Handle temporary provider errors
-                self._handle_temporary_provider_error(task, current_subtask, exc, "review provider request failed", context)
-                emit(f"[6/7] Provider temporarily unavailable: {task.outcome}. Task paused.")
-                return self._build_run_report(task)
-            except ProviderError as exc:
-                self._record_provider_failure(task, current_subtask, exc, "review provider request failed")
-                emit(f"[6/7] Provider stopped the run: {task.outcome}")
-                break
-            review = report.review
-            if review.verdict == "APPROVED":
-                report.completed = True
-                break
-            if iteration >= self.config.max_iterations:
-                break
-            emit("[6/7] Review requested changes; continuing...")
-            emit("[7/7] Complete")
+                            selected_cmd_spec = self.provider.select_diagnostic_command(current_subtask.goal, plan, context, failed, available_diagnostics)
 
+                            if selected_cmd_spec is None or selected_cmd_spec not in available_diagnostics:
+                                emit("[5.2/7] Provider did not select a valid diagnostic command. Proceeding to repair.")
+                                break
+
+                            emit(f"[5.3/7] Executing selected diagnostic command: {selected_cmd_spec.display()}")
+                            diagnostic_result = self.runner.run(selected_cmd_spec)
+                            truncated_result = self._truncate_execution_result(diagnostic_result)
+                        
+                            current_diagnostic_evidence.append(truncated_result)
+                            executed_diagnostic_names_this_iteration.append(selected_cmd_spec.name)
+
+                            # Create a checkpoint after each diagnostic run to persist state
+                            extra_context = {
+                                'diagnostic_evidence': [e.to_dict() for e in current_diagnostic_evidence],
+                                'executed_diagnostic_names_this_iteration': executed_diagnostic_names_this_iteration
+                            }
+                            self._create_checkpoint(task, current_subtask, f"After running diagnostic: {selected_cmd_spec.name}", context, report, extra_context=extra_context)
+
+                    try:
+                        failure = self.failure_analyzer.analyze(failed, coding_agent.diff() or self.git.diff(), context, plan)
+                    except ProviderError as exc:
+                        self._record_provider_failure(task, current_subtask, exc, "failure-analysis provider request failed")
+                        emit(f"[5/7] Provider stopped the run: {report.outcome}")
+                        break
+
+                    # Attach diagnostic evidence to the failure analysis
+                    failure.diagnostic_evidence = current_diagnostic_evidence
+
+                    # Phase 3.14: Propose a plan modification if the failure seems architectural
+                    if failure.category in {"MISSING_DEPENDENCY", "ARCHITECTURAL_FLAW"}: # Example categories
+                        emit("[5.5/7] Failure suggests a planning issue. Proposing plan modification...")
+                        plan_proposal: PlanProposal | None = self.provider.propose_plan_modification(task.objective, task.plan, failure)
+                        if plan_proposal:
+                            report.plan_proposal = plan_proposal
+                            # The orchestrator's job is done; it returns the proposal in the report.
+                            # The Scheduler will handle the task state transition.
+                            break # Exit the repair loop
+
+                    failure.category = failure.category or "VALIDATION_FAILURE"
+                    report.failures.append(failure)
+                    emit("[5/7] Analyzing failure...")
+                    if iteration < self.config.max_iterations:
+                        continue
+                    break
+                self._create_checkpoint(task, current_subtask, "After successful validation, before review", context, report) # Checkpoint
+
+                emit("[6/7] Reviewing changes...")
+                try:
+                    report.review = self.reviewer.review(current_subtask.goal, plan, coding_agent.diff() or self.git.diff(), context)
+                except (RateLimitError, QuotaExceededError) as exc: # Handle temporary provider errors
+                    self._handle_temporary_provider_error(task, current_subtask, exc, "review provider request failed", context)
+                    emit(f"[6/7] Provider temporarily unavailable: {task.outcome}. Task paused.")
+                    return self._build_run_report(task)
+                except ProviderError as exc:
+                    self._record_provider_failure(task, current_subtask, exc, "review provider request failed")
+                    emit(f"[6/7] Provider stopped the run: {task.outcome}")
+                    break
+                review = report.review
+                if review.verdict == "APPROVED":
+                    report.completed = True
+                    break
+                if iteration >= self.config.max_iterations:
+                    break
+                emit("[6/7] Review requested changes; continuing...")
+                emit("[7/7] Complete")
+
+            # Status setting logic moved outside the loop to ensure it always runs
             if report.completed:
                 task.status = TaskStatus.COMPLETED
                 current_subtask.status = SubtaskStatus.COMPLETED
@@ -251,7 +304,7 @@ class Orchestrator:
             updated_at=now,
         )
 
-    def _create_checkpoint(self, task: Task, subtask: Subtask, description: str, context: ProjectContext, report: RunReport) -> Checkpoint:
+    def _create_checkpoint(self, task: Task, subtask: Subtask, description: str, context: ProjectContext, report: RunReport, extra_context: dict[str, Any] | None = None) -> Checkpoint:
         checkpoint_id = str(uuid.uuid4())
         now = datetime.datetime.now(datetime.timezone.utc)
 
@@ -272,7 +325,7 @@ class Orchestrator:
             "last_provider_event": report.outcome,
             "next_recommended_action": "Continue the current subtask from the existing repository state.",
         }
-        # Merge extra context for Phase 3.13
+        # Merge extra context for Phase 3.13 (diagnostic state etc.)
         if extra_context:
             continuation_context.update(extra_context)
 

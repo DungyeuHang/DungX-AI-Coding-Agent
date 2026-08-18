@@ -120,7 +120,7 @@ class CodingAgent:
     def _resulting_content(action: str, operation: FileOperation, original: str | None, relative: str) -> str | None:
         if action == "delete":
             return None
-        if action in {"write", "create"} and operation.content is not None:
+        if action in {"write", "create", "modify"} and operation.content is not None:
             return operation.content
         if operation.patch is not None:
             return UnifiedPatchApplier().apply(original or "", operation.patch, expected_path=relative)

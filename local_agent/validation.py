@@ -195,7 +195,7 @@ class ValidationIntelligence:
     def select_commands(self, task: str, change_impact: ChangeImpact, discovered_commands: list[ValidationCommand]) -> ValidationPlan:
         task_keywords = _name_tokens(task)
         intents = {name for name, pattern in _INTENT_KEYWORDS.items() if pattern.search(task)}
-        entities = {name for name, pattern in _ENTITY_KEYWORDS.items() if pattern.search(task)}
+        entities = {name for name, keywords in _ENTITY_KEYWORDS.items() if keywords & task_keywords}
 
         primary_commands: list[CommandSpec] = []
         secondary_commands: list[CommandSpec] = []
