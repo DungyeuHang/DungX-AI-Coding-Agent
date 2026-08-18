@@ -5,11 +5,12 @@ from collections import defaultdict
 from pathlib import Path
 
 from .filesystem import ProjectFilesystem, ProtectedPathError, SandboxViolation
-from .models import ProjectContext
+from .models import ProjectContext, SemanticIndex
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 _STOP_WORDS = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of", "on", "or", "the", "to", "with", "add", "fix", "page", "feature", "application", "simple", "existing", "system", "register", "implement", "make"}
+_SYMBOL_NAME_RE = re.compile(r"`([^`]+)`|([A-Za-z_][A-Za-z0-9_.]+)") # Matches `symbol` or plain_symbol.with.dots
 _UI_TASK_TERMS = {"about", "component", "frontend", "layout", "navigation", "nav", "page", "react", "route", "router", "screen", "ui", "view"}
 _RELATION_BONUS = {
     "imports": 0.10,
@@ -48,6 +49,27 @@ class ContextSelector:
             for token in self._keywords(str(dependency).replace("/", " ").replace("-", " "))
         }
         scored: dict[str, dict[str, object]] = {}
+
+        semantic_boost_paths: dict[str, str] = {} # path -> reason
+        semantic_index = context.metadata.get("semantic_index")
+        if semantic_index and isinstance(semantic_index, SemanticIndex):
+            candidate_symbols = self._extract_candidate_symbols(task)
+            if candidate_symbols:
+                # 1. Exact symbol matches from candidates
+                exact_matches = semantic_index.find_symbols(candidate_symbols)
+                for path, symbol in exact_matches:
+                    if path not in semantic_boost_paths:
+                        semantic_boost_paths[path] = f"semantic symbol definition match: {symbol.name}"
+
+                # 2. Substring symbol matches for broader discovery
+                for query in candidate_symbols:
+                    # Only search for longer, more specific candidates to avoid noise
+                    if len(query) > 4 and '.' not in query:
+                        substring_matches = semantic_index.search_symbols(query)
+                        for path, symbol in substring_matches:
+                            if path not in semantic_boost_paths:
+                                semantic_boost_paths[path] = f"semantic symbol definition match: {symbol.name} (similar to '{query}')"
+
         for relative in candidates:
             try:
                 with self.filesystem.resolve(relative).open("r", encoding="utf-8") as handle:
@@ -65,6 +87,10 @@ class ContextSelector:
                 reasons.append("task keyword match in path")
             if content_matches:
                 reasons.append("task keyword match in content")
+            if relative in semantic_boost_paths:
+                score += 0.50 # Strong boost for semantic symbol definition
+                reasons.append(semantic_boost_paths[relative])
+
             if relative in modified:
                 score += 0.14
                 reasons.append("recently modified")
@@ -229,6 +255,20 @@ class ContextSelector:
     def _keywords(value: str) -> set[str]:
         camel_case = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
         return {word.lower() for word in _WORD_RE.findall(camel_case) if len(word) > 2 and word.lower() not in _STOP_WORDS}
+
+    def _extract_candidate_symbols(self, task: str) -> set[str]:
+        candidates: set[str] = set()
+        for match in _SYMBOL_NAME_RE.finditer(task):
+            symbol = match.group(1) or match.group(2)
+            is_backtick_name = match.group(1) is not None
+            is_qualified_name = "." in symbol if symbol else False
+            is_identifier_style = bool(symbol and ("_" in symbol or re.search(r"[a-z0-9][A-Z]", symbol)))
+            if symbol and (is_backtick_name or is_qualified_name or is_identifier_style):
+                candidates.add(symbol)
+                # Add last component for qualified names
+                if is_qualified_name:
+                    candidates.add(symbol.split('.')[-1])
+        return {s for s in candidates if s and s.lower() not in _STOP_WORDS and len(s) > 2}
 
     @staticmethod
     def _modified_paths(status: str) -> set[str]:

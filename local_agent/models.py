@@ -276,6 +276,45 @@ class SemanticIndex:
                     matching_symbols.append(symbol)
         return matching_symbols
 
+    def find_symbols(self, names: set[str]) -> list[tuple[str, SymbolDefinition]]:
+        """Finds all symbol definitions matching any of the given names.
+        Returns a list of (file_path, SymbolDefinition) tuples, sorted by symbol name, path, and line.
+        """
+        matching_symbols: list[tuple[str, SymbolDefinition]] = []
+        for path in sorted(self.files.keys()):
+            file_index = self.files[path]
+            for symbol in file_index.symbols:
+                if symbol.name in names:
+                    matching_symbols.append((path, symbol))
+        # Sort for deterministic output
+        matching_symbols.sort(key=lambda item: (item[1].name, item[0], item[1].location.start_line))
+        return matching_symbols
+
+    def find_file_for_symbol(self, name: str) -> list[str]:
+        """Finds all file paths containing a symbol definition with an exact name match."""
+        matching_files: set[str] = set()
+        for path, file_index in self.files.items():
+            for symbol in file_index.symbols:
+                if symbol.name == name:
+                    matching_files.add(path)
+                    break # Move to the next file
+        return sorted(list(matching_files))
+
+    def search_symbols(self, query: str) -> list[tuple[str, SymbolDefinition]]:
+        """Finds all symbol definitions with a case-insensitive substring match.
+        Returns a list of (file_path, SymbolDefinition) tuples, sorted by symbol name, path, and line.
+        """
+        matching_symbols: list[tuple[str, SymbolDefinition]] = []
+        query_lower = query.lower()
+        for path in sorted(self.files.keys()):
+            file_index = self.files[path]
+            for symbol in file_index.symbols:
+                if query_lower in symbol.name.lower():
+                    matching_symbols.append((path, symbol))
+        # Sort for deterministic output
+        matching_symbols.sort(key=lambda item: (item[1].name, item[0], item[1].location.start_line))
+        return matching_symbols
+
 @dataclass
 class ProviderMetric:
     request_type: str

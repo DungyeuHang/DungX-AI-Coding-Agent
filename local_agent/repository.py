@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
+import logging
 import os
 import posixpath
 import re
@@ -9,7 +11,18 @@ import tomllib
 from pathlib import Path, PurePosixPath
 
 from .git import GitIntegration
-from .models import CommandSpec, FileRelationship, ProjectContext, RepositoryFile, RepositoryMap
+from .indexing.parser import TreeSitterParser
+from .indexing.python_indexer import PythonIndexer
+from .models import (
+    CommandSpec,
+    FileIndex,
+    FileRelationship,
+    ProjectContext,
+    RepositoryFile,
+    RepositoryMap,
+    SemanticIndex,
+)
+from .storage import JsonFileStorage
 
 
 IGNORED_DIRECTORIES = {
@@ -17,6 +30,7 @@ IGNORED_DIRECTORIES = {
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".cache", "dist", "build", "coverage", "target", ".tox",
 }
 SECRET_NAMES = {".env", ".env.local", ".env.production", "credentials.json", "secrets.json", "id_rsa", "id_ed25519", "token.json"}
+LOGGER = logging.getLogger(__name__)
 LANGUAGES = {
     ".py": "Python", ".js": "JavaScript", ".jsx": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
     ".ts": "TypeScript", ".tsx": "TypeScript", ".java": "Java", ".kt": "Kotlin", ".go": "Go", ".rs": "Rust",
@@ -68,6 +82,27 @@ class RepositoryIntelligence:
             raise ValueError(f"project directory does not exist: {self.root}")
         self.git = GitIntegration(self.root)
         self.ignore = GitIgnoreMatcher(self.root)
+        self.storage = JsonFileStorage(self.root / ".agent_data")
+        self.semantic_index_path = "semantic_index.json"
+        self._semantic_index: SemanticIndex | None = None
+        self._ts_available = False
+        try:
+            self._parser = TreeSitterParser()
+            self._python_indexer = PythonIndexer(self._parser)
+            self._ts_available = True
+            LOGGER.info("Tree-sitter parser for Python is available.")
+        except (ImportError, OSError) as e:
+            LOGGER.warning("Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: %s", e)
+
+    @property
+    def semantic_index(self) -> SemanticIndex | None:
+        """
+        Returns the current semantic index. Loads from disk if not already in memory.
+        Does not trigger a full rescan.
+        """
+        if self._semantic_index is None:
+            self._semantic_index = self.storage.load_semantic_index()
+        return self._semantic_index
 
     def scan(self) -> ProjectContext:
         context = ProjectContext(root=str(self.root))
@@ -75,7 +110,11 @@ class RepositoryIntelligence:
         ignored: list[dict[str, str]] = []
         protected: list[dict[str, str]] = []
         directories: set[str] = set()
-        for current, dirnames, names in os.walk(self.root):
+        existing_semantic_index = self.storage.load_semantic_index()
+        current_semantic_index_files: dict[str, FileIndex] = {}
+        scanned_paths = set()
+
+        for current, dirnames, names in os.walk(self.root, topdown=True):
             current_path = Path(current)
             current_relative = "" if current_path == self.root else current_path.relative_to(self.root).as_posix()
             kept: list[str] = []
@@ -92,6 +131,7 @@ class RepositoryIntelligence:
             for name in sorted(names):
                 path = current_path / name
                 relative = path.relative_to(self.root).as_posix()
+                scanned_paths.add(relative)
                 if self._is_secret(name):
                     protected.append({"path": relative, "reason": "protected secret-like file"})
                     continue
@@ -105,7 +145,25 @@ class RepositoryIntelligence:
                     continue
                 records.append(record)
                 self._classify(relative, context)
+                try:
+                    content_hash = self._calculate_sha256(path)
+                    existing_file_index = existing_semantic_index.files.get(relative)
+                    if existing_file_index and existing_file_index.content_hash == content_hash:
+                        current_semantic_index_files[relative] = existing_file_index
+                    else:
+                        file_index = FileIndex(path=relative, language=record.language, content_hash=content_hash)
+                        if record.language == "Python" and self._ts_available:
+                            file_index = self._index_python_file(path, relative, content_hash)
+                        current_semantic_index_files[relative] = file_index
+                except OSError as e:
+                    LOGGER.warning("Could not process file for semantic index %s: %s", relative, e)
 
+        indexed_paths = set(existing_semantic_index.files.keys())
+        deleted_paths = indexed_paths - scanned_paths
+        for path in deleted_paths:
+            LOGGER.debug("Removing deleted file from semantic index: %s", path)
+        self._semantic_index = SemanticIndex(files=current_semantic_index_files)
+        self.storage.save_semantic_index(self._semantic_index)
         context.directories = sorted(directories)
         context.git_status = self.git.status()
         metadata = self._metadata(records)
@@ -122,8 +180,20 @@ class RepositoryIntelligence:
             entry_points=sorted(item.path for item in records if item.is_entry_point), relationships=relationships,
             ignored_paths=sorted(ignored, key=lambda item: item["path"]), protected_paths=sorted(protected, key=lambda item: item["path"]),
         )
+        context.metadata["semantic_index"] = self._semantic_index
         context.metadata["scan_statistics"] = {"scanned_files": len(records), "ignored_paths": len(ignored), "protected_paths": len(protected), "relationships": len(relationships)}
         return context
+
+    def _calculate_sha256(self, path: Path) -> str:
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except OSError as e:
+            LOGGER.warning("Could not calculate hash for %s: %s", path, e)
+            return ""
 
     def _directory_ignore_reason(self, name: str, relative: str) -> str | None:
         if name in IGNORED_DIRECTORIES:
@@ -163,6 +233,18 @@ class RepositoryIntelligence:
             is_documentation=name.startswith("readme") or name.split(".")[0] in DOC_NAMES or suffix in {".md", ".rst", ".txt"},
             is_generated=self._is_generated(name), is_entry_point=self._is_entry_point(name),
         )
+
+    def _index_python_file(self, path: Path, relative_path: str, content_hash: str) -> FileIndex:
+        """Use PythonIndexer to create a FileIndex for a Python file."""
+        file_index = FileIndex(path=relative_path, language="Python", content_hash=content_hash)
+        try:
+            content = path.read_bytes()
+            symbols, imports = self._python_indexer.index(content)
+            file_index.symbols = symbols
+            file_index.imports = imports
+        except Exception as e:
+            LOGGER.warning("Failed to index Python file %s: %s", relative_path, e)
+        return file_index
 
     @staticmethod
     def _line_count(path: Path) -> int | None:
