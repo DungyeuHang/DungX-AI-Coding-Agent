@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import uuid
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any, TypeVar
+
+from .models import Checkpoint, ProviderConfig, SchedulerState, Subtask, Task
+
+T = TypeVar("T", Task, Checkpoint)
+
+class TaskStorage(ABC):
+    @abstractmethod
+    def save_task(self, task: Task) -> None:
+        pass
+
+    @abstractmethod
+    def load_task(self, task_id: str) -> Task:
+        pass
+
+    @abstractmethod
+    def list_tasks(self) -> list[Task]:
+        pass
+
+    @abstractmethod
+    def save_checkpoint(self, checkpoint: Checkpoint) -> None:
+        pass
+
+    @abstractmethod
+    def load_checkpoint(self, checkpoint_id: str) -> Checkpoint:
+        pass
+
+    @abstractmethod
+    def save_scheduler_state(self, state: SchedulerState) -> None:
+        pass
+
+    @abstractmethod
+    def load_scheduler_state(self) -> SchedulerState:
+        pass
+
+    @abstractmethod
+    def save_provider_configs(self, configs: list[ProviderConfig]) -> None:
+        pass
+
+    @abstractmethod
+    def load_provider_configs(self) -> list[ProviderConfig]:
+        pass
+
+class JsonFileStorage(TaskStorage):
+    def __init__(self, base_dir: str | Path):
+        self.base_dir = Path(base_dir)
+        self.tasks_dir = self.base_dir / "tasks"
+        self.checkpoints_dir = self.base_dir / "checkpoints"
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    def _task_path(self, task_id: str) -> Path:
+        return self.tasks_dir / f"{task_id}.json"
+
+    def _checkpoint_path(self, checkpoint_id: str) -> Path:
+        return self.checkpoints_dir / f"{checkpoint_id}.json"
+
+    def _scheduler_state_path(self) -> Path:
+        return self.base_dir / "scheduler_state.json"
+
+    def _provider_configs_path(self) -> Path:
+        return self.base_dir / "providers.json"
+
+    def _atomic_write(self, path: Path, data: dict[str, Any]) -> None:
+        temp_path = path.with_suffix(".json.tmp")
+        try:
+            with temp_path.open("w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(temp_path, path)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
+
+    def save_task(self, task: Task) -> None:
+        self._atomic_write(self._task_path(task.task_id), task.to_dict())
+
+    def load_task(self, task_id: str) -> Task:
+        path = self._task_path(task_id)
+        if not path.exists():
+            raise FileNotFoundError(f"Task with ID {task_id} not found.")
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return Task.from_dict(data)
+        except (json.JSONDecodeError, KeyError) as e:
+            raise ValueError(f"Failed to load task {task_id} due to malformed data: {e}")
+
+    def list_tasks(self) -> list[Task]:
+        tasks = []
+        for task_file in self.tasks_dir.glob("*.json"):
+            try:
+                tasks.append(self.load_task(task_file.stem))
+            except (FileNotFoundError, ValueError):
+                # Skip corrupted or deleted task files
+                pass
+        return tasks
+
+    def save_checkpoint(self, checkpoint: Checkpoint) -> None:
+        self._atomic_write(self._checkpoint_path(checkpoint.checkpoint_id), checkpoint.to_dict())
+
+    def load_checkpoint(self, checkpoint_id: str) -> Checkpoint:
+        path = self._checkpoint_path(checkpoint_id)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint with ID {checkpoint_id} not found.")
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return Checkpoint.from_dict(data)
+        except (json.JSONDecodeError, KeyError) as e:
+            raise ValueError(f"Failed to load checkpoint {checkpoint_id} due to malformed data: {e}")
+
+    def save_scheduler_state(self, state: SchedulerState) -> None:
+        self._atomic_write(self._scheduler_state_path(), state.to_dict())
+
+    def load_scheduler_state(self) -> SchedulerState:
+        path = self._scheduler_state_path()
+        if not path.exists():
+            return SchedulerState()
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return SchedulerState.from_dict(json.load(f))
+        except (json.JSONDecodeError, KeyError):
+            return SchedulerState() # Return default state if file is corrupted
+
+    def save_provider_configs(self, configs: list[ProviderConfig]) -> None:
+        data = [c.to_dict() for c in configs]
+        self._atomic_write(self._provider_configs_path(), {"providers": data})
+
+    def load_provider_configs(self) -> list[ProviderConfig]:
+        path = self._provider_configs_path()
+        if not path.exists():
+            return []
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [ProviderConfig.from_dict(c) for c in data.get("providers", [])]
+        except (json.JSONDecodeError, KeyError):
+            return []

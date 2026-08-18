@@ -43,6 +43,9 @@ class AgentConfig:
     repair_context_bytes: int = 12000
     review_context_bytes: int = 16000
     provider_max_retries: int = 1
+    approval_mode: Literal["never", "plan_review", "always"] = "never" # Added for Phase 3.12
+    max_secondary_validations_per_iteration: int = 1 # Added for Phase 3.13
+    max_diagnostic_output_bytes: int = 4000 # Added for Phase 3.13
     max_retry_wait_seconds: int = 60
     metrics_enabled: bool = False
 
@@ -68,6 +71,9 @@ class AgentConfig:
             "repair_context_bytes": "AGENT_REPAIR_CONTEXT_BYTES",
             "review_context_bytes": "AGENT_REVIEW_CONTEXT_BYTES",
             "provider_max_retries": "AGENT_PROVIDER_MAX_RETRIES",
+            "approval_mode": "AGENT_APPROVAL_MODE", # Added for Phase 3.12
+            "max_secondary_validations_per_iteration": "AGENT_MAX_SECONDARY_VALIDATIONS", # Added for Phase 3.13
+            "max_diagnostic_output_bytes": "AGENT_MAX_DIAGNOSTIC_OUTPUT_BYTES", # Added for Phase 3.13
             "max_retry_wait_seconds": "AGENT_MAX_RETRY_WAIT_SECONDS",
             "metrics_enabled": "AGENT_METRICS",
         }
@@ -115,6 +121,11 @@ class AgentConfig:
             implementation_context_bytes=_positive_int(value("implementation_context_bytes", 22000), "implementation_context_bytes"),
             repair_context_bytes=_positive_int(value("repair_context_bytes", 12000), "repair_context_bytes"),
             review_context_bytes=_positive_int(value("review_context_bytes", 16000), "review_context_bytes"),
+            # For Phase 3.12, only 'never' and 'plan_review' are fully implemented.
+            # 'always' is a placeholder for future work.
+            approval_mode=str(value("approval_mode", "never")).lower(), # Added for Phase 3.12
+            max_secondary_validations_per_iteration=_positive_int(value("max_secondary_validations_per_iteration", 1), "max_secondary_validations_per_iteration", minimum=0), # Added for Phase 3.13
+            max_diagnostic_output_bytes=_positive_int(value("max_diagnostic_output_bytes", 4000), "max_diagnostic_output_bytes"), # Added for Phase 3.13
             provider_max_retries=_positive_int(value("provider_max_retries", 1), "provider_max_retries", minimum=0),
             max_retry_wait_seconds=_positive_int(value("max_retry_wait_seconds", 60), "max_retry_wait_seconds"),
             metrics_enabled=_bool(value("metrics_enabled", False)),
@@ -125,11 +136,13 @@ class AgentConfig:
             raise ValueError(f"project directory does not exist: {self.project}")
         if self.provider not in {"mock", "openai", "gemini", "antigravity"}:
             raise ValueError("provider must be 'mock', 'openai', 'gemini', or 'antigravity'")
-        if self.approval not in {"never", "always"}:
+        if self.approval not in {"never", "always"}: # This is for code changes approval, not plan approval.
             raise ValueError("approval must be 'never' or 'always'")
+        if self.approval_mode not in {"never", "plan_review", "always"}:
+            raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
         if self.command_timeout_seconds < 1:
             raise ValueError("command_timeout_seconds must be positive")
-        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds"):
+        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
         if self.provider_max_retries < 0:
@@ -147,6 +160,7 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING"))
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
     parser.add_argument("--approval", choices=("never", "always"), default=None, help="pause for approval before applying changes")
+    parser.add_argument("--approval-mode", choices=("never", "plan_review", "always"), default=None, help="control plan approval behavior") # Added for Phase 3.12
 
 
 def config_from_args(args: argparse.Namespace) -> AgentConfig:
@@ -159,6 +173,7 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,
             "approval": args.approval,
+            "approval_mode": args.approval_mode, # Added for Phase 3.12
         }.items() if value is not None
     }
     config = AgentConfig.from_environment(args.project, **overrides)

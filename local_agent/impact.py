@@ -26,6 +26,14 @@ _RISK_PATTERNS = {
     "high": re.compile(r"package\.json|auth|security|database|schema|build|config", re.I),
     "medium": re.compile(r"router|layout|shared|provider", re.I),
 }
+_PAGE_NAME_RE = re.compile(r"\b(?:add|create|implement|introduce|build)\s+(?:an?\s+)?([A-Za-z][A-Za-z0-9_-]*)\s+(?:page|screen)\b", re.I)
+_STOPWORDS = {"a", "an", "and", "the", "in", "it", "page", "screen", "fix", "the"}
+
+
+def _name_tokens(value: str) -> set[str]:
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", value)
+    return {token.lower() for token in re.findall(r"[A-Za-z0-9]+", value)}
 
 
 class ChangeImpactAnalyzer:
@@ -57,12 +65,12 @@ class ChangeImpactAnalyzer:
 
     def _apply_new_page_rules(self, task: str, context: ProjectContext, targets: dict[str, ChangeTarget], entities: set[str]):
         repo_map = context.repository_map
-        page_dirs = {Path(p).parent for p in repo_map.files if "page" in p.lower() and "src" in p.lower()}
-        page_dir = "src/pages" if Path("src/pages") in page_dirs else (next(iter(page_dirs), Path("src/features/unnamed"))).as_posix()
+        page_dirs = sorted({Path(file.path).parent for file in repo_map.files if "page" in file.path.lower() and "src" in file.path.lower()}, key=lambda path: path.as_posix())
+        page_dir = "src/pages" if Path("src/pages") in page_dirs else (page_dirs[0] if page_dirs else Path("src/features/unnamed")).as_posix()
 
-        task_words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", task))
-        page_name_candidates = [w for w in task_words if w.lower() not in {"a", "an", "the", "page", "and", "in", "it"}]
-        page_name = page_name_candidates[-1].capitalize() if page_name_candidates else "New"
+        match = _PAGE_NAME_RE.search(task)
+        page_name = match.group(1) if match else "New"
+        page_name = "".join(part.capitalize() for part in re.split(r"[-_]", page_name))
         new_page_path = f"{page_dir}/{page_name}Page.tsx"
         targets[new_page_path] = ChangeTarget(new_page_path, "create", 1.0, f"Proposed new page file based on task entity 'page' and existing project structure.", "page", "low")
         new_test_path = f"{page_dir}/__tests__/{page_name}Page.test.tsx"
@@ -78,12 +86,12 @@ class ChangeImpactAnalyzer:
 
     def _apply_backend_fix_rules(self, task: str, context: ProjectContext, targets: dict[str, ChangeTarget]):
         repo_map = context.repository_map
-        task_keywords = {w.lower() for w in re.findall(r"\w+", task)}
+        task_keywords = _name_tokens(task) - _STOPWORDS
         for file in repo_map.files:
             is_backend = "functions" in file.path or "backend" in file.path
-            if not is_backend:
+            if not is_backend or file.is_test:
                 continue
-            path_keywords = {w.lower() for w in re.findall(r"\w+", file.path)}
+            path_keywords = _name_tokens(file.path)
             if task_keywords & path_keywords:
                 targets[file.path] = ChangeTarget(file.path, "modify", 0.9, "File path matches keywords from backend fix task.", "backend", "medium")
                 # Find related test
@@ -93,9 +101,11 @@ class ChangeImpactAnalyzer:
 
     def _apply_generic_fix_rules(self, task: str, context: ProjectContext, targets: dict[str, ChangeTarget]):
         repo_map = context.repository_map
-        task_keywords = {w.lower() for w in re.findall(r"\w+", task)}
+        task_keywords = _name_tokens(task) - _STOPWORDS
         for file in repo_map.files:
-            path_keywords = {w.lower() for w in re.findall(r"\w+", file.path)}
+            if file.is_test:
+                continue
+            path_keywords = _name_tokens(file.path)
             if task_keywords & path_keywords:
                 targets[file.path] = ChangeTarget(file.path, "modify", 0.8, "File path matches keywords from fix task.", "primary", self._get_risk(file.path))
                 # Find dependencies and tests

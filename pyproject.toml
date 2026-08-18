@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "A local-first autonomous AI software engineering agent MVP"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "keyring>=23.0.0",
+]
 
 [project.scripts]
 agent = "local_agent.cli:main"

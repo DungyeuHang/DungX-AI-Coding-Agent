@@ -8,11 +8,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict
+from dataclasses import asdict, field
 from typing import Any
 
 from .config import AgentConfig
-from .models import ExecutionResult, FailureAnalysis, FileOperation, Plan, ProjectContext, ProviderMetric, ReviewResult
+from .models import CommandSpec, ExecutionResult, FailureAnalysis, FileOperation, Plan, PlanProposal, ProjectContext, ProviderCapability, ProviderMetric, ReviewResult, TaskPlan
 
 
 class ProviderError(RuntimeError):
@@ -57,6 +57,7 @@ class AIProvider:
     @property
     def provider_metrics(self) -> list[ProviderMetric]:
         return getattr(self, "_provider_metrics", [])
+    capabilities: set[ProviderCapability] = field(default_factory=set, init=False)
 
     def _record_metric(self, request_type: str, input_size: int, output_size: int, duration_seconds: float, model: str, succeeded: bool, error_category: str = "") -> None:
         if not getattr(self, "metrics_enabled", False):
@@ -86,6 +87,14 @@ class AIProvider:
     def review_changes(self, task: str, plan: Plan, diff: str, context: ProjectContext) -> ReviewResult:
         raise NotImplementedError
 
+    def select_diagnostic_command(self, task: str, plan: Plan, context: ProjectContext, primary_failure: ExecutionResult, available_commands: list[CommandSpec]) -> CommandSpec | None:
+        """Select a secondary command to run for more diagnostic info."""
+        return None # Default implementation does nothing
+
+    def propose_plan_modification(self, task: str, plan: TaskPlan, failure: FailureAnalysis) -> PlanProposal | None:
+        """Propose adding or modifying subtasks to fix a planning-level issue."""
+        return None # Default implementation does nothing
+
 
 class MockProvider(AIProvider):
     """Offline provider used for tests and safe workflow dry runs.
@@ -94,6 +103,12 @@ class MockProvider(AIProvider):
     changes. This makes the offline limitation visible instead of pretending a
     task was implemented.
     """
+
+    def __init__(self):
+        self.capabilities = {
+            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
+            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+        }
 
     def generate_plan(self, task: str, context: ProjectContext) -> Plan:
         inspect = (context.documentation_files[:2] + context.config_files[:8] + context.test_files[:8] + context.source_files[:8])
@@ -123,10 +138,22 @@ class MockProvider(AIProvider):
             return ReviewResult("CHANGES_REQUIRED", "No implementation diff was produced by the offline provider.", ["Configure a real provider and provide its API key to generate code."])
         return ReviewResult("CHANGES_REQUIRED", "The offline provider cannot verify generated changes.", ["Run a model-backed review before accepting the implementation."])
 
+    def select_diagnostic_command(self, task: str, plan: Plan, context: ProjectContext, primary_failure: ExecutionResult, available_commands: list[CommandSpec]) -> CommandSpec | None:
+        # The mock provider makes a simple, deterministic choice if available.
+        return available_commands[0] if available_commands else None
+
+    def propose_plan_modification(self, task: str, plan: TaskPlan, failure: FailureAnalysis) -> PlanProposal | None:
+        # The mock provider can propose a simple addition for testing.
+        return None
+
 
 class OpenAIProvider(AIProvider):
     def __init__(self, config: AgentConfig):
         self.config = config
+        self.capabilities = {
+            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
+            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+        }
         self.metrics_enabled = config.metrics_enabled
         self.api_key = config.api_key
         if self.api_key is None:
@@ -226,6 +253,21 @@ class OpenAIProvider(AIProvider):
             verdict = "CHANGES_REQUIRED"
         return ReviewResult(verdict, str(data.get("summary", "")), _strings(data.get("findings")))
 
+    def select_diagnostic_command(self, task: str, plan: Plan, context: ProjectContext, primary_failure: ExecutionResult, available_commands: list[CommandSpec]) -> CommandSpec | None:
+        if not available_commands:
+            return None
+        command_list = "\n".join([f"- {cmd.name}: {cmd.display()}" for cmd in available_commands])
+        data = self._json_call(
+            "You are a debugging expert. Return only JSON with a single key 'command_name' whose value is the name of the best command to run for more diagnostic information, or null if none are suitable.",
+            f"Task:\n{task}\nPlan:\n{json.dumps(asdict(plan))}\nPrimary Failure:\n{json.dumps(primary_failure.to_dict())}\n\nAvailable diagnostic commands:\n{command_list}\n\nSelect one command name from the list to help diagnose the failure."
+        )
+        selected_name = data.get("command_name")
+        return next((cmd for cmd in available_commands if cmd.name == selected_name), None)
+
+    def propose_plan_modification(self, task: str, plan: TaskPlan, failure: FailureAnalysis) -> PlanProposal | None:
+        # For now, the real providers do not implement this.
+        return None
+
 
 GEMINI_STABLE_MODEL_PREFERENCE = (
     "gemini-3.5-flash",
@@ -243,6 +285,10 @@ class GeminiProvider(AIProvider):
     def __init__(self, config: AgentConfig):
         self.config = config
         self.metrics_enabled = config.metrics_enabled
+        self.capabilities = {
+            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
+            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+        }
         # Prefer the explicit runtime credential; retain environment fallback
         # for direct CLI/provider construction.
         self.api_key = config.api_key
@@ -424,6 +470,21 @@ class GeminiProvider(AIProvider):
             verdict = "CHANGES_REQUIRED"
         return ReviewResult(verdict, str(data.get("summary", "")), _strings(data.get("findings")))
 
+    def select_diagnostic_command(self, task: str, plan: Plan, context: ProjectContext, primary_failure: ExecutionResult, available_commands: list[CommandSpec]) -> CommandSpec | None:
+        if not available_commands:
+            return None
+        command_list = "\n".join([f"- {cmd.name}: {cmd.display()}" for cmd in available_commands])
+        data = self._json_call(
+            "You are a debugging expert. Return only JSON with a single key 'command_name' whose value is the name of the best command to run for more diagnostic information, or null if none are suitable.",
+            f"Task:\n{task}\nPlan:\n{json.dumps(asdict(plan))}\nPrimary Failure:\n{json.dumps(primary_failure.to_dict())}\n\nAvailable diagnostic commands:\n{command_list}\n\nSelect one command name from the list to help diagnose the failure."
+        )
+        selected_name = data.get("command_name")
+        return next((cmd for cmd in available_commands if cmd.name == selected_name), None)
+
+    def propose_plan_modification(self, task: str, plan: TaskPlan, failure: FailureAnalysis) -> PlanProposal | None:
+        # For now, the real providers do not implement this.
+        return None
+
 
 class AntigravityProvider(GeminiProvider):
     """Official Antigravity managed-agent adapter over the Interactions API.
@@ -436,6 +497,10 @@ class AntigravityProvider(GeminiProvider):
     def __init__(self, config: AgentConfig):
         super().__init__(config)
         self.agent = os.environ.get("ANTIGRAVITY_AGENT", ANTIGRAVITY_AGENT)
+        self.capabilities = {
+            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
+            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+        }
 
     def _json_call(self, system: str, user: str) -> dict[str, Any]:
         payload = self._interaction(system, user)
@@ -483,6 +548,10 @@ class AntigravityProvider(GeminiProvider):
         raise ProviderError("Antigravity response did not contain model text")
 
 
+class DeepSeekProvider(OpenAIProvider):
+    """Placeholder for DeepSeek, assuming OpenAI-compatible API."""
+    pass
+
 def _strings(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -524,7 +593,12 @@ def _bounded_context(context: ProjectContext, budget: int, max_files: int, max_f
         "file_previews": {},
         "validation_commands": compact.get("validation_commands", []),
         "git_status": compact.get("git_status", ""),
-        "metadata": {"context_selection": metadata.get("context_selection", {})},
+        "metadata": {
+            "context_selection": metadata.get("context_selection", {}),
+            "change_impact": metadata.get("change_impact", {}),
+            "validation_plan": metadata.get("validation_plan", {}),
+            "continuation_context": metadata.get("continuation_context", {}), # Added for Phase 3.9
+        },
         "truncated_files": [],
     }
     repository_summary = compact.get("repository_map", {})
@@ -644,7 +718,11 @@ def _error_category(error: BaseException) -> str:
     return UnknownProviderError.category
 
 
-def build_provider(config: AgentConfig) -> AIProvider:
+def build_provider(config: AgentConfig, api_key: str | None = None) -> AIProvider:
+    # If an explicit key is passed, use it. Otherwise, use the one from config.
+    if api_key:
+        config.api_key = api_key
+
     if config.provider == "mock":
         return MockProvider()
     if config.provider == "openai":
@@ -653,4 +731,6 @@ def build_provider(config: AgentConfig) -> AIProvider:
         return GeminiProvider(config)
     if config.provider == "antigravity":
         return AntigravityProvider(config)
+    if config.provider == "deepseek":
+        return DeepSeekProvider(config)
     raise ProviderError(f"unsupported provider: {config.provider}")
