@@ -27,17 +27,25 @@ class TreeSitterParser:
                 "Please run the build script to compile the tree-sitter grammars."
             )
         
-        self.PY_LANGUAGE = Language(LANGUAGE_SO_PATH.resolve(), "python")
-        
+        self._language_names = {
+            "python": "python",
+            "javascript": "javascript",
+            "typescript": "typescript",
+            "tsx": "tsx",
+        }
+        self._languages: dict[str, Any] = {}
         self._parsers: dict[str, Parser] = {}
 
     def get_parser(self, language: str) -> Parser:
+        if language not in self._language_names:
+            raise ValueError(f"Unsupported language for Tree-sitter parser: {language}")
         if language not in self._parsers:
+            language_obj = self._languages.get(language)
+            if language_obj is None:
+                language_obj = Language(LANGUAGE_SO_PATH.resolve(), self._language_names[language])
+                self._languages[language] = language_obj
             parser = Parser()
-            if language == "python":
-                parser.set_language(self.PY_LANGUAGE)
-            else:
-                raise ValueError(f"Unsupported language for Tree-sitter parser: {language}")
+            parser.set_language(language_obj)
             self._parsers[language] = parser
         return self._parsers[language]
 

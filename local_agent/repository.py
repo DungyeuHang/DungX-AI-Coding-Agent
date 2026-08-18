@@ -11,6 +11,7 @@ import tomllib
 from pathlib import Path, PurePosixPath
 
 from .git import GitIntegration
+from .indexing.javascript_indexer import JavaScriptIndexer
 from .indexing.parser import TreeSitterParser
 from .indexing.python_indexer import PythonIndexer
 from .models import (
@@ -89,6 +90,7 @@ class RepositoryIntelligence:
         try:
             self._parser = TreeSitterParser()
             self._python_indexer = PythonIndexer(self._parser)
+            self._javascript_indexer = JavaScriptIndexer(self._parser)
             self._ts_available = True
             LOGGER.info("Tree-sitter parser for Python is available.")
         except (ImportError, OSError) as e:
@@ -154,6 +156,8 @@ class RepositoryIntelligence:
                         file_index = FileIndex(path=relative, language=record.language, content_hash=content_hash)
                         if record.language == "Python" and self._ts_available:
                             file_index = self._index_python_file(path, relative, content_hash)
+                        elif record.language in {"JavaScript", "TypeScript"} and self._ts_available:
+                            file_index = self._index_javascript_file(path, relative, content_hash)
                         current_semantic_index_files[relative] = file_index
                 except OSError as e:
                     LOGGER.warning("Could not process file for semantic index %s: %s", relative, e)
@@ -244,6 +248,19 @@ class RepositoryIntelligence:
             file_index.imports = imports
         except Exception as e:
             LOGGER.warning("Failed to index Python file %s: %s", relative_path, e)
+        return file_index
+
+    def _index_javascript_file(self, path: Path, relative_path: str, content_hash: str) -> FileIndex:
+        """Use JavaScriptIndexer for JavaScript, JSX, TypeScript, or TSX files."""
+        file_index = FileIndex(path=relative_path, language=LANGUAGES.get(path.suffix.lower(), "JavaScript"), content_hash=content_hash)
+        try:
+            content = path.read_bytes()
+            parser_language = "tsx" if path.suffix.lower() == ".tsx" else "typescript" if path.suffix.lower() == ".ts" else "javascript"
+            symbols, imports = self._javascript_indexer.index(content, parser_language)
+            file_index.symbols = symbols
+            file_index.imports = imports
+        except Exception as e:
+            LOGGER.warning("Failed to index JavaScript/TypeScript file %s: %s", relative_path, e)
         return file_index
 
     @staticmethod
