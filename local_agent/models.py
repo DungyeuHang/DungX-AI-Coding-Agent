@@ -199,6 +199,11 @@ class FailureAnalysis:
         data["diagnostic_evidence"] = [e.to_dict() for e in self.diagnostic_evidence]
         return data
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        data["diagnostic_evidence"] = [ExecutionResult.from_dict(e) for e in data.get("diagnostic_evidence", [])]
+        return cls(**data)
+
 @dataclass
 class ProviderMetric:
     request_type: str
@@ -210,6 +215,13 @@ class ProviderMetric:
     error_category: str = ""
     approximate_input_tokens: int = 0
     approximate_output_tokens: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(**data)
 
 
 @dataclass
@@ -338,6 +350,10 @@ class SubtaskModification:
     acceptance_criteria: list[str] | None = None
     dependencies: list[str] | None = None
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(**data)
+
 @dataclass
 class AddSubtask:
     subtask: Subtask
@@ -350,6 +366,14 @@ class PlanProposal:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(
+            reason=data.get("reason", ""),
+            modifications=[SubtaskModification.from_dict(m) for m in data.get("modifications", [])],
+            additions=[AddSubtask.from_dict(a) for a in data.get("additions", [])],
+        )
 
 @dataclass
 class Task:
@@ -389,8 +413,8 @@ class Task:
         if data.get("plan"):
             data["plan"] = TaskPlan.from_dict(data["plan"])
         if data.get("plan_proposal"):
-            data["plan_proposal"] = PlanProposal(**data["plan_proposal"])
-        data["provider_execution_history"] = [ProviderMetric(**metric_data) for metric_data in data["provider_execution_history"]]
+            data["plan_proposal"] = PlanProposal.from_dict(data["plan_proposal"])
+        data["provider_execution_history"] = [ProviderMetric.from_dict(metric_data) for metric_data in data.get("provider_execution_history", [])]
         if data.get("next_retry_at"):
             data["next_retry_at"] = datetime.datetime.fromisoformat(data["next_retry_at"])
         return cls(**data)

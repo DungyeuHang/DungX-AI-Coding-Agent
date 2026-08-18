@@ -8,7 +8,7 @@ from unittest import mock
 
 from local_agent.config import AgentConfig
 from local_agent.models import (
-    CommandSpec, ExecutionResult, FailureAnalysis, FileOperation, Plan,
+    Checkpoint, CommandSpec, ExecutionResult, FailureAnalysis, FileOperation, Plan,
     ProjectContext, ReviewResult, Subtask, SubtaskStatus, Task, TaskPlan,
     TaskStatus, ValidationPlan,
 )
@@ -227,3 +227,54 @@ class Phase313Tests(unittest.TestCase):
         self.assertEqual(len(provider2.select_diagnostic_command_calls), 0)
         final_task = self.storage.load_task(task.task_id)
         self.assertEqual(final_task.status, TaskStatus.COMPLETED)
+
+    def test_failure_analysis_with_diagnostics_survives_roundtrip(self):
+        # Arrange: Create a task with a complex FailureAnalysis in its history
+        task = self._create_task_with_plan()
+        diagnostic_result = ExecutionResult("npm run lint", 1, stderr="Lint error")
+        failure = FailureAnalysis(
+            probable_root_cause="Linting failed",
+            diagnostic_evidence=[diagnostic_result]
+        )
+        task.execution_history.append({"type": "failure", "failure": failure.to_dict()})
+        self.storage.save_task(task)
+
+        # Act: Reload the task and try to build a report (which deserializes history)
+        reloaded_task = self.storage.load_task(task.task_id)
+        orchestrator = Orchestrator(self._get_config(), MockProvider(), self.storage)
+        try:
+            report = orchestrator._build_run_report(reloaded_task)
+        except Exception as e:
+            self.fail(f"_build_run_report crashed with: {e}")
+
+        # Assert
+        self.assertEqual(len(report.failures), 1)
+        reloaded_failure = report.failures[0]
+        self.assertIsInstance(reloaded_failure, FailureAnalysis)
+        self.assertEqual(len(reloaded_failure.diagnostic_evidence), 1)
+        reloaded_evidence = reloaded_failure.diagnostic_evidence[0]
+        self.assertIsInstance(reloaded_evidence, ExecutionResult)
+        self.assertEqual(reloaded_evidence.command, "npm run lint")
+
+    def test_resume_from_checkpoint_with_diagnostics(self):
+        # Arrange: Create a checkpoint with diagnostic evidence
+        task = self._create_task_with_plan()
+        diagnostic_result = ExecutionResult("npm run lint", 1, stderr="Lint error")
+        checkpoint = Checkpoint(
+            checkpoint_id="chk-diag", task_id=task.task_id, subtask_id="sub1",
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+            current_state_description="Paused during diagnostics",
+            continuation_context={'diagnostic_evidence': [diagnostic_result.to_dict()]}
+        )
+        self.storage.save_checkpoint(checkpoint)
+        task.plan.subtasks[0].latest_checkpoint_id = "chk-diag"
+        self.storage.save_task(task)
+
+        # Act & Assert: The orchestrator should be able to load this and not crash
+        orchestrator = Orchestrator(self._get_config(), MockProvider(), self.storage)
+        try:
+            # We don't need to run the full loop, just verify the initial load
+            with mock.patch.object(orchestrator.provider, 'generate_code', return_value=[]):
+                 orchestrator.run(task, "sub1")
+        except Exception as e:
+            self.fail(f"Orchestrator crashed on resume with: {e}")
