@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Literal, Self
+from typing import Any, Dict, Literal, Self
 
 
 @dataclass(frozen=True)
@@ -209,6 +209,74 @@ class FailureAnalysis:
         return cls(**data)
 
 @dataclass
+class SymbolLocation:
+    start_line: int
+    end_line: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(**data)
+
+@dataclass
+class SymbolDefinition:
+    name: str
+    kind: Literal["class", "function", "method"]
+    location: SymbolLocation
+    parent: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["location"] = self.location.to_dict()
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        data = dict(data)
+        data["location"] = SymbolLocation.from_dict(data["location"])
+        return cls(**data)
+
+@dataclass
+class FileIndex:
+    path: str
+    language: str
+    content_hash: str
+    symbols: list[SymbolDefinition] = field(default_factory=list)
+    imports: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["symbols"] = [s.to_dict() for s in self.symbols]
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        data = dict(data)
+        data["symbols"] = [SymbolDefinition.from_dict(s) for s in data.get("symbols", [])]
+        return cls(**data)
+
+@dataclass
+class SemanticIndex:
+    files: Dict[str, FileIndex] = field(default_factory=dict) # Keyed by file path
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"files": {path: fi.to_dict() for path, fi in self.files.items()}}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(files={path: FileIndex.from_dict(fi) for path, fi in data.get("files", {}).items()})
+
+    def find_symbol(self, name: str) -> list[SymbolDefinition]:
+        matching_symbols: list[SymbolDefinition] = []
+        for file_index in self.files.values():
+            for symbol in file_index.symbols:
+                if symbol.name == name:
+                    matching_symbols.append(symbol)
+        return matching_symbols
+
+@dataclass
 class ProviderMetric:
     request_type: str
     input_size: int
@@ -373,7 +441,7 @@ class AddSubtask:
     subtask: Subtask
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Self:
+    def from_dict(cls, data: dict[str, Any]) -> Self: # Existing fix, ensuring it's not regressed
         # Required for PlanProposal deserialization
         return cls(subtask=Subtask.from_dict(data["subtask"]))
 
@@ -419,7 +487,7 @@ class Task:
             data["plan"] = self.plan.to_dict()
         if self.plan_proposal:
             data["plan_proposal"] = self.plan_proposal.to_dict()
-        data["provider_execution_history"] = [asdict(metric) for metric in self.provider_execution_history]
+        data["provider_execution_history"] = [metric.to_dict() for metric in self.provider_execution_history] # Hardened
         return data
 
     next_retry_at: datetime.datetime | None = None # Added for Phase 3.10

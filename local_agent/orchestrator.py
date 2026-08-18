@@ -93,14 +93,11 @@ class Orchestrator:
         # Phase 3.14: Resume diagnostic / secondary-validation state from the latest checkpoint, if present.
         current_diagnostic_evidence: list[ExecutionResult] = []
         executed_diagnostic_names_this_iteration: list[str] = []
-        if current_subtask is not None and current_subtask.latest_checkpoint_id:
+        if current_subtask and current_subtask.latest_checkpoint_id:
             try:
                 checkpoint = self.storage.load_checkpoint(current_subtask.latest_checkpoint_id)
-                current_diagnostic_evidence = [
-                    ExecutionResult.from_dict(d)
-                    for d in checkpoint.continuation_context.get("diagnostic_evidence", [])
-                ]
-                executed_diagnostic_names_this_iteration = list(
+                current_diagnostic_evidence = [ExecutionResult.from_dict(d) for d in checkpoint.continuation_context.get("diagnostic_evidence", [])]
+                executed_diagnostic_names_this_iteration = list( # Ensure it's a list for mutability
                     checkpoint.continuation_context.get("executed_diagnostic_names_this_iteration", [])
                 )
                 # Load the last failure from checkpoint to continue repair iterations
@@ -440,7 +437,7 @@ class Orchestrator:
         failures = []
         for entry in task.execution_history:
             if entry.get("type") == "execution":
-                executions.append(ExecutionResult(**entry["execution"]))
+                executions.append(ExecutionResult.from_dict(entry["execution"]))
             elif entry.get("type") == "failure":
                 failures.append(FailureAnalysis.from_dict(entry["failure"]))
 

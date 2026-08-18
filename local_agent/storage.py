@@ -4,13 +4,14 @@ import json
 import os
 import shutil
 import uuid
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod # noqa: F401
 from pathlib import Path
 from typing import Any, TypeVar
 
 from .models import Checkpoint, ProviderConfig, SchedulerState, Subtask, Task
 
 T = TypeVar("T", Task, Checkpoint)
+from .models import SemanticIndex # Added for Phase 3.15
 
 class TaskStorage(ABC):
     @abstractmethod
@@ -48,6 +49,14 @@ class TaskStorage(ABC):
     @abstractmethod
     def load_provider_configs(self) -> list[ProviderConfig]:
         pass
+    
+    @abstractmethod
+    def save_semantic_index(self, semantic_index: SemanticIndex) -> None:
+        pass
+
+    @abstractmethod
+    def load_semantic_index(self) -> SemanticIndex:
+        pass
 
 class JsonFileStorage(TaskStorage):
     def __init__(self, base_dir: str | Path):
@@ -55,6 +64,7 @@ class JsonFileStorage(TaskStorage):
         self.tasks_dir = self.base_dir / "tasks"
         self.checkpoints_dir = self.base_dir / "checkpoints"
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        self.base_dir.mkdir(parents=True, exist_ok=True) # Ensure base_dir exists for semantic_index.json
         self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     def _task_path(self, task_id: str) -> Path:
@@ -65,6 +75,9 @@ class JsonFileStorage(TaskStorage):
 
     def _scheduler_state_path(self) -> Path:
         return self.base_dir / "scheduler_state.json"
+    
+    def _semantic_index_path(self) -> Path:
+        return self.base_dir / "semantic_index.json"
 
     def _provider_configs_path(self) -> Path:
         return self.base_dir / "providers.json"
@@ -145,3 +158,18 @@ class JsonFileStorage(TaskStorage):
             return [ProviderConfig.from_dict(c) for c in data.get("providers", [])]
         except (json.JSONDecodeError, KeyError):
             return []
+
+    def save_semantic_index(self, semantic_index: SemanticIndex) -> None:
+        self._atomic_write(self._semantic_index_path(), semantic_index.to_dict())
+
+    def load_semantic_index(self) -> SemanticIndex:
+        path = self._semantic_index_path()
+        if not path.exists():
+            return SemanticIndex()
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return SemanticIndex.from_dict(json.load(f))
+        except (json.JSONDecodeError, KeyError) as e:
+            # Log error but return empty index for robustness
+            print(f"Warning: Failed to load semantic index due to malformed data: {e}. Returning empty index.")
+            return SemanticIndex()
