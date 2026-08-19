@@ -1,0 +1,775 @@
+ok
+test_command_runner_captures_success_and_blocks_destructive_commands (tests.test_core.CoreTests.test_command_runner_captures_success_and_blocks_destructive_commands) ... ok
+test_configuration_reads_environment_and_validates (tests.test_core.CoreTests.test_configuration_reads_environment_and_validates) ... ok
+test_failure_result_is_not_marked_success (tests.test_core.CoreTests.test_failure_result_is_not_marked_success) ... ok
+test_filesystem_is_sandboxed_and_protects_secrets (tests.test_core.CoreTests.test_filesystem_is_sandboxed_and_protects_secrets) ... ok
+test_git_adapter_handles_non_repository_without_remote_operations (tests.test_core.CoreTests.test_git_adapter_handles_non_repository_without_remote_operations) ... ok
+ERROR
+test_antigravity_configuration_and_documented_interactions_request (tests.test_phase2.Phase2Tests.test_antigravity_configuration_and_documented_interactions_request) ... ok
+test_antigravity_response_parsing_and_safe_error (tests.test_phase2.Phase2Tests.test_antigravity_response_parsing_and_safe_error) ... ok
+ok
+test_dry_run_and_approval_do_not_write (tests.test_phase2.Phase2Tests.test_dry_run_and_approval_do_not_write) ... ERROR
+test_gemini_404_has_safe_diagnostic (tests.test_phase2.Phase2Tests.test_gemini_404_has_safe_diagnostic) ... ok
+test_gemini_configuration_missing_key_and_response_parsing (tests.test_phase2.Phase2Tests.test_gemini_configuration_missing_key_and_response_parsing) ... ok
+test_gemini_connection_discovers_model_and_uses_header_auth (tests.test_phase2.Phase2Tests.test_gemini_connection_discovers_model_and_uses_header_auth) ... ok
+test_gemini_malformed_generation_response_is_reported (tests.test_phase2.Phase2Tests.test_gemini_malformed_generation_response_is_reported) ... ok
+test_patch_modify_create_delete_and_dry_validation (tests.test_phase2.Phase2Tests.test_patch_modify_create_delete_and_dry_validation) ... ok
+test_repair_cycle_uses_failure_and_respects_limit (tests.test_phase2.Phase2Tests.test_repair_cycle_uses_failure_and_respects_limit) ... ERROR
+test_sandbox_integration_performs_real_deterministic_coding_workflow (tests.test_phase2.Phase2Tests.test_sandbox_integration_performs_real_deterministic_coding_workflow) ... ERROR
+test_unrelated_existing_change_is_preserved (tests.test_phase2.Phase2Tests.test_unrelated_existing_change_is_preserved) ... ok
+test_context_selector_limits_files_and_file_previews_explicitly (tests.test_phase3.Phase3Tests.test_context_selector_limits_files_and_file_previews_explicitly) ... ok
+test_invalid_patch_then_quota_preserves_file_and_stops_repair (tests.test_phase3.Phase3Tests.test_invalid_patch_then_quota_preserves_file_and_stops_repair) ... ERROR
+test_quota_429_without_retry_hint_is_classified_and_not_retried (tests.test_phase3.Phase3Tests.test_quota_429_without_retry_hint_is_classified_and_not_retried) ... ok
+test_repair_payload_contains_only_relevant_patch_failure (tests.test_phase3.Phase3Tests.test_repair_payload_contains_only_relevant_patch_failure) ... ok
+test_retry_after_is_respected_once_and_metrics_are_safe (tests.test_phase3.Phase3Tests.test_retry_after_is_respected_once_and_metrics_are_safe) ... ok
+tests.test_phase310 (unittest.loader._FailedTest.tests.test_phase310) ... ERROR
+test_all_providers_not_configured (tests.test_phase310_1.Phase310_1_Tests.test_all_providers_not_configured) ... ERROR
+test_fallback_with_missing_credentials (tests.test_phase310_1.Phase310_1_Tests.test_fallback_with_missing_credentials) ... ERROR
+test_provider_selection_with_credentials (tests.test_phase310_1.Phase310_1_Tests.test_provider_selection_with_credentials) ... ERROR
+test_restart_behavior (tests.test_phase310_1.Phase310_1_Tests.test_restart_behavior) ... ERROR
+test_scheduler_loads_persistent_config (tests.test_phase310_1.Phase310_1_Tests.test_scheduler_loads_persistent_config) ... ok
+test_secrets_not_in_state_files (tests.test_phase310_1.Phase310_1_Tests.test_secrets_not_in_state_files) ... ERROR
+tests.test_phase311 (unittest.loader._FailedTest.tests.test_phase311) ... ERROR
+tests.test_phase312 (unittest.loader._FailedTest.tests.test_phase312) ... ERROR
+ok
+ok
+ok
+ok
+No primary validation commands in plan
+No primary validation commands in plan
+No primary validation commands in plan
+No primary validation commands in plan
+No primary validation commands in plan
+ok
+ok
+ok
+test_approve_proposal_applies_changes_and_sets_pending (tests.test_phase314.Phase314Tests.test_approve_proposal_applies_changes_and_sets_pending) ... ERROR
+test_backward_compatibility_with_pre_314_tasks (tests.test_phase314.Phase314Tests.test_backward_compatibility_with_pre_314_tasks) ... ok
+test_plan_proposed_task_is_not_executed (tests.test_phase314.Phase314Tests.test_plan_proposed_task_is_not_executed) ... ok
+test_proposal_survives_restart (tests.test_phase314.Phase314Tests.test_proposal_survives_restart) ... ok
+test_proposal_with_add_subtask_survives_roundtrip (tests.test_phase314.Phase314Tests.test_proposal_with_add_subtask_survives_roundtrip) ... ERROR
+test_reject_proposal_clears_proposal_and_sets_paused (tests.test_phase314.Phase314Tests.test_reject_proposal_clears_proposal_and_sets_paused) ... ERROR
+test_scheduler_accepts_valid_proposal_and_sets_plan_proposed (tests.test_phase314.Phase314Tests.test_scheduler_accepts_valid_proposal_and_sets_plan_proposed) ... FAIL
+test_file_index_round_trip (tests.test_phase315.Phase315_1Tests.test_file_index_round_trip) ... ok
+test_load_corrupted_semantic_index_file (tests.test_phase315.Phase315_1Tests.test_load_corrupted_semantic_index_file) ... ok
+test_load_empty_semantic_index_file (tests.test_phase315.Phase315_1Tests.test_load_empty_semantic_index_file) ... ok
+test_semantic_index_find_symbol (tests.test_phase315.Phase315_1Tests.test_semantic_index_find_symbol) ... ok
+test_semantic_index_real_disk_persistence (tests.test_phase315.Phase315_1Tests.test_semantic_index_real_disk_persistence) ... ok
+test_semantic_index_round_trip (tests.test_phase315.Phase315_1Tests.test_semantic_index_round_trip) ... ok
+test_symbol_definition_round_trip (tests.test_phase315.Phase315_1Tests.test_symbol_definition_round_trip) ... ok
+test_symbol_location_round_trip (tests.test_phase315.Phase315_1Tests.test_symbol_location_round_trip) ... ok
+test_1_function_definition_priority (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_1_function_definition_priority) ... ok
+test_2_class_definition_priority (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_2_class_definition_priority) ... ok
+test_3_multiple_definitions (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_3_multiple_definitions) ... ok
+test_4_no_semantic_match (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_4_no_semantic_match) ... ok
+test_5_empty_or_missing_semantic_index (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_5_empty_or_missing_semantic_index) ... ok
+test_6_backtick_symbol_matching (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_6_backtick_symbol_matching) ... ok
+test_7_qualified_symbol_matching (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_7_qualified_symbol_matching) ... FAIL
+test_8_regression_existing_context_selector_behavior (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_8_regression_existing_context_selector_behavior) ... ok
+test_extract_candidate_symbols_logic (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_extract_candidate_symbols_logic) ... ok
+test_classes_methods_and_exported_declarations (tests.test_phase3155.Phase3155Tests.test_classes_methods_and_exported_declarations) ... ok
+test_context_selector_prioritizes_javascript_and_typescript_symbols (tests.test_phase3155.Phase3155Tests.test_context_selector_prioritizes_javascript_and_typescript_symbols) ... ok
+test_javascript_and_typescript_symbol_models (tests.test_phase3155.Phase3155Tests.test_javascript_and_typescript_symbol_models) ... ok
+test_jsx_and_tsx_file_support (tests.test_phase3155.Phase3155Tests.test_jsx_and_tsx_file_support) ... ok
+test_multiple_definitions_and_deterministic_ordering (tests.test_phase3155.Phase3155Tests.test_multiple_definitions_and_deterministic_ordering) ... ok
+test_python_symbol_and_phase3154_behavior_regression (tests.test_phase3155.Phase3155Tests.test_python_symbol_and_phase3154_behavior_regression) ... ok
+ok
+test_unavailable_semantic_index_falls_back_without_semantic_reason (tests.test_phase3155.Phase3155Tests.test_unavailable_semantic_index_falls_back_without_semantic_reason) ... ok
+test_class_only_symbol_regression (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_class_only_symbol_regression) ... FAIL
+test_exact_qualified_javascript_match (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_exact_qualified_javascript_match) ... ok
+test_exact_qualified_python_match (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_exact_qualified_python_match) ... FAIL
+test_missing_semantic_index_fallback (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_missing_semantic_index_fallback) ... FAIL
+test_multiple_valid_qualified_definitions (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_multiple_valid_qualified_definitions) ... ok
+test_parent_container_mismatch (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_parent_container_mismatch) ... FAIL
+test_unqualified_symbol_regression (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_unqualified_symbol_regression) ... FAIL
+test_direct_semantic_match_gets_highest_boost (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_direct_semantic_match_gets_highest_boost) ... ok
+test_missing_relationship_data_falls_back_safely (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_missing_relationship_data_falls_back_safely) ... FAIL
+test_missing_semantic_index_falls_back_safely (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_missing_semantic_index_falls_back_safely) ... FAIL
+test_multiple_semantic_seeds_do_not_duplicate_boost (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_multiple_semantic_seeds_do_not_duplicate_boost) ... FAIL
+test_qualified_symbol_regression_with_dependency (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_qualified_symbol_regression_with_dependency) ... FAIL
+test_related_file_gets_secondary_boost (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_related_file_gets_secondary_boost) ... FAIL
+test_secondary_boost_does_not_outrank_direct_match (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_secondary_boost_does_not_outrank_direct_match) ... ok
+test_incremental_scan_removes_deleted_file (tests.test_phase3158.Phase3158_RepositoryIntelligenceIntegrationTests.test_incremental_scan_removes_deleted_file) ... skipped 'Tree-sitter is not installed or grammars not built, skipping semantic indexing integration tests.'
+test_incremental_scan_updates_modified_file_only (tests.test_phase3158.Phase3158_RepositoryIntelligenceIntegrationTests.test_incremental_scan_updates_modified_file_only) ... skipped 'Tree-sitter is not installed or grammars not built, skipping semantic indexing integration tests.'
+test_initial_scan_creates_correct_index (tests.test_phase3158.Phase3158_RepositoryIntelligenceIntegrationTests.test_initial_scan_creates_correct_index) ... skipped 'Tree-sitter is not installed or grammars not built, skipping semantic indexing integration tests.'
+ok
+test_roadmap_updated_for_semantic_indexing (tests.test_phase3159.Phase3159_DocumentationTests.test_roadmap_updated_for_semantic_indexing) ... FAIL
+test_planning_fallback_to_secondary_provider (tests.test_phase316.Phase316_SchedulerPlanningFallbackTest.test_planning_fallback_to_secondary_provider)
+ok
+ok
+test_context_cli_does_not_call_provider (tests.test_phase35.Phase35Tests.test_context_cli_does_not_call_provider) ... ERROR
+test_context_limits_are_configurable (tests.test_phase35.Phase35Tests.test_context_limits_are_configurable) ... ok
+ok
+FAIL
+ok
+test_connection_and_run_share_ui_runtime_configuration_builder (tests.test_phase352.Phase352Tests.test_connection_and_run_share_ui_runtime_configuration_builder) ... ok
+test_environment_fallback_works_when_runtime_key_is_absent (tests.test_phase352.Phase352Tests.test_environment_fallback_works_when_runtime_key_is_absent) ... ok
+test_explicit_runtime_key_takes_precedence (tests.test_phase352.Phase352Tests.test_explicit_runtime_key_takes_precedence) ... ok
+test_explicit_runtime_key_works_without_environment (tests.test_phase352.Phase352Tests.test_explicit_runtime_key_works_without_environment) ... ok
+test_missing_both_produces_safe_credential_error (tests.test_phase352.Phase352Tests.test_missing_both_produces_safe_credential_error) ... ok
+test_secret_never_appears_in_errors_metrics_urls_or_config_repr (tests.test_phase352.Phase352Tests.test_secret_never_appears_in_errors_metrics_urls_or_config_repr) ... ok
+test_ui_config_passes_runtime_key_without_mutating_environment (tests.test_phase352.Phase352Tests.test_ui_config_passes_runtime_key_without_mutating_environment) ... ok
+ok
+ok
+ok
+ok
+ok
+ok
+ok
+ok
+ok
+ERROR
+ERROR
+test_orchestrator_executes_primary_validation_commands (tests.test_phase38.Phase38Tests.test_orchestrator_executes_primary_validation_commands) ... ERROR
+test_orchestrator_passes_validation_plan_to_provider_and_report (tests.test_phase38.Phase38Tests.test_orchestrator_passes_validation_plan_to_provider_and_report) ... ERROR
+test_orchestrator_stops_on_validation_failure (tests.test_phase38.Phase38Tests.test_orchestrator_stops_on_validation_failure) ... ERROR
+ERROR
+ERROR
+ERROR
+ERROR
+ERROR
+test_checkpoint_persistence_and_reload (tests.test_phase39.Phase39Tests.test_checkpoint_persistence_and_reload) ... ERROR
+test_completed_task_persistence (tests.test_phase39.Phase39Tests.test_completed_task_persistence) ... ERROR
+test_no_api_secrets_stored_in_checkpoints (tests.test_phase39.Phase39Tests.test_no_api_secrets_stored_in_checkpoints) ... ERROR
+test_permanent_failure_leads_to_failed_state (tests.test_phase39.Phase39Tests.test_permanent_failure_leads_to_failed_state) ... ERROR
+test_provider_agnostic_continuation_context (tests.test_phase39.Phase39Tests.test_provider_agnostic_continuation_context) ... ERROR
+test_quota_exhaustion_leads_to_paused_state_and_resume (tests.test_phase39.Phase39Tests.test_quota_exhaustion_leads_to_paused_state_and_resume) ... ERROR
+test_subtask_state_transitions (tests.test_phase39.Phase39Tests.test_subtask_state_transitions) ... ERROR
+test_task_creation_and_persistence (tests.test_phase39.Phase39Tests.test_task_creation_and_persistence) ... ERROR
+test_task_reload_after_process_restart_simulation (tests.test_phase39.Phase39Tests.test_task_reload_after_process_restart_simulation) ... ERROR
+test_temporary_provider_error_leads_to_paused_state (tests.test_phase39.Phase39Tests.test_temporary_provider_error_leads_to_paused_state) ... ERROR
+test_placeholder_key_detection_never_needs_the_real_key (tests.test_ui.UITests.test_placeholder_key_detection_never_needs_the_real_key) ... ok
+test_iteration_limit_is_bounded_when_validation_fails (tests.test_workflow.WorkflowTests.test_iteration_limit_is_bounded_when_validation_fails) ... ERROR
+test_mock_workflow_reports_incomplete_instead_of_faking_code (tests.test_workflow.WorkflowTests.test_mock_workflow_reports_incomplete_instead_of_faking_code) ... ERROR
+
+======================================================================
+ERROR: test_planner_and_mock_provider_are_real_structured_operations (tests.test_core.CoreTests.test_planner_and_mock_provider_are_real_structured_operations)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_core.py", line 63, in test_planner_and_mock_provider_are_real_structured_operations
+    plan = Planner(MockProvider()).create_plan("Add a feature", context)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Planner' object has no attribute 'create_plan'. Did you mean: 'create_task_plan'?
+
+======================================================================
+ERROR: test_dry_run_and_approval_do_not_write (tests.test_phase2.Phase2Tests.test_dry_run_and_approval_do_not_write)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase2.py", line 256, in test_dry_run_and_approval_do_not_write
+    dry_report = Orchestrator(dry_config, DeterministicProvider()).run("Add multiply")
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: test_repair_cycle_uses_failure_and_respects_limit (tests.test_phase2.Phase2Tests.test_repair_cycle_uses_failure_and_respects_limit)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase2.py", line 272, in test_repair_cycle_uses_failure_and_respects_limit
+    report = Orchestrator(config, provider).run("Keep addition correct")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: test_sandbox_integration_performs_real_deterministic_coding_workflow (tests.test_phase2.Phase2Tests.test_sandbox_integration_performs_real_deterministic_coding_workflow)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase2.py", line 244, in test_sandbox_integration_performs_real_deterministic_coding_workflow
+    report = Orchestrator(config, provider).run("Add multiply(a, b) and tests")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: test_invalid_patch_then_quota_preserves_file_and_stops_repair (tests.test_phase3.Phase3Tests.test_invalid_patch_then_quota_preserves_file_and_stops_repair)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3.py", line 76, in test_invalid_patch_then_quota_preserves_file_and_stops_repair
+    report = Orchestrator(config, provider).run("Keep addition correct")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: tests.test_phase310 (unittest.loader._FailedTest.tests.test_phase310)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: tests.test_phase310
+Traceback (most recent call last):
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase310.py", line 10, in <module>
+    from local_agent.models import (
+ImportError: cannot import name 'ProviderError' from 'local_agent.models' (D:\GitHub\DungX-AI-Coding-Agent\local_agent\models.py)
+
+
+======================================================================
+ERROR: test_all_providers_not_configured (tests.test_phase310_1.Phase310_1_Tests.test_all_providers_not_configured)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase310_1.py", line 86, in test_all_providers_not_configured
+    selected_config = scheduler._select_provider(self._create_task())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Scheduler' object has no attribute '_select_provider'. Did you mean: '_select_providers'?
+
+======================================================================
+ERROR: test_fallback_with_missing_credentials (tests.test_phase310_1.Phase310_1_Tests.test_fallback_with_missing_credentials)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase310_1.py", line 74, in test_fallback_with_missing_credentials
+    selected_config = scheduler._select_provider(self._create_task())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Scheduler' object has no attribute '_select_provider'. Did you mean: '_select_providers'?
+
+======================================================================
+ERROR: test_provider_selection_with_credentials (tests.test_phase310_1.Phase310_1_Tests.test_provider_selection_with_credentials)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase310_1.py", line 57, in test_provider_selection_with_credentials
+    selected_config = scheduler._select_provider(self._create_task())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Scheduler' object has no attribute '_select_provider'. Did you mean: '_select_providers'?
+
+======================================================================
+ERROR: test_restart_behavior (tests.test_phase310_1.Phase310_1_Tests.test_restart_behavior)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase310_1.py", line 141, in test_restart_behavior
+    selected_config = scheduler._select_provider(self._create_task())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Scheduler' object has no attribute '_select_provider'. Did you mean: '_select_providers'?
+
+======================================================================
+ERROR: test_secrets_not_in_state_files (tests.test_phase310_1.Phase310_1_Tests.test_secrets_not_in_state_files)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\mock.py", line 1390, in patched
+    return func(*newargs, **newkeywargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase310_1.py", line 118, in test_secrets_not_in_state_files
+    scheduler.run_once()
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\scheduler.py", line 99, in run_once
+    self.storage.save_task(runnable_task)
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\storage.py", line 97, in save_task
+    self._atomic_write(self._task_path(task.task_id), task.to_dict())
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\storage.py", line 89, in _atomic_write
+    json.dump(data, f, indent=2, ensure_ascii=False)
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\__init__.py", line 179, in dump
+    for chunk in iterable:
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 432, in _iterencode
+    yield from _iterencode_dict(o, _current_indent_level)
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 439, in _iterencode
+    o = _default(o)
+        ^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type datetime is not JSON serializable
+
+======================================================================
+ERROR: tests.test_phase311 (unittest.loader._FailedTest.tests.test_phase311)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: tests.test_phase311
+Traceback (most recent call last):
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase311.py", line 11, in <module>
+    from local_agent.models import (
+ImportError: cannot import name 'QuotaExceededError' from 'local_agent.models' (D:\GitHub\DungX-AI-Coding-Agent\local_agent\models.py)
+
+
+======================================================================
+ERROR: tests.test_phase312 (unittest.loader._FailedTest.tests.test_phase312)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: tests.test_phase312
+Traceback (most recent call last):
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\loader.py", line 339, in _get_module_from_name
+    __import__(name)
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase312.py", line 13, in <module>
+    from local_agent.models import (
+ImportError: cannot import name 'QuotaExceededError' from 'local_agent.models' (D:\GitHub\DungX-AI-Coding-Agent\local_agent\models.py)
+
+
+======================================================================
+ERROR: test_approve_proposal_applies_changes_and_sets_pending (tests.test_phase314.Phase314Tests.test_approve_proposal_applies_changes_and_sets_pending)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase314.py", line 104, in test_approve_proposal_applies_changes_and_sets_pending
+    main(["approve-proposal", "--project", str(self.root), task.task_id])
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 165, in main
+    args = build_parser().parse_args(argv)
+           ^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 22, in build_parser
+    add_common_arguments(run, include_provider_args=True)
+TypeError: add_common_arguments() got an unexpected keyword argument 'include_provider_args'
+
+======================================================================
+ERROR: test_proposal_with_add_subtask_survives_roundtrip (tests.test_phase314.Phase314Tests.test_proposal_with_add_subtask_survives_roundtrip)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase314.py", line 181, in test_proposal_with_add_subtask_survives_roundtrip
+    self.storage.save_task(task)
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\storage.py", line 97, in save_task
+    self._atomic_write(self._task_path(task.task_id), task.to_dict())
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\storage.py", line 89, in _atomic_write
+    json.dump(data, f, indent=2, ensure_ascii=False)
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\__init__.py", line 179, in dump
+    for chunk in iterable:
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 432, in _iterencode
+    yield from _iterencode_dict(o, _current_indent_level)
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 326, in _iterencode_list
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 439, in _iterencode
+    o = _default(o)
+        ^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type datetime is not JSON serializable
+
+======================================================================
+ERROR: test_reject_proposal_clears_proposal_and_sets_paused (tests.test_phase314.Phase314Tests.test_reject_proposal_clears_proposal_and_sets_paused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase314.py", line 126, in test_reject_proposal_clears_proposal_and_sets_paused
+    main(["reject-proposal", "--project", str(self.root), task.task_id])
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 165, in main
+    args = build_parser().parse_args(argv)
+           ^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 22, in build_parser
+    add_common_arguments(run, include_provider_args=True)
+TypeError: add_common_arguments() got an unexpected keyword argument 'include_provider_args'
+
+======================================================================
+ERROR: test_context_cli_does_not_call_provider (tests.test_phase35.Phase35Tests.test_context_cli_does_not_call_provider)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase35.py", line 128, in test_context_cli_does_not_call_provider
+    result = main(["context", "--project", str(root), "teacher dashboard", "--log-level", "CRITICAL"]) # Suppress logging
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 165, in main
+    args = build_parser().parse_args(argv)
+           ^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 22, in build_parser
+    add_common_arguments(run, include_provider_args=True)
+TypeError: add_common_arguments() got an unexpected keyword argument 'include_provider_args'
+
+======================================================================
+ERROR: test_orchestrator_passes_change_impact_to_provider_and_report (tests.test_phase37.Phase37Tests.test_orchestrator_passes_change_impact_to_provider_and_report)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase37.py", line 137, in test_orchestrator_passes_change_impact_to_provider_and_report
+    report = Orchestrator(config, provider, JsonFileStorage(root / ".agent_data")).run(task=mock.MagicMock(objective="Fix the student HomePage."), subtask_id="mock-subtask-id") # Added storage
+                                                                                            ^^^^
+NameError: name 'mock' is not defined
+
+======================================================================
+ERROR: test_js_command_discovery (tests.test_phase38.Phase38Tests.test_js_command_discovery)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 99, in test_js_command_discovery
+    commands = validation_intelligence.discover_commands(repo_map)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_orchestrator_executes_primary_validation_commands (tests.test_phase38.Phase38Tests.test_orchestrator_executes_primary_validation_commands)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 252, in test_orchestrator_executes_primary_validation_commands
+    report = Orchestrator(config, provider).run("Test task.")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: test_orchestrator_passes_validation_plan_to_provider_and_report (tests.test_phase38.Phase38Tests.test_orchestrator_passes_validation_plan_to_provider_and_report)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 201, in test_orchestrator_passes_validation_plan_to_provider_and_report
+    report = Orchestrator(config, provider).run("Add an About page and link it in navigation.")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: test_orchestrator_stops_on_validation_failure (tests.test_phase38.Phase38Tests.test_orchestrator_stops_on_validation_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 283, in test_orchestrator_stops_on_validation_failure
+    report = Orchestrator(config, provider).run("Test task.")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: test_python_command_discovery (tests.test_phase38.Phase38Tests.test_python_command_discovery)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 126, in test_python_command_discovery
+    commands = validation_intelligence.discover_commands(repo_map)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_task_aware_validation_selection_add_page (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_add_page)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 146, in test_task_aware_validation_selection_add_page
+    discovered_commands = validation_intelligence.discover_commands(repo_map)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_task_aware_validation_selection_fix_auth (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_fix_auth)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 166, in test_task_aware_validation_selection_fix_auth
+    discovered_commands = validation_intelligence.discover_commands(repo_map)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_task_aware_validation_selection_refactor_component (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_refactor_component)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 184, in test_task_aware_validation_selection_refactor_component
+    discovered_commands = validation_intelligence.discover_commands(repo_map)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_validation_plan_serialization (tests.test_phase38.Phase38Tests.test_validation_plan_serialization)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 297, in test_validation_plan_serialization
+    discovered_commands = validation_intelligence.discover_commands(repo_map)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_checkpoint_persistence_and_reload (tests.test_phase39.Phase39Tests.test_checkpoint_persistence_and_reload)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 107, in setUp
+    self._setup_repository()
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 115, in _setup_repository
+    (self.root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1047, in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\tmp6f9d50gz\\src\\app.py'
+
+======================================================================
+ERROR: test_completed_task_persistence (tests.test_phase39.Phase39Tests.test_completed_task_persistence)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 107, in setUp
+    self._setup_repository()
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 115, in _setup_repository
+    (self.root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1047, in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\tmpqrjraeif\\src\\app.py'
+
+======================================================================
+ERROR: test_no_api_secrets_stored_in_checkpoints (tests.test_phase39.Phase39Tests.test_no_api_secrets_stored_in_checkpoints)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 107, in setUp
+    self._setup_repository()
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 115, in _setup_repository
+    (self.root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1047, in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\tmprqjk8x8o\\src\\app.py'
+
+======================================================================
+ERROR: test_permanent_failure_leads_to_failed_state (tests.test_phase39.Phase39Tests.test_permanent_failure_leads_to_failed_state)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 107, in setUp
+    self._setup_repository()
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 115, in _setup_repository
+    (self.root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1047, in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\tmp504yirh4\\src\\app.py'
+
+======================================================================
+ERROR: test_provider_agnostic_continuation_context (tests.test_phase39.Phase39Tests.test_provider_agnostic_continuation_context)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 107, in setUp
+    self._setup_repository()
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 115, in _setup_repository
+    (self.root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1047, in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\tmpzwf3w6rh\\src\\app.py'
+
+======================================================================
+ERROR: test_quota_exhaustion_leads_to_paused_state_and_resume (tests.test_phase39.Phase39Tests.test_quota_exhaustion_leads_to_paused_state_and_resume)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 107, in setUp
+    self._setup_repository()
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 115, in _setup_repository
+    (self.root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1047, in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\tmpbhf7riff\\src\\app.py'
+
+======================================================================
+ERROR: test_subtask_state_transitions (tests.test_phase39.Phase39Tests.test_subtask_state_transitions)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 107, in setUp
+    self._setup_repository()
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 115, in _setup_repository
+    (self.root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1047, in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\tmpfhvugbbx\\src\\app.py'
+
+======================================================================
+ERROR: test_task_creation_and_persistence (tests.test_phase39.Phase39Tests.test_task_creation_and_persistence)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 107, in setUp
+    self._setup_repository()
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 115, in _setup_repository
+    (self.root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1047, in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\tmpp7dyaa1_\\src\\app.py'
+
+======================================================================
+ERROR: test_task_reload_after_process_restart_simulation (tests.test_phase39.Phase39Tests.test_task_reload_after_process_restart_simulation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 107, in setUp
+    self._setup_repository()
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 115, in _setup_repository
+    (self.root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1047, in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\tmp9sqkkxhe\\src\\app.py'
+
+======================================================================
+ERROR: test_temporary_provider_error_leads_to_paused_state (tests.test_phase39.Phase39Tests.test_temporary_provider_error_leads_to_paused_state)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 107, in setUp
+    self._setup_repository()
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase39.py", line 115, in _setup_repository
+    (self.root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1047, in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\tmpcjywovja\\src\\app.py'
+
+======================================================================
+ERROR: test_iteration_limit_is_bounded_when_validation_fails (tests.test_workflow.WorkflowTests.test_iteration_limit_is_bounded_when_validation_fails)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_workflow.py", line 17, in test_iteration_limit_is_bounded_when_validation_fails
+    report = Orchestrator(config, MockProvider()).run("Fix the failing task")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: test_mock_workflow_reports_incomplete_instead_of_faking_code (tests.test_workflow.WorkflowTests.test_mock_workflow_reports_incomplete_instead_of_faking_code)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_workflow.py", line 26, in test_mock_workflow_reports_incomplete_instead_of_faking_code
+    report = Orchestrator(config, MockProvider()).run("Implement a feature")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+FAIL: test_scheduler_accepts_valid_proposal_and_sets_plan_proposed (tests.test_phase314.Phase314Tests.test_scheduler_accepts_valid_proposal_and_sets_plan_proposed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\mock.py", line 1390, in patched
+    return func(*newargs, **newkeywargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase314.py", line 78, in test_scheduler_accepts_valid_proposal_and_sets_plan_proposed
+    self.assertEqual(loaded_task.status, TaskStatus.PLAN_PROPOSED)
+AssertionError: <TaskStatus.RUNNING: 'running'> != <TaskStatus.PLAN_PROPOSED: 'plan_proposed'>
+
+======================================================================
+FAIL: test_7_qualified_symbol_matching (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_7_qualified_symbol_matching)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3154.py", line 219, in test_7_qualified_symbol_matching
+    self.assertTrue(any(reason.startswith("semantic symbol definition match:") for reason in reasons))
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_class_only_symbol_regression (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_class_only_symbol_regression)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3156.py", line 153, in test_class_only_symbol_regression
+    self.assertLess(score_user, 0.6)
+AssertionError: 0.99 not less than 0.6
+
+======================================================================
+FAIL: test_exact_qualified_python_match (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_exact_qualified_python_match)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3156.py", line 97, in test_exact_qualified_python_match
+    self.assertLess(score_auth, 0.6, "AuthService.save should not get qualified boost")
+AssertionError: 0.836 not less than 0.6 : AuthService.save should not get qualified boost
+
+======================================================================
+FAIL: test_missing_semantic_index_fallback (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_missing_semantic_index_fallback)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3156.py", line 182, in test_missing_semantic_index_fallback
+    self.assertLess(score_user, 0.5)
+AssertionError: 0.536 not less than 0.5
+
+======================================================================
+FAIL: test_parent_container_mismatch (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_parent_container_mismatch)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3156.py", line 125, in test_parent_container_mismatch
+    self.assertLess(score_user, 0.6)
+AssertionError: 0.824 not less than 0.6
+
+======================================================================
+FAIL: test_unqualified_symbol_regression (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_unqualified_symbol_regression)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3156.py", line 141, in test_unqualified_symbol_regression
+    self.assertLess(score_user, 0.6)
+AssertionError: 0.612 not less than 0.6
+
+======================================================================
+FAIL: test_missing_relationship_data_falls_back_safely (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_missing_relationship_data_falls_back_safely)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3157.py", line 113, in test_missing_relationship_data_falls_back_safely
+    self.assertLess(score_handler, 0.15, "Handler should not get a boost without relationship data")
+AssertionError: 0.336 not less than 0.15 : Handler should not get a boost without relationship data
+
+======================================================================
+FAIL: test_missing_semantic_index_falls_back_safely (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_missing_semantic_index_falls_back_safely)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3157.py", line 123, in test_missing_semantic_index_falls_back_safely
+    self.assertLess(score_service, 0.5)
+AssertionError: 0.601 not less than 0.5
+
+======================================================================
+FAIL: test_multiple_semantic_seeds_do_not_duplicate_boost (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_multiple_semantic_seeds_do_not_duplicate_boost)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3157.py", line 105, in test_multiple_semantic_seeds_do_not_duplicate_boost
+    self.assertLess(score_service, 0.25, "Score should not be additive for multiple relations")
+AssertionError: 0.592 not less than 0.25 : Score should not be additive for multiple relations
+
+======================================================================
+FAIL: test_qualified_symbol_regression_with_dependency (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_qualified_symbol_regression_with_dependency)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3157.py", line 133, in test_qualified_symbol_regression_with_dependency
+    self.assertLess(score_handler, 0.25)
+AssertionError: 0.574 not less than 0.25
+
+======================================================================
+FAIL: test_related_file_gets_secondary_boost (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_related_file_gets_secondary_boost)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3157.py", line 87, in test_related_file_gets_secondary_boost
+    self.assertLess(score_handler, 0.25, "Related file boost should be less than direct substring match")
+AssertionError: 0.586 not less than 0.25 : Related file boost should be less than direct substring match
+
+======================================================================
+FAIL: test_roadmap_updated_for_semantic_indexing (tests.test_phase3159.Phase3159_DocumentationTests.test_roadmap_updated_for_semantic_indexing)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase3159.py", line 10, in test_roadmap_updated_for_semantic_indexing
+    self.assertIn("1. Add semantic code search and incremental project indexing. (Completed in Phase 3.15)", content)
+AssertionError: '1. Add semantic code search and incremental project indexing. (Completed in Phase 3.15)' not found in '# Local-first Autonomous AI Software Engineer\n\n`agent` is a local-first coding-agent MVP. It analyzes a project on disk,\nselects task-relevant context, asks a pluggable provider for a plan and\nstructured patch changes, validates and applies those changes safely, runs\ndetected validation commands, repairs failures up to a bounded limit, and\nreviews the resulting diff.\n\nThe target project is always an explicit local directory (or the current\ndirectory). The agent does not require GitHub or any other remote service, never\ncommits or pushes automatically, and confines file operations to the target.\n\n## Installation\n\nPython 3.11+ is required. From this repository:\n\n```powershell\npython -m pip install -e .\n```\n\nThe project has no runtime dependencies. Tests use the Python standard library.\n\n## Usage\n\nAnalyze a local project:\n\n```powershell\nagent analyze --project "D:\\Projects\\my-app"\n```\n\nRun a task in the current directory or another project:\n\n```powershell\nagent run "Add input validation"\nagent run --project "D:\\Projects\\my-app" "Fix the failing login test"\n```\n\nThe default `mock` provider is deliberately offline and makes no source\nchanges. It is useful for exercising the workflow and safety boundaries. To\nenable model-backed planning and edits, configure an OpenAI-compatible provider:\n\n```powershell\n$env:AGENT_PROVIDER = "openai"\n$env:OPENAI_API_KEY = "..."\n$env:OPENAI_MODEL = "gpt-4.1-mini"\nagent run --project "D:\\Projects\\my-app" "Implement feature X"\n```\n\nGemini is supported without an additional SDK. The provider sends structured\nJSON requests to the Gemini REST API and prefers unified patches for edits:\n\n```powershell\n$env:AGENT_PROVIDER = "gemini"\n$env:GEMINI_API_KEY = "..."\n$env:GEMINI_MODEL = "gemini-2.5-flash"\nagent run --project "D:\\Projects\\my-app" --provider gemini "Implement feature X"\n```\n\nThe model name is configurable with `--model` or `GEMINI_MODEL`. API keys are\nread only from environment variables and are never printed.\n\nPhase 3 context and retry controls are configurable with `AGENT_*` settings,\nincluding `AGENT_MAX_CONTEXT_FILES`, `AGENT_MAX_CONTEXT_FILE_BYTES`,\n`AGENT_MAX_CONTEXT_TOKENS`, and `AGENT_DEPENDENCY_DEPTH`,\n`AGENT_PLANNING_CONTEXT_BYTES`, `AGENT_IMPLEMENTATION_CONTEXT_BYTES`,\n`AGENT_REPAIR_CONTEXT_BYTES`, `AGENT_REVIEW_CONTEXT_BYTES`,\n`AGENT_PROVIDER_MAX_RETRIES`, and `AGENT_MAX_RETRY_WAIT_SECONDS`. Set\n`AGENT_METRICS=true` to include approximate request sizes, token counts,\nduration, model, and success/failure metrics in the run report. Metrics never\ninclude keys or source contents.\n\nPhase 3.5 adds deterministic repository intelligence. The scanner builds a\ntyped local repository map with file metadata, stacks, frameworks, entry\npoints, tests, configuration, ignore/protected-path decisions, and lightweight\nPython/JavaScript/TypeScript relationships. It reads locally and does not call\nan AI provider:\n\n```powershell\nagent inspect --project "D:\\Projects\\my-app"\nagent context --project "D:\\Projects\\my-app" "Add class management to the teacher dashboard"\n```\n\n`agent context` reports task relevance scores, explanations, dependency\nexpansion, exclusions, and context-budget usage. Dependency expansion defaults\nto one hop and is configurable with `AGENT_DEPENDENCY_DEPTH`.\n\nThe official Antigravity managed-agent API is also available as a separate\nprovider. It uses the documented Gemini Interactions API and does not reuse\nAntigravity CLI or browser credentials:\n\n```powershell\n$env:GEMINI_API_KEY = "..."\n$env:GEMINI_MODEL = "gemini-3.7-flash"\nagent run --project "D:\\Projects\\my-app" --provider antigravity "Implement feature X"\n```\n\nYou can also use `python -m local_agent` instead of the installed `agent`\ncommand. Use `--max-iterations N` to bound autonomous repair attempts and\n`--validation "python -m unittest"` to add an explicit validation command.\n\n## Local desktop UI\n\nFor machines where the terminal environment does not share the expected API-key\nenvironment, launch the lightweight Tkinter UI:\n\n```powershell\npython -m local_agent.ui\n# or, after installation:\nagent-ui\n```\n\nThe UI lets you choose a provider and model, enter a key in a masked field,\nselect a local project, test Gemini connectivity, run dry-runs, and require\napproval before changes are applied. Keys are held only in the running process;\nthe UI passes them directly through runtime configuration to the provider and\ndoes not write them to process environment variables, configuration files,\nproject files, logs, or reports. CLI usage continues to fall back to\n`GEMINI_API_KEY` or `OPENAI_API_KEY` when no runtime key is supplied.\n\nUse dry-run to inspect proposed changes without writing files, or approval mode\nto pause immediately before applying validated changes:\n\n```powershell\nagent run --project "D:\\Projects\\my-app" --provider gemini --dry-run "Implement feature X"\nagent run --project "D:\\Projects\\my-app" --provider gemini --approval always "Implement feature X"\n```\n\n## Architecture\n\n```text\nCLI -> Orchestrator\n       |-- RepositoryAnalyzer -> ProjectContext\n       |-- Planner -> Plan\n       |-- CodingAgent -> sandboxed FileSystem\n       |-- CommandRunner -> ValidationResult\n       |-- FailureAnalyzer -> FailureAnalysis\n       |-- Reviewer -> ReviewResult\n       `-- AIProvider (mock, OpenAI, Gemini, or Antigravity API)\n```\n\nThe `local_agent` package keeps each responsibility small:\n\n- `config.py` centralizes environment and CLI configuration.\n- `analyzer.py` discovers project metadata without sending the whole repository\n  to a provider.\n- `repository.py` builds the deterministic repository map and local file\n  relationships used by inspection and context selection.\n- `context.py` ranks candidate files by task keywords, path/content matches,\n  tests, configuration, recent Git changes, and dependency relationships before\n  provider calls, subject to file/byte/token budgets. React/TypeScript tasks\n  additionally use router, layout, navigation, page, reverse-import, test, and\n  package-dependency relationships; generic words receive lower weight.\n- `filesystem.py` enforces the target-project boundary and protects Git and\n  common secret files.\n- `git.py` provides read-only local status, diff, branch, and log inspection.\n- `commands.py` executes discovered commands without a shell and captures\n  command, exit code, output, and duration.\n- `patching.py` validates and applies strict unified diffs in memory before any\n  filesystem write.\n- `providers.py`, `planner.py`, `coding_agent.py`, `failure.py`, and\n  `reviewer.py` implement the provider and development workflow.\n- `orchestrator.py` coordinates a bounded plan/implement/validate/repair/review\n  loop.\n\n## Safety and current limitations\n\nFile paths are resolved beneath the selected project directory. `.git` is never\ndeleted, destructive commands are rejected, secrets are not read by analysis,\nand unrelated pre-existing Git changes are reported and left untouched. The\nagent never commits, pushes, resets, or silently discards changes.\n\nThe mock provider does not invent code changes. OpenAI and Gemini require a\nworking API key and models that return the documented JSON shapes; live provider\ncalls are not part of the automated tests. AI output is treated as untrusted:\npaths, operations, patches, protected files, and plan scope are checked before\nwriting. Command discovery is intentionally conservative, and language-specific\nsemantic indexing, parallel agents, CI integration, dashboard/IDE integrations,\nlong-term memory, and remote Git workflows are not included in this MVP.\n\n## Safe Gemini manual test\n\nCreate a temporary project with a small Python module and unittest, then run:\n\n```powershell\n$env:GEMINI_API_KEY = "..."\n$env:GEMINI_MODEL = "gemini-2.5-flash"\nagent run --project "D:\\Projects\\agent-test" --provider gemini --dry-run "Add a multiply function and tests"\nagent run --project "D:\\Projects\\agent-test" --provider gemini --approval always "Add a multiply function and tests"\n```\n\nReview the dry-run diff first. The second command asks for confirmation before\nwriting. Use `--max-iterations 1` for a bounded smoke test. Never place the API\nkey in the command line or commit it to the target project.\n\n## Roadmap\n\n1. Add semantic code search and incremental project indexing.\n2. Add more providers and provider capability negotiation.\n3. Add approval policies and richer command permissions.\n4. Add parallel specialist agents, CI integration, and project memory.\n5. Add optional Git commits, pull requests, dashboard, and IDE integrations.\n'
+
+======================================================================
+FAIL: test_scan_builds_deterministic_map_and_protects_ignored_files (tests.test_phase35.Phase35Tests.test_scan_builds_deterministic_map_and_protects_ignored_files)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase35.py", line 69, in test_scan_builds_deterministic_map_and_protects_ignored_files
+    self.assertEqual(context.repository_map.compact(), RepositoryAnalyzer(root).analyze().repository_map.compact())
+AssertionError: {'roo[182 chars]nt': 8}, 'languages': ['Python'], 'frameworks'[110 chars]': 5} != {'roo[182 chars]nt': 9}, 'languages': ['Python'], 'frameworks'[110 chars]': 5}
+Diff is 654 characters long. Set self.maxDiff to None to see it.
+
+----------------------------------------------------------------------
+Ran 137 tests in 5.610s
+
+FAILED (failures=14, errors=39, skipped=3)

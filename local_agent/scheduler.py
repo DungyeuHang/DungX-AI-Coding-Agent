@@ -88,6 +88,7 @@ class Scheduler:
             return
 
         # Phase 3.11: If task has no plan, create one first.
+        planned_in_this_run = False
         if not runnable_task.plan:
             emit(f"Task {runnable_task.task_id} has no plan. Generating one...")
             planning_provider_configs = self._select_providers(runnable_task, required_capabilities={ProviderCapability.PLANNING})
@@ -98,15 +99,35 @@ class Scheduler:
                 self.storage.save_task(runnable_task)
                 return
             
-            try:
-                self._plan_task(runnable_task, planning_provider_configs[0]) # Use the highest priority provider for planning
-                runnable_task = self.storage.load_task(runnable_task.task_id) # Re-load task with plan
-            except (ValueError, ProviderError) as e:
-                emit(f"Failed to create a valid plan for task {runnable_task.task_id}: {e}")
+            plan_succeeded = False
+            last_plan_error: Exception | None = None
+
+            for planning_provider_config in planning_provider_configs:
+                emit(f"Attempting to generate a plan for task {runnable_task.task_id} with provider '{planning_provider_config.provider}'.")
+                try:
+                    self._plan_task_with_provider(runnable_task, planning_provider_config)
+                    runnable_task = self.storage.load_task(runnable_task.task_id) # Re-load task with plan
+                    self._update_provider_state_after_success(planning_provider_config.provider)
+                    plan_succeeded = True
+                    break
+                except (ValueError, ProviderError) as e:
+                    last_plan_error = e
+                    emit(f"Planning with provider '{planning_provider_config.provider}' failed: {e}. Trying next available provider.")
+                    if isinstance(e, ProviderError):
+                        self._update_provider_state_after_failure(planning_provider_config.provider, e.category, e.retry_after_seconds)
+                    else:
+                        # ValueError from _plan_task_with_provider means no API key is configured for this provider
+                        self._update_provider_state_after_failure(planning_provider_config.provider, "AUTHENTICATION_ERROR", None)
+                    continue
+
+            if not plan_succeeded:
+                emit(f"Failed to create a valid plan for task {runnable_task.task_id}: {last_plan_error}")
                 runnable_task.status = TaskStatus.FAILED
                 runnable_task.updated_at = datetime.datetime.now(datetime.timezone.utc)
                 self.storage.save_task(runnable_task)
                 return
+
+            planned_in_this_run = True
             
             # Phase 3.12: After planning, if approval_mode is 'plan_review', set task to PLAN_REVIEW
             if self.base_config.approval_mode == "plan_review":
@@ -119,6 +140,9 @@ class Scheduler:
         provider_configs = self._select_providers(runnable_task)
 
         if not provider_configs:
+            if planned_in_this_run:
+                emit(f"Task {runnable_task.task_id} plan generated; no execution provider available yet. Task remains PENDING for a later run.")
+                return # Task already saved with the plan; stays PENDING for execution
             emit(f"No available and compatible provider for task {runnable_task.task_id}. Scheduling for later.")
             runnable_task.status = TaskStatus.PAUSED
             runnable_task.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=DEFAULT_RETRY_BACKOFF_SECONDS)

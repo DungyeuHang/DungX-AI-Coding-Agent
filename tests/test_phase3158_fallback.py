@@ -15,6 +15,7 @@ class RepositoryIntelligenceFallbackTests(unittest.TestCase):
         self.temp_dir = Path(tempfile.mkdtemp())
         self.root = self.temp_dir / "repo"
         self.root.mkdir()
+        (self.root / "src").mkdir(parents=True, exist_ok=True)
         (self.root / "src/app.py").write_text("def main_func():\n    pass\n", encoding="utf-8")
 
     def tearDown(self):

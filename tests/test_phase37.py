@@ -134,7 +134,7 @@ class Phase37Tests(unittest.TestCase):
         provider = CapturingProvider()
         config = AgentConfig.from_environment(root, max_iterations=1)
 
-    report = Orchestrator(config, provider, JsonFileStorage(root / ".agent_data")).run(task=mock.MagicMock(objective="Fix the student HomePage."), subtask_id="mock-subtask-id") # Added storage
+        report = Orchestrator(config, provider, JsonFileStorage(root / ".agent_data")).run(task=mock.MagicMock(objective="Fix the student HomePage."), subtask_id="mock-subtask-id") # Added storage
 
         self.assertTrue(report.completed)
         self.assertIs(report.project, provider.plan_context)

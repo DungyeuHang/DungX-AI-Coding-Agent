@@ -81,36 +81,32 @@ class Planner:
         if not task.strip():
             raise ValueError("task cannot be empty")
 
-        # This is a conceptual implementation. The actual prompt would be more complex.
-        # The provider's `generate_plan` is being repurposed to return a more complex structure.
-        # In a real system, this might be a different provider method, e.g., `decompose_task`.
-        system_prompt = (
-            "You are an expert software architect. Decompose the user's task into a dependency graph of smaller, concrete engineering subtasks. "
-            "Return only valid JSON with a 'plan' key. The value should be an object with 'subtasks', 'risks', and 'assumptions'. "
-            "Each subtask must have 'id', 'title', 'goal', 'dependencies' (a list of other subtask ids), and 'acceptance_criteria' (a list of strings)."
-        )
-        user_prompt = f"Task:\n{task}\n\nProject context:\n{self.provider._context(context)}"
-
-        # We assume the provider's `generate_plan` can be adapted or a new method is used
-        # to get this structured JSON output. For this phase, we'll simulate it.
-        # The `generate_plan` in `providers.py` would need to be updated to handle this.
-        # For now, we'll assume it returns the structured data.
-        decomposed_plan_data = self.provider.generate_plan(user_prompt, context) # This is a conceptual call
+        # The public AIProvider contract is `generate_plan(...) -> Plan`. We
+        # normalize that provider-level Plan into the structured TaskPlan the
+        # scheduler executes: each Plan step becomes a Subtask in a dependency
+        # chain, and the Plan risks become the TaskPlan risks.
+        plan = self.provider.generate_plan(task, context)
 
         now = datetime.datetime.now(datetime.timezone.utc)
-        subtasks = [
-            Subtask(
-                subtask_id=s.get("id", str(uuid.uuid4())),
-                title=s.get("title", "Untitled Subtask"),
-                goal=s.get("goal", "No goal specified."),
-                description=s.get("goal", "No goal specified."), # Use goal as description
-                dependencies=s.get("dependencies", []),
-                acceptance_criteria=s.get("acceptance_criteria", []),
-                status=SubtaskStatus.PENDING,
-                created_at=now,
-                updated_at=now,
-            ) for s in decomposed_plan_data.get("subtasks", [])
-        ]
+        steps = plan.steps if plan.steps else [task]
+        subtasks: list[Subtask] = []
+        for step in steps:
+            step_text = step.strip()
+            if not step_text:
+                continue
+            subtasks.append(
+                Subtask(
+                    subtask_id=str(uuid.uuid4()),
+                    title=step_text,
+                    goal=step_text,
+                    description=step_text,
+                    dependencies=[subtasks[-1].subtask_id] if subtasks else [],
+                    acceptance_criteria=[],
+                    status=SubtaskStatus.PENDING,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
 
         errors = GraphValidator(subtasks).validate()
         if errors:
@@ -119,6 +115,6 @@ class Planner:
         return TaskPlan(
             objective=task,
             subtasks=subtasks,
-            risks=decomposed_plan_data.get("risks", []),
-            assumptions=decomposed_plan_data.get("assumptions", []),
+            risks=plan.risks,
+            assumptions=[],
         )

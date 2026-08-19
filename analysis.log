@@ -1,0 +1,153 @@
+146: ERROR: test_planner_and_mock_provider_are_real_structured_operations (tests.test_core.CoreTests.test_planner_and_mock_provider_are_real_structured_operations)
+148: Traceback (most recent call last):
+152: AttributeError: 'Planner' object has no attribute 'create_plan'. Did you mean: 'create_task_plan'?
+155: ERROR: test_dry_run_and_approval_do_not_write (tests.test_phase2.Phase2Tests.test_dry_run_and_approval_do_not_write)
+157: Traceback (most recent call last):
+161: TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+164: ERROR: test_repair_cycle_uses_failure_and_respects_limit (tests.test_phase2.Phase2Tests.test_repair_cycle_uses_failure_and_respects_limit)
+166: Traceback (most recent call last):
+170: TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+173: ERROR: test_sandbox_integration_performs_real_deterministic_coding_workflow (tests.test_phase2.Phase2Tests.test_sandbox_integration_performs_real_deterministic_coding_wor
+175: Traceback (most recent call last):
+179: TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+182: ERROR: test_invalid_patch_then_quota_preserves_file_and_stops_repair (tests.test_phase3.Phase3Tests.test_invalid_patch_then_quota_preserves_file_and_stops_repair)
+184: Traceback (most recent call last):
+188: TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+191: ERROR: tests.test_phase310 (unittest.loader._FailedTest.tests.test_phase310)
+193: ImportError: Failed to import test module: tests.test_phase310
+194: Traceback (most recent call last):
+202: ImportError: cannot import name 'ProviderError' from 'local_agent.models' (D:\GitHub\DungX-AI-Coding-Agent\local_agent\models.py)
+206: ERROR: test_all_providers_not_configured (tests.test_phase310_1.Phase310_1_Tests.test_all_providers_not_configured)
+208: Traceback (most recent call last):
+212: AttributeError: 'Scheduler' object has no attribute '_select_provider'. Did you mean: '_select_providers'?
+215: ERROR: test_fallback_with_missing_credentials (tests.test_phase310_1.Phase310_1_Tests.test_fallback_with_missing_credentials)
+217: Traceback (most recent call last):
+221: AttributeError: 'Scheduler' object has no attribute '_select_provider'. Did you mean: '_select_providers'?
+224: ERROR: test_provider_selection_with_credentials (tests.test_phase310_1.Phase310_1_Tests.test_provider_selection_with_credentials)
+226: Traceback (most recent call last):
+230: AttributeError: 'Scheduler' object has no attribute '_select_provider'. Did you mean: '_select_providers'?
+233: ERROR: test_restart_behavior (tests.test_phase310_1.Phase310_1_Tests.test_restart_behavior)
+235: Traceback (most recent call last):
+239: AttributeError: 'Scheduler' object has no attribute '_select_provider'. Did you mean: '_select_providers'?
+242: ERROR: test_secrets_not_in_state_files (tests.test_phase310_1.Phase310_1_Tests.test_secrets_not_in_state_files)
+244: Traceback (most recent call last):
+266:     raise TypeError(f'Object of type {o.__class__.__name__} '
+267: TypeError: Object of type datetime is not JSON serializable
+270: ERROR: tests.test_phase311 (unittest.loader._FailedTest.tests.test_phase311)
+272: ImportError: Failed to import test module: tests.test_phase311
+273: Traceback (most recent call last):
+281: ImportError: cannot import name 'QuotaExceededError' from 'local_agent.models' (D:\GitHub\DungX-AI-Coding-Agent\local_agent\models.py)
+285: ERROR: tests.test_phase312 (unittest.loader._FailedTest.tests.test_phase312)
+287: ImportError: Failed to import test module: tests.test_phase312
+288: Traceback (most recent call last):
+296: ImportError: cannot import name 'QuotaExceededError' from 'local_agent.models' (D:\GitHub\DungX-AI-Coding-Agent\local_agent\models.py)
+300: ERROR: test_approve_proposal_applies_changes_and_sets_pending (tests.test_phase314.Phase314Tests.test_approve_proposal_applies_changes_and_sets_pending)
+302: Traceback (most recent call last):
+310: TypeError: add_common_arguments() got an unexpected keyword argument 'include_provider_args'
+313: ERROR: test_proposal_with_add_subtask_survives_roundtrip (tests.test_phase314.Phase314Tests.test_proposal_with_add_subtask_survives_roundtrip)
+315: Traceback (most recent call last):
+340:     raise TypeError(f'Object of type {o.__class__.__name__} '
+341: TypeError: Object of type datetime is not JSON serializable
+344: ERROR: test_reject_proposal_clears_proposal_and_sets_paused (tests.test_phase314.Phase314Tests.test_reject_proposal_clears_proposal_and_sets_paused)
+346: Traceback (most recent call last):
+354: TypeError: add_common_arguments() got an unexpected keyword argument 'include_provider_args'
+357: ERROR: test_context_cli_does_not_call_provider (tests.test_phase35.Phase35Tests.test_context_cli_does_not_call_provider)
+359: Traceback (most recent call last):
+368: TypeError: add_common_arguments() got an unexpected keyword argument 'include_provider_args'
+371: ERROR: test_orchestrator_passes_change_impact_to_provider_and_report (tests.test_phase37.Phase37Tests.test_orchestrator_passes_change_impact_to_provider_and_report)
+373: Traceback (most recent call last):
+380: ERROR: test_js_command_discovery (tests.test_phase38.Phase38Tests.test_js_command_discovery)
+382: Traceback (most recent call last):
+389: AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+392: ERROR: test_orchestrator_executes_primary_validation_commands (tests.test_phase38.Phase38Tests.test_orchestrator_executes_primary_validation_commands)
+394: Traceback (most recent call last):
+398: TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+401: ERROR: test_orchestrator_passes_validation_plan_to_provider_and_report (tests.test_phase38.Phase38Tests.test_orchestrator_passes_validation_plan_to_provider_and_report)
+403: Traceback (most recent call last):
+407: TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+410: ERROR: test_orchestrator_stops_on_validation_failure (tests.test_phase38.Phase38Tests.test_orchestrator_stops_on_validation_failure)
+412: Traceback (most recent call last):
+416: TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+419: ERROR: test_python_command_discovery (tests.test_phase38.Phase38Tests.test_python_command_discovery)
+421: Traceback (most recent call last):
+428: AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+431: ERROR: test_task_aware_validation_selection_add_page (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_add_page)
+433: Traceback (most recent call last):
+440: AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+443: ERROR: test_task_aware_validation_selection_fix_auth (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_fix_auth)
+445: Traceback (most recent call last):
+452: AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+455: ERROR: test_task_aware_validation_selection_refactor_component (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_refactor_component)
+457: Traceback (most recent call last):
+464: AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+467: ERROR: test_validation_plan_serialization (tests.test_phase38.Phase38Tests.test_validation_plan_serialization)
+469: Traceback (most recent call last):
+476: AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+479: ERROR: test_checkpoint_persistence_and_reload (tests.test_phase39.Phase39Tests.test_checkpoint_persistence_and_reload)
+481: Traceback (most recent call last):
+495: ERROR: test_completed_task_persistence (tests.test_phase39.Phase39Tests.test_completed_task_persistence)
+497: Traceback (most recent call last):
+511: ERROR: test_no_api_secrets_stored_in_checkpoints (tests.test_phase39.Phase39Tests.test_no_api_secrets_stored_in_checkpoints)
+513: Traceback (most recent call last):
+527: ERROR: test_permanent_failure_leads_to_failed_state (tests.test_phase39.Phase39Tests.test_permanent_failure_leads_to_failed_state)
+529: Traceback (most recent call last):
+543: ERROR: test_provider_agnostic_continuation_context (tests.test_phase39.Phase39Tests.test_provider_agnostic_continuation_context)
+545: Traceback (most recent call last):
+559: ERROR: test_quota_exhaustion_leads_to_paused_state_and_resume (tests.test_phase39.Phase39Tests.test_quota_exhaustion_leads_to_paused_state_and_resume)
+561: Traceback (most recent call last):
+575: ERROR: test_subtask_state_transitions (tests.test_phase39.Phase39Tests.test_subtask_state_transitions)
+577: Traceback (most recent call last):
+591: ERROR: test_task_creation_and_persistence (tests.test_phase39.Phase39Tests.test_task_creation_and_persistence)
+593: Traceback (most recent call last):
+607: ERROR: test_task_reload_after_process_restart_simulation (tests.test_phase39.Phase39Tests.test_task_reload_after_process_restart_simulation)
+609: Traceback (most recent call last):
+623: ERROR: test_temporary_provider_error_leads_to_paused_state (tests.test_phase39.Phase39Tests.test_temporary_provider_error_leads_to_paused_state)
+625: Traceback (most recent call last):
+639: ERROR: test_iteration_limit_is_bounded_when_validation_fails (tests.test_workflow.WorkflowTests.test_iteration_limit_is_bounded_when_validation_fails)
+641: Traceback (most recent call last):
+645: TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+648: ERROR: test_mock_workflow_reports_incomplete_instead_of_faking_code (tests.test_workflow.WorkflowTests.test_mock_workflow_reports_incomplete_instead_of_faking_code)
+650: Traceback (most recent call last):
+654: TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+657: FAIL: test_scheduler_accepts_valid_proposal_and_sets_plan_proposed (tests.test_phase314.Phase314Tests.test_scheduler_accepts_valid_proposal_and_sets_plan_proposed)
+659: Traceback (most recent call last):
+664:     self.assertEqual(loaded_task.status, TaskStatus.PLAN_PROPOSED)
+668: FAIL: test_7_qualified_symbol_matching (tests.test_phase3154.TestPhase3154ContextSelectorIntegration.test_7_qualified_symbol_matching)
+670: Traceback (most recent call last):
+672:     self.assertTrue(any(reason.startswith("semantic symbol definition match:") for reason in reasons))
+676: FAIL: test_class_only_symbol_regression (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_class_only_symbol_regression)
+678: Traceback (most recent call last):
+680:     self.assertLess(score_user, 0.6)
+684: FAIL: test_exact_qualified_python_match (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_exact_qualified_python_match)
+686: Traceback (most recent call last):
+688:     self.assertLess(score_auth, 0.6, "AuthService.save should not get qualified boost")
+692: FAIL: test_missing_semantic_index_fallback (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_missing_semantic_index_fallback)
+694: Traceback (most recent call last):
+696:     self.assertLess(score_user, 0.5)
+700: FAIL: test_parent_container_mismatch (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_parent_container_mismatch)
+702: Traceback (most recent call last):
+704:     self.assertLess(score_user, 0.6)
+708: FAIL: test_unqualified_symbol_regression (tests.test_phase3156.Phase3156_QualifiedSymbolResolutionTests.test_unqualified_symbol_regression)
+710: Traceback (most recent call last):
+712:     self.assertLess(score_user, 0.6)
+716: FAIL: test_missing_relationship_data_falls_back_safely (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_missing_relationship_data_falls_back_safely)
+718: Traceback (most recent call last):
+720:     self.assertLess(score_handler, 0.15, "Handler should not get a boost without relationship data")
+724: FAIL: test_missing_semantic_index_falls_back_safely (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_missing_semantic_index_falls_back_safely)
+726: Traceback (most recent call last):
+728:     self.assertLess(score_service, 0.5)
+732: FAIL: test_multiple_semantic_seeds_do_not_duplicate_boost (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_multiple_semantic_seeds_do_not_duplicate_boos
+734: Traceback (most recent call last):
+736:     self.assertLess(score_service, 0.25, "Score should not be additive for multiple relations")
+740: FAIL: test_qualified_symbol_regression_with_dependency (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_qualified_symbol_regression_with_dependency)
+742: Traceback (most recent call last):
+744:     self.assertLess(score_handler, 0.25)
+748: FAIL: test_related_file_gets_secondary_boost (tests.test_phase3157.Phase3157_DependencyAwareRetrievalTests.test_related_file_gets_secondary_boost)
+750: Traceback (most recent call last):
+752:     self.assertLess(score_handler, 0.25, "Related file boost should be less than direct substring match")
+756: FAIL: test_roadmap_updated_for_semantic_indexing (tests.test_phase3159.Phase3159_DocumentationTests.test_roadmap_updated_for_semantic_indexing)
+758: Traceback (most recent call last):
+760:     self.assertIn("1. Add semantic code search and incremental project indexing. (Completed in Phase 3.15)", content)
+764: FAIL: test_scan_builds_deterministic_map_and_protects_ignored_files (tests.test_phase35.Phase35Tests.test_scan_builds_deterministic_map_and_protects_ignored_files)
+766: Traceback (most recent call last):
+768:     self.assertEqual(context.repository_map.compact(), RepositoryAnalyzer(root).analyze().repository_map.compact())

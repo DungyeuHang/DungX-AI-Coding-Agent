@@ -65,9 +65,10 @@ class Phase3156_QualifiedSymbolResolutionTests(unittest.TestCase):
             source_files=list(self.semantic_index.files.keys()),
             metadata={"semantic_index": self.semantic_index},
         )
-        # Mock repository_map for ContextSelector
+        # Mock repository_map for ContextSelector: no file records (semantic index
+        # boosts are the only augmentation these tests exercise).
         self.project_context.repository_map = unittest.mock.MagicMock()
-        self.project_context.repository_map.files = [unittest.mock.MagicMock(path=p) for p in self.semantic_index.files.keys()]
+        self.project_context.repository_map.files = []
         self.project_context.repository_map.relationships = []
 
         self.context_selector = ContextSelector(self.repo_root)
@@ -161,7 +162,6 @@ class Phase3156_QualifiedSymbolResolutionTests(unittest.TestCase):
         )
         (self.repo_root / "user_service_v2.py").write_text("class UserService:\n  def save(self):\n    pass")
         self.project_context.source_files.append("user_service_v2.py")
-        self.project_context.repository_map.files.append(unittest.mock.MagicMock(path="user_service_v2.py"))
 
         task = "Fix `UserService.save`"
         score_v1, reasons_v1 = self._get_file_score_and_reason(task, "user_service.py")

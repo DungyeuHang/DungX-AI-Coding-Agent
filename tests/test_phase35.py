@@ -125,7 +125,7 @@ class Phase35Tests(unittest.TestCase):
         root = self._repository()
         output = io.StringIO()
         with redirect_stdout(output):
-        result = main(["context", "--project", str(root), "teacher dashboard", "--log-level", "CRITICAL"]) # Suppress logging
+            result = main(["context", "--project", str(root), "teacher dashboard", "--log-level", "CRITICAL"]) # Suppress logging
         self.assertEqual(result, 0)
         self.assertIn("Selected context:", output.getvalue())
         self.assertIn("teacher_dashboard.py", output.getvalue())

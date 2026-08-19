@@ -41,10 +41,10 @@ class Phase38Tests(unittest.TestCase):
         # Python project setup
         (root / "pyproject.toml").write_text("[project]\nname='my-python-app'\n[tool.ruff]\nline-length=88\n", encoding="utf-8")
         (root / "requirements.txt").write_text("pytest\nmypy\n", encoding="utf-8")
-        (root / "src" / "app.py").mkdir(parents=True)
+        (root / "src").mkdir(parents=True)
         (root / "src" / "app.py").write_text("def hello(): return 'world'\n", encoding="utf-8")
         (root / "src" / "auth.py").write_text("def login(): pass\n", encoding="utf-8")
-        (root / "tests" / "test_app.py").mkdir(parents=True)
+        (root / "tests").mkdir(parents=True)
         (root / "tests" / "test_app.py").write_text("import pytest\nfrom src.app import hello\ndef test_hello(): assert hello() == 'world'\n", encoding="utf-8")
         (root / "tests" / "test_auth.py").write_text("import pytest\nfrom src.auth import login\ndef test_login(): assert login() is None\n", encoding="utf-8")
         (root / "mypy.ini").write_text("[mypy]\n", encoding="utf-8")
@@ -75,9 +75,11 @@ class Phase38Tests(unittest.TestCase):
             }
         }), encoding="utf-8")
         (root / "tsconfig.json").write_text("{}", encoding="utf-8")
-        (root / "src" / "components" / "Button.tsx").mkdir(parents=True)
+        (root / "src" / "components").mkdir(parents=True)
         (root / "src" / "components" / "Button.tsx").write_text("export function Button() { return <button>Click</button>; }\n", encoding="utf-8")
+        (root / "src" / "pages").mkdir(parents=True)
         (root / "src" / "pages" / "AboutPage.tsx").write_text("export function AboutPage() { return <div>About</div>; }\n", encoding="utf-8")
+        (root / "src" / "app").mkdir(parents=True)
         (root / "src" / "app" / "router.tsx").write_text("import { AboutPage } from '../pages/AboutPage';\n", encoding="utf-8")
 
         return root

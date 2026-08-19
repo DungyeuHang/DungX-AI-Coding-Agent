@@ -44,7 +44,7 @@ class Phase3157_DependencyAwareRetrievalTests(unittest.TestCase):
 
         self.repository_map = RepositoryMap(
             root=str(self.repo_root), project_metadata={}, languages=["Python"], frameworks=[],
-            files=[unittest.mock.MagicMock(path=p) for p in ["services/user_service.py", "handlers/user_handler.py", "utils/logger.py", "main.py"]],
+            files=[],
             directories=["services", "handlers", "utils"], tests=[], configuration_files=[], entry_points=["main.py"],
             relationships=[
                 FileRelationship(source="handlers/user_handler.py", target="services/user_service.py", kind="imports"),

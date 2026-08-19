@@ -75,6 +75,24 @@ class AIProvider:
             approximate_output_tokens=math.ceil(output_size / 4),
         ))
 
+    def _context(self, context: ProjectContext, stage: str = "planning") -> str:
+        """Serialize project context for provider prompts.
+
+        Uses the provider's ``config`` when available; falls back to the
+        ``AgentConfig`` defaults so config-less providers (e.g. mock/test
+        providers) also satisfy the contract.
+        """
+        config = getattr(self, "config", None)
+        if config is None:
+            budget = 30000
+            max_files = 24
+            max_file_bytes = 5000
+        else:
+            budget = getattr(config, f"{stage}_context_bytes", 30000)
+            max_files = config.max_context_files
+            max_file_bytes = config.max_context_file_bytes
+        return json.dumps(_bounded_context(context, budget, max_files, max_file_bytes), ensure_ascii=False, indent=2)
+
     def generate_plan(self, task: str, context: ProjectContext) -> Plan:
         raise NotImplementedError
 
