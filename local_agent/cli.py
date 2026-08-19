@@ -19,7 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_arguments(context)
     context.add_argument("task", help="task used to select relevant context")
     run = subparsers.add_parser("run", help="plan, implement, validate, repair, and review a task")
-    add_common_arguments(run)
+    add_common_arguments(run, include_provider_args=True)
     run.add_argument("task", help="implementation task objective or ID to resume")
     run.add_argument("--resume", action="store_true", help="treat 'task' argument as a task ID to resume") # Added resume flag
 

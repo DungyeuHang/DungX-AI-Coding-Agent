@@ -549,8 +549,11 @@ class AntigravityProvider(GeminiProvider):
 
 
 class DeepSeekProvider(OpenAIProvider):
-    """Placeholder for DeepSeek, assuming OpenAI-compatible API."""
-    pass
+    """Provider for DeepSeek, using the OpenAI-compatible API."""
+    def __init__(self, config: AgentConfig):
+        super().__init__(config)
+        self.base_url = config.deepseek_base_url.rstrip("/")
+
 
 def _strings(value: object) -> list[str]:
     if not isinstance(value, list):

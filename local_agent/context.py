@@ -50,25 +50,75 @@ class ContextSelector:
         }
         scored: dict[str, dict[str, object]] = {}
 
-        semantic_boost_paths: dict[str, str] = {} # path -> reason
+        # Phase 3.15.6: Use a dictionary to store boosts to handle different priorities.
+        semantic_boosts: dict[str, tuple[float, str]] = {}  # path -> (boost_score, reason)
         semantic_index = context.metadata.get("semantic_index")
         if semantic_index and isinstance(semantic_index, SemanticIndex):
             candidate_symbols = self._extract_candidate_symbols(task)
-            if candidate_symbols:
-                # 1. Exact symbol matches from candidates
-                exact_matches = semantic_index.find_symbols(candidate_symbols)
-                for path, symbol in exact_matches:
-                    if path not in semantic_boost_paths:
-                        semantic_boost_paths[path] = f"semantic symbol definition match: {symbol.name}"
 
-                # 2. Substring symbol matches for broader discovery
-                for query in candidate_symbols:
-                    # Only search for longer, more specific candidates to avoid noise
-                    if len(query) > 4 and '.' not in query:
-                        substring_matches = semantic_index.search_symbols(query)
-                        for path, symbol in substring_matches:
-                            if path not in semantic_boost_paths:
-                                semantic_boost_paths[path] = f"semantic symbol definition match: {symbol.name} (similar to '{query}')"
+            # Separate qualified and unqualified symbols
+            qualified_candidates = {s for s in candidate_symbols if '.' in s}
+            unqualified_candidates = candidate_symbols - qualified_candidates
+
+            # 1. Process exact qualified matches (highest priority)
+            for q_symbol in qualified_candidates:
+                parts = q_symbol.rsplit('.', 1)
+                if len(parts) != 2: continue
+                parent_name, child_name = parts
+
+                for path, file_index in semantic_index.files.items():
+                    for symbol in file_index.symbols:
+                        if symbol.name == child_name and symbol.parent == parent_name:
+                            reason = f"semantic qualified symbol match: {q_symbol}"
+                            # Use a higher boost for qualified matches
+                            current_boost, _ = semantic_boosts.get(path, (0.0, ""))
+                            # Qualified match boost: 0.75
+                            if 0.75 > current_boost:
+                                semantic_boosts[path] = (0.75, reason)
+
+            # 2. Process exact unqualified matches
+            exact_matches = semantic_index.find_symbols(unqualified_candidates)
+            for path, symbol in exact_matches:
+                reason = f"semantic symbol definition match: {symbol.name}"
+                current_boost, _ = semantic_boosts.get(path, (0.0, ""))
+                # Unqualified exact match boost: 0.50
+                if 0.50 > current_boost:
+                    semantic_boosts[path] = (0.50, reason)
+
+            # 3. Substring symbol matches for broader discovery (lowest priority)
+            for query in unqualified_candidates:
+                if len(query) > 4:
+                    substring_matches = semantic_index.search_symbols(query)
+                    for path, symbol in substring_matches:
+                        reason = f"semantic symbol substring match: {symbol.name} (for '{query}')"
+                        current_boost, _ = semantic_boosts.get(path, (0.0, ""))
+                        # Substring match boost: 0.25
+                        if 0.25 > current_boost:
+                            semantic_boosts[path] = (0.25, reason)
+
+        # Phase 3.15.7: Dependency-aware expansion from semantic seeds
+        if repository_map and repository_map.relationships:
+            semantic_seed_paths = sorted(list(semantic_boosts.keys()))  # Deterministic
+
+            # Build a quick lookup for relationships for performance
+            forward_deps = defaultdict(list)
+            reverse_deps = defaultdict(list)
+            for rel in repository_map.relationships:
+                forward_deps[rel.source].append(rel.target)
+                reverse_deps[rel.target].append(rel.source)
+
+            for seed_path in semantic_seed_paths:
+                # A file is related if it imports the seed, or is imported by the seed.
+                related_paths = set(forward_deps.get(seed_path, [])) | set(reverse_deps.get(seed_path, []))
+
+                for related_path in sorted(list(related_paths)):  # Deterministic
+                    if related_path == seed_path:
+                        continue
+
+                    reason = f"related to semantic match in {seed_path}"
+                    current_boost, _ = semantic_boosts.get(related_path, (0.0, ""))
+                    if 0.15 > current_boost:
+                        semantic_boosts[related_path] = (0.15, reason)
 
         for relative in candidates:
             try:
@@ -87,9 +137,11 @@ class ContextSelector:
                 reasons.append("task keyword match in path")
             if content_matches:
                 reasons.append("task keyword match in content")
-            if relative in semantic_boost_paths:
-                score += 0.50 # Strong boost for semantic symbol definition
-                reasons.append(semantic_boost_paths[relative])
+
+            if relative in semantic_boosts:
+                boost, reason = semantic_boosts[relative]
+                score += boost
+                reasons.append(reason)
 
             if relative in modified:
                 score += 0.14

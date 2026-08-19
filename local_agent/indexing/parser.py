@@ -18,10 +18,14 @@ BUILD_PATH = Path(__file__).parent.parent.parent / "build"
 LANGUAGE_SO_PATH = BUILD_PATH / "languages.so"
 
 class TreeSitterParser:
+    @staticmethod
+    def language_library_exists() -> bool:
+        return LANGUAGE_SO_PATH.exists()
+
     def __init__(self):
         if Language is None or Parser is None:
             raise ImportError("tree-sitter is not installed")
-        if not LANGUAGE_SO_PATH.exists():
+        if not self.language_library_exists():
             raise FileNotFoundError(
                 f"Language library not found at {LANGUAGE_SO_PATH}. "
                 "Please run the build script to compile the tree-sitter grammars."

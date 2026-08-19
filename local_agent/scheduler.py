@@ -84,14 +84,14 @@ class Scheduler:
         
         # Phase 3.12: Do not execute tasks in PLAN_REVIEW or REJECTED status
         if runnable_task.status in {TaskStatus.PLAN_REVIEW, TaskStatus.REJECTED, TaskStatus.PLAN_PROPOSED}:
-            emit(f"Task {runnable_task.task_id} is in {runnable_task.status.value} status. Skipping execution.")
+            emit(f"Task {runnable_task.task_id} is in '{runnable_task.status.value}' status. Skipping execution.")
             return
 
         # Phase 3.11: If task has no plan, create one first.
         if not runnable_task.plan:
             emit(f"Task {runnable_task.task_id} has no plan. Generating one...")
-            planning_provider_config = self._select_provider(runnable_task, required_capabilities={ProviderCapability.PLANNING})
-            if not planning_provider_config:
+            planning_provider_configs = self._select_providers(runnable_task, required_capabilities={ProviderCapability.PLANNING})
+            if not planning_provider_configs:
                 emit("No available provider for planning. Task will be retried later.")
                 runnable_task.status = TaskStatus.PAUSED
                 runnable_task.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=DEFAULT_RETRY_BACKOFF_SECONDS)
@@ -99,7 +99,7 @@ class Scheduler:
                 return
             
             try:
-                self._plan_task(runnable_task, planning_provider_config)
+                self._plan_task(runnable_task, planning_provider_configs[0]) # Use the highest priority provider for planning
                 runnable_task = self.storage.load_task(runnable_task.task_id) # Re-load task with plan
             except (ValueError, ProviderError) as e:
                 emit(f"Failed to create a valid plan for task {runnable_task.task_id}: {e}")
@@ -116,9 +116,9 @@ class Scheduler:
                 emit(f"Task {runnable_task.task_id} plan generated and awaiting review. Status set to PLAN_REVIEW.")
                 return # Exit run_once, wait for approval
 
-        provider_config = self._select_provider(runnable_task)
+        provider_configs = self._select_providers(runnable_task)
 
-        if not provider_config:
+        if not provider_configs:
             emit(f"No available and compatible provider for task {runnable_task.task_id}. Scheduling for later.")
             runnable_task.status = TaskStatus.PAUSED
             runnable_task.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=DEFAULT_RETRY_BACKOFF_SECONDS)
@@ -133,59 +133,72 @@ class Scheduler:
             emit(f"No runnable subtasks for task {runnable_task.task_id}. Task status: {self.storage.load_task(runnable_task.task_id).status.value}")
             return
 
-        emit(f"Selected provider '{provider_config.provider}' for task {runnable_task.task_id}.")
         runnable_task.status = TaskStatus.RUNNING
-        runnable_task.assigned_to = provider_config.provider
+        runnable_task.assigned_to = "scheduler" # Lock the task
         self.storage.save_task(runnable_task)
 
-        api_key = self.credential_store.get("dungx-ai-coding-agent", provider_config.provider)
-        if not api_key:
-             # This should not happen if _select_provider is correct, but as a safeguard:
-            emit(f"FATAL: No API key found for selected provider '{provider_config.provider}' after selection.")
-            self._update_provider_state_after_failure(provider_config.provider, "AUTHENTICATION_ERROR", None)
-            return
+        subtask_completed = False
+        last_error: Exception | None = None
+
         try:
-            provider = build_provider(provider_config, api_key)
-            orchestrator = Orchestrator(provider_config, provider, self.storage) # Orchestrator now takes a subtask
-            report = orchestrator.run(task=runnable_task, subtask_id=next_subtask.subtask_id, progress=progress)
+            for provider_config in provider_configs:
+                emit(f"Attempting subtask '{next_subtask.title}' with provider '{provider_config.provider}'.")
+                try:
+                    api_key = self.credential_store.get("dungx-ai-coding-agent", provider_config.provider)
+                    if not api_key:
+                        raise ProviderError(f"No API key for {provider_config.provider}", category="AUTHENTICATION_ERROR")
+                    
+                    provider = build_provider(provider_config, api_key)
+                    orchestrator = Orchestrator(provider_config, provider, self.storage)
+                    report = orchestrator.run(task=runnable_task, subtask_id=next_subtask.subtask_id, progress=progress)
 
-            final_task_state = self.storage.load_task(runnable_task.task_id)
-            if final_task_state.status == TaskStatus.PAUSED:
-                emit(f"Task {final_task_state.task_id} was paused by provider. Updating provider state.")
-                last_failure = next((f for f in reversed(final_task_state.execution_history) if f.get("type") == "failure"), None)
-                retry_after = DEFAULT_RETRY_BACKOFF_SECONDS
-                if last_failure and last_failure.get("failure", {}).get("details", {}).get("retry_after_seconds"):
-                    retry_after = last_failure["failure"]["details"]["retry_after_seconds"]
-                self._update_provider_state_after_failure(provider_config.provider, report.outcome, retry_after)
-            elif final_task_state.status == TaskStatus.COMPLETED:
-                emit(f"Task {final_task_state.task_id} completed successfully.")
-                self._update_provider_state_after_success(provider_config.provider)
-            elif final_task_state.status == TaskStatus.RUNNING: # Subtask finished, but task is not
-                emit(f"Subtask {next_subtask.subtask_id} completed. Task continues.")
-            else: # FAILED
-                # Phase 3.14: Check if the orchestrator proposed a plan modification
-                if report.plan_proposal:
-                    emit(f"Orchestrator proposed a plan modification for task {final_task_state.task_id}.")
-                    # Basic validation of the proposal
-                    if self._is_proposal_valid(final_task_state, report.plan_proposal):
-                        final_task_state.plan_proposal = report.plan_proposal
-                        final_task_state.status = TaskStatus.PLAN_PROPOSED
-                        emit(f"Task {final_task_state.task_id} status set to PLAN_PROPOSED for review.")
-                    else:
-                        emit(f"Invalid plan proposal for task {final_task_state.task_id}. Discarding and pausing task.")
-                        final_task_state.status = TaskStatus.PAUSED
-                        final_task_state.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=DEFAULT_RETRY_BACKOFF_SECONDS)
-                    self.storage.save_task(final_task_state)
-                    return # Stop here, wait for human review or retry
+                    final_task_state = self.storage.load_task(runnable_task.task_id)
+                    current_subtask_state = next((s for s in final_task_state.plan.subtasks if s.subtask_id == next_subtask.subtask_id), None)
 
-                emit(f"Task {final_task_state.task_id} failed.")
-                self._update_provider_state_after_failure(provider_config.provider, report.outcome, None) # None retry_after for permanent failure
+                    if final_task_state.status == TaskStatus.PAUSED:
+                        emit(f"Task paused by provider '{provider_config.provider}'. Will not attempt other providers.")
+                        last_failure = next((f for f in reversed(final_task_state.execution_history) if f.get("type") == "failure"), None)
+                        retry_after = DEFAULT_RETRY_BACKOFF_SECONDS
+                        if last_failure and last_failure.get("failure", {}).get("details", {}).get("retry_after_seconds"):
+                            retry_after = last_failure["failure"]["details"]["retry_after_seconds"]
+                        self._update_provider_state_after_failure(provider_config.provider, report.outcome, retry_after)
+                        subtask_completed = False # Not completed, but also not a hard failure for fallback
+                        break # Exit provider loop
 
-        except Exception as e:
-            LOGGER.exception("Scheduler caught unhandled exception during orchestration: %s", e)
-            self._update_provider_state_after_failure(provider_config.provider, "SCHEDULER_ERROR", None)
-            runnable_task.status = TaskStatus.FAILED
-            runnable_task.outcome = "SCHEDULER_ERROR"
+                    if current_subtask_state and current_subtask_state.status == SubtaskStatus.COMPLETED:
+                        emit(f"Provider '{provider_config.provider}' successfully completed subtask '{next_subtask.title}'.")
+                        self._update_provider_state_after_success(provider_config.provider)
+                        subtask_completed = True
+                        break # Exit provider loop
+
+                    # Handle plan proposals
+                    if report.plan_proposal:
+                        emit(f"Orchestrator proposed a plan modification for task {final_task_state.task_id}.")
+                        if self._is_proposal_valid(final_task_state, report.plan_proposal):
+                            final_task_state.plan_proposal = report.plan_proposal
+                            final_task_state.status = TaskStatus.PLAN_PROPOSED
+                            emit(f"Task {final_task_state.task_id} status set to PLAN_PROPOSED for review.")
+                        else:
+                            emit(f"Invalid plan proposal for task {final_task_state.task_id}. Discarding and pausing task.")
+                            final_task_state.status = TaskStatus.PAUSED
+                        self.storage.save_task(final_task_state)
+                        subtask_completed = False # Not completed, but not a provider failure
+                        break # Exit provider loop
+
+                except ProviderError as e:
+                    last_error = e
+                    emit(f"Provider '{provider_config.provider}' failed: {e}. Trying next available provider.")
+                    self._update_provider_state_after_failure(provider_config.provider, e.category, e.retry_after_seconds)
+                    continue # to next provider
+
+            if not subtask_completed:
+                final_task = self.storage.load_task(runnable_task.task_id)
+                if final_task.status not in {TaskStatus.PAUSED, TaskStatus.PLAN_PROPOSED}:
+                    emit("All available providers failed to execute the subtask.")
+                    final_task.status = TaskStatus.FAILED
+                    final_task.outcome = getattr(last_error, 'category', 'ALL_PROVIDERS_FAILED') if last_error else 'ALL_PROVIDERS_FAILED'
+                    self.storage.save_task(final_task)
+
         finally:
             # Always unassign the task after the run
             final_task = self.storage.load_task(runnable_task.task_id)
@@ -236,7 +249,7 @@ class Scheduler:
             task.updated_at = datetime.datetime.now(datetime.timezone.utc)
             self.storage.save_task(task)
 
-    def _select_provider(self, task: Task, required_capabilities: set[ProviderCapability] | None = None) -> AgentConfig | None:
+    def _select_providers(self, task: Task, required_capabilities: set[ProviderCapability] | None = None) -> list[AgentConfig]:
         if required_capabilities is None:
             # Default capabilities for a standard implementation subtask
             required_capabilities = {
@@ -268,20 +281,19 @@ class Scheduler:
                 available_providers.append(provider)
 
         if not available_providers:
-            return None
+            return []
 
         # Sort by priority (lower is better)
         available_providers.sort(key=lambda p: p.priority)
-        if not available_providers:
-            return None
         
-        # Now, build the final AgentConfig for the selected provider
-        selected_provider_reg = available_providers[0]
+        # Build AgentConfig for all available, sorted providers
+        configs: list[AgentConfig] = []
         provider_configs = self.storage.load_provider_configs()
-        selected_provider_profile = next((p for p in provider_configs if p.provider_id == selected_provider_reg.provider_id), None)
-        if not selected_provider_profile:
-            return None # Should not happen
-        return self._build_agent_config(selected_provider_profile)
+        for provider_reg in available_providers:
+            profile = next((p for p in provider_configs if p.provider_id == provider_reg.provider_id), None)
+            if profile:
+                configs.append(self._build_agent_config(profile))
+        return configs
 
     def _update_provider_state_after_failure(self, provider_id: str, error_category: str, retry_after: float | None) -> None:
         state = self.state.provider_states[provider_id]
@@ -313,9 +325,9 @@ class Scheduler:
         final_config_dict["provider"] = provider_config.provider_id
         return AgentConfig(**final_config_dict)
 
-    def _plan_task(self, task: Task, config: AgentConfig) -> None:
+    def _plan_task_with_provider(self, task: Task, config: AgentConfig) -> None:
         """Uses the Planner to create a subtask graph for a task."""
-        api_key = self.credential_store.get("dungx-ai-coding-agent", config.provider)
+        api_key = self.credential_store.get("dungx-ai-coding-agent", config.provider) # Namespace is hardcoded for now
         if not api_key:
             raise ValueError(f"No API key for planning provider {config.provider}")
         

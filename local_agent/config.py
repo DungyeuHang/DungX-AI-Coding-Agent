@@ -32,6 +32,7 @@ class AgentConfig:
     log_level: str = "INFO"
     api_base_url: str = "https://api.openai.com/v1"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
     dry_run: bool = False
     approval: str = "never"
     max_context_files: int = 24
@@ -60,6 +61,7 @@ class AgentConfig:
             "log_level": "AGENT_LOG_LEVEL",
             "api_base_url": "OPENAI_BASE_URL",
             "gemini_base_url": "GEMINI_BASE_URL",
+            "deepseek_base_url": "DEEPSEEK_BASE_URL",
             "dry_run": "AGENT_DRY_RUN",
             "approval": "AGENT_APPROVAL",
             "max_context_files": "AGENT_MAX_CONTEXT_FILES",
@@ -90,7 +92,9 @@ class AgentConfig:
         provider_name = str(value("provider", "mock")).lower()
         explicit_api_key = overrides.get("api_key")
         if explicit_api_key is None:
-            credential_name = "GEMINI_API_KEY" if provider_name in {"gemini", "antigravity"} else "OPENAI_API_KEY"
+            credential_name = "DEEPSEEK_API_KEY" if provider_name == "deepseek" else \
+                              "GEMINI_API_KEY" if provider_name in {"gemini", "antigravity"} else \
+                              "OPENAI_API_KEY"
             configured_api_key = os.environ.get(credential_name)
         else:
             configured_api_key = str(explicit_api_key) or None
@@ -111,6 +115,7 @@ class AgentConfig:
             log_level=str(value("log_level", "INFO")).upper(),
             api_base_url=str(value("api_base_url", "https://api.openai.com/v1")),
             gemini_base_url=str(value("gemini_base_url", "https://generativelanguage.googleapis.com/v1beta")),
+            deepseek_base_url=str(value("deepseek_base_url", "https://api.deepseek.com/v1")),
             dry_run=_bool(value("dry_run", False)),
             approval=str(value("approval", "never")).lower(),
             max_context_files=_positive_int(value("max_context_files", 24), "max_context_files"),
@@ -134,8 +139,8 @@ class AgentConfig:
     def validate(self) -> None:
         if not self.project.is_dir():
             raise ValueError(f"project directory does not exist: {self.project}")
-        if self.provider not in {"mock", "openai", "gemini", "antigravity"}:
-            raise ValueError("provider must be 'mock', 'openai', 'gemini', or 'antigravity'")
+        if self.provider not in {"mock", "openai", "gemini", "antigravity", "deepseek"}:
+            raise ValueError("provider must be 'mock', 'openai', 'gemini', 'antigravity', or 'deepseek'")
         if self.approval not in {"never", "always"}: # This is for code changes approval, not plan approval.
             raise ValueError("approval must be 'never' or 'always'")
         if self.approval_mode not in {"never", "plan_review", "always"}:
