@@ -131,6 +131,26 @@ class Phase314Tests(unittest.TestCase):
         self.assertIsNone(loaded_task.plan_proposal)
         self.assertEqual(len(loaded_task.plan.subtasks), 1) # Plan should be unchanged
 
+    def test_reject_proposal_sets_retry_delay(self):
+        # Arrange
+        s1 = Subtask(subtask_id="1", title="A", goal="A")
+        plan = TaskPlan(objective="Test", subtasks=[s1])
+        proposal = PlanProposal(reason="A reason", additions=[])
+        task = self._create_task(plan=plan, status=TaskStatus.PLAN_PROPOSED)
+        task.plan_proposal = proposal
+        self.storage.save_task(task)
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        # Act
+        from local_agent.cli import main
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            main(["reject-proposal", "--project", str(self.root), task.task_id])
+
+        # Assert
+        loaded_task = self.storage.load_task(task.task_id)
+        self.assertIsNotNone(loaded_task.next_retry_at)
+        self.assertGreater(loaded_task.next_retry_at, now)
+
     def test_proposal_survives_restart(self):
         # Arrange
         s1 = Subtask(subtask_id="1", title="A", goal="A")

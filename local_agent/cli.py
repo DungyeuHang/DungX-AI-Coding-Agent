@@ -73,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     # New commands for Phase 3.9
     create_task = subparsers.add_parser("create-task", help="create a new persistent task")
     add_common_arguments(create_task)
+    create_task.add_argument("--autonomous", action="store_true", help="Enable autonomous mode for this task")
     create_task.add_argument("objective", help="the objective of the new task")
 
     list_tasks = subparsers.add_parser("list-tasks", help="list all persistent tasks")
@@ -81,6 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
     show_task = subparsers.add_parser("show-task", help="show details of a specific task")
     add_common_arguments(show_task)
     show_task.add_argument("task_id", help="ID of the task to show")
+
+    doctor = subparsers.add_parser("doctor", help="run a health check on the agent and project environment")
+    add_common_arguments(doctor)
+
+    show_config = subparsers.add_parser("show-config", help="show the current agent configuration")
+    add_common_arguments(show_config)
 
     credentials = subparsers.add_parser("credentials", help="securely manage provider API keys")
     credentials_sub = credentials.add_subparsers(dest="credentials_command", required=True)
@@ -348,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
             task.plan_proposal = None
             task.status = TaskStatus.PAUSED
             task.updated_at = datetime.datetime.now(datetime.timezone.utc)
+            task.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5)
             storage.save_task(task)
             print(f"Proposal for task {args.task_id} rejected. Task status set to 'paused'.")
             return 0
@@ -369,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
                 status=TaskStatus.PENDING,
                 created_at=now,
                 updated_at=now,
+                autonomous=args.autonomous,
             )
             storage.save_task(new_task)
             print(f"Created task: {new_task.task_id}")
@@ -385,6 +394,56 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "show-task":
             task = storage.load_task(args.task_id)
             _print_task_details(task)
+            return 0
+
+        if args.command == "doctor":
+            print("DungX AI Coding Agent Health Check")
+            print("=" * 35)
+
+            # 1. Python/runtime
+            print(f"\n[1/5] Runtime Environment")
+            print(f"  - Python Version: {sys.version.split()[0]}")
+            print(f"  - Python Executable: {sys.executable}")
+
+            # 2. Project and Storage
+            print(f"\n[2/5] Project and Storage")
+            print(f"  - Project Root: {config.project}")
+            try:
+                storage.data_dir.mkdir(exist_ok=True)
+                (storage.data_dir / "write_test.tmp").touch()
+                (storage.data_dir / "write_test.tmp").unlink()
+                print(f"  - Storage Directory: {storage.data_dir} (Writable)")
+            except OSError as e:
+                print(f"  - Storage Directory: {storage.data_dir} (NOT WRITABLE: {e})")
+
+            # 3. Git Repository
+            print(f"\n[3/5] Git Repository")
+            from .git import GitIntegration
+            git = GitIntegration(config.project)
+            if git.is_repository():
+                print(f"  - Status: Detected Git repository")
+                print(f"  - Branch: {git.branch()}")
+                status = git.status()
+                print(f"  - Working Tree: {'Clean' if 'nothing to commit, working tree clean' in status else 'Contains uncommitted changes'}")
+            else:
+                print("  - Status: Not a Git repository")
+
+            # 4. Provider Status
+            print(f"\n[4/5] Provider Status")
+            from .scheduler import Scheduler
+            from .credentials import MockCredentialStore
+            try:
+                scheduler = Scheduler(config, storage, MockCredentialStore())
+                provider_configs = storage.load_provider_configs()
+                print(f"  - Configured Providers: {len(provider_configs)}")
+            except Exception as e:
+                print(f"  - Could not determine provider status: {e}")
+            return 0
+
+        if args.command == "show-config":
+            # Exclude sensitive fields like api_key
+            config_dict = {k: v for k, v in config.__dict__.items() if k != "api_key"}
+            print(json.dumps(config_dict, indent=2, default=str))
             return 0
 
         if args.command == "run":

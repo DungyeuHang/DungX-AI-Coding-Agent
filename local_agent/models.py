@@ -501,6 +501,22 @@ class PlanProposal:
             additions=[AddSubtask.from_dict(a) for a in data.get("additions", [])],
         )
 
+
+@dataclass
+class ApprovalPolicy:
+    name: str
+    action: Literal["auto_approve", "require_approval"]
+    # Conditions (all must be met for the policy to match)
+    if_risk_is_at_most: Literal["low", "medium", "high"] | None = None
+    if_path_matches: list[str] | None = None  # glob patterns
+    if_path_does_not_match: list[str] | None = None  # glob patterns
+    if_max_lines_changed: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(**data)
+
+
 @dataclass
 class Task:
     task_id: str
@@ -511,6 +527,7 @@ class Task:
     plan: TaskPlan | None = None # Changed from subtasks list to a full plan
     plan_proposal: PlanProposal | None = None # Added for Phase 3.14
     current_subtask_id: str | None = None
+    autonomous: bool = False # New for autonomous mode
     execution_history: list[dict[str, Any]] = field(default_factory=list)
     latest_checkpoint_id: str | None = None
     retry_info: dict[str, Any] = field(default_factory=dict)

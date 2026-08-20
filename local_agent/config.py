@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal
 
 
 def _bool(value: object) -> bool:
@@ -35,6 +37,8 @@ class AgentConfig:
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     dry_run: bool = False
     approval: str = "never"
+    autonomous_mode: bool = False # New for autonomous mode
+    approval_policies: list[dict[str, Any]] = field(default_factory=list)
     max_context_files: int = 24
     max_context_file_bytes: int = 5000
     max_context_tokens: int = 7500
@@ -64,6 +68,8 @@ class AgentConfig:
             "deepseek_base_url": "DEEPSEEK_BASE_URL",
             "dry_run": "AGENT_DRY_RUN",
             "approval": "AGENT_APPROVAL",
+            "autonomous_mode": "AGENT_AUTONOMOUS",
+            "approval_policies": "AGENT_APPROVAL_POLICIES",
             "max_context_files": "AGENT_MAX_CONTEXT_FILES",
             "max_context_file_bytes": "AGENT_MAX_CONTEXT_FILE_BYTES",
             "max_context_tokens": "AGENT_MAX_CONTEXT_TOKENS",
@@ -90,6 +96,13 @@ class AgentConfig:
         if isinstance(commands, str):
             commands = [item.strip() for item in commands.split("||") if item.strip()]
         provider_name = str(value("provider", "mock")).lower()
+        approval_policies_str = value("approval_policies", "[]")
+        try:
+            approval_policies_val = json.loads(approval_policies_str) if isinstance(approval_policies_str, str) else approval_policies_str
+            if not isinstance(approval_policies_val, list):
+                raise ValueError("AGENT_APPROVAL_POLICIES must be a JSON list of objects")
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ValueError(f"Invalid format for AGENT_APPROVAL_POLICIES: {e}") from e
         explicit_api_key = overrides.get("api_key")
         if explicit_api_key is None:
             credential_name = "DEEPSEEK_API_KEY" if provider_name == "deepseek" else \
@@ -118,6 +131,8 @@ class AgentConfig:
             deepseek_base_url=str(value("deepseek_base_url", "https://api.deepseek.com/v1")),
             dry_run=_bool(value("dry_run", False)),
             approval=str(value("approval", "never")).lower(),
+            autonomous_mode=_bool(value("autonomous_mode", False)),
+            approval_policies=approval_policies_val,
             max_context_files=_positive_int(value("max_context_files", 24), "max_context_files"),
             max_context_file_bytes=_positive_int(value("max_context_file_bytes", 5000), "max_context_file_bytes"),
             max_context_tokens=_positive_int(value("max_context_tokens", 7500), "max_context_tokens"),
@@ -139,10 +154,10 @@ class AgentConfig:
     def validate(self) -> None:
         if not self.project.is_dir():
             raise ValueError(f"project directory does not exist: {self.project}")
-        if self.provider not in {"mock", "openai", "gemini", "antigravity", "deepseek"}:
-            raise ValueError("provider must be 'mock', 'openai', 'gemini', 'antigravity', or 'deepseek'")
-        if self.approval not in {"never", "always"}: # This is for code changes approval, not plan approval.
-            raise ValueError("approval must be 'never' or 'always'")
+        if self.provider not in {"mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"}:
+            raise ValueError("provider must be one of 'mock', 'openai', 'gemini', 'antigravity', 'deepseek', 'anthropic'")
+        if self.approval not in {"never", "always", "policy"}:
+            raise ValueError("approval must be 'never', 'always', or 'policy'")
         if self.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
         if self.command_timeout_seconds < 1:
@@ -158,17 +173,20 @@ class AgentConfig:
 
 def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args: bool = False) -> None:
     parser.add_argument("--project", default=".", help="local project directory")
-    parser.add_argument("--provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek"), default=None)
+    parser.add_argument("--provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"), default=None)
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-iterations", type=int, default=None)
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING"))
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
-    parser.add_argument("--approval", choices=("never", "always"), default=None, help="pause for approval before applying changes")
+    parser.add_argument("--approval", choices=("never", "always", "policy"), default=None, help="control code change approval behavior")
+    parser.add_argument("--autonomous", action="store_true", help="enable experimental autonomous execution mode")
+    parser.add_argument("--approval-policy-file", default=None, help="path to a JSON file containing approval policies")
     parser.add_argument("--approval-mode", choices=("never", "plan_review", "always"), default=None, help="control plan approval behavior") # Added for Phase 3.12
     if include_provider_args:
         parser.add_argument("--api-key", default=None, help="provider API key (defaults to environment variable)")
         parser.add_argument("--api-base-url", default=None, help="override the provider API base URL")
+        parser.add_argument("--anthropic-base-url", default=None, help="override the Anthropic API base URL")
         parser.add_argument("--gemini-base-url", default=None, help="override the Gemini API base URL")
         parser.add_argument("--deepseek-base-url", default=None, help="override the DeepSeek API base URL")
 
@@ -183,13 +201,22 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,
             "approval": args.approval,
+            "autonomous_mode": args.autonomous if args.autonomous else None,
             "approval_mode": args.approval_mode, # Added for Phase 3.12
             "api_key": getattr(args, "api_key", None),
             "api_base_url": getattr(args, "api_base_url", None),
+            "anthropic_base_url": getattr(args, "anthropic_base_url", None),
             "gemini_base_url": getattr(args, "gemini_base_url", None),
             "deepseek_base_url": getattr(args, "deepseek_base_url", None),
         }.items() if value is not None
     }
+    if getattr(args, "approval_policy_file", None):
+        policy_path = Path(args.approval_policy_file)
+        if not policy_path.is_file():
+            raise FileNotFoundError(f"Approval policy file not found: {policy_path}")
+        with policy_path.open('r', encoding='utf-8') as f:
+            overrides["approval_policies"] = json.load(f)
+
     config = AgentConfig.from_environment(args.project, **overrides)
     config.validate()
     return config

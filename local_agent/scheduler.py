@@ -32,7 +32,7 @@ class ProviderRegistry:
         try:
             # Instantiate provider to get its capabilities
             provider_instance = build_provider(config)
-            capabilities = provider_instance.capabilities
+            capabilities = provider_instance.capabilities # This is now a property
         except ProviderError:
             # Cannot instantiate, assume no capabilities for now
             capabilities = set()
@@ -83,7 +83,15 @@ class Scheduler:
         emit(f"Selected task {runnable_task.task_id} for execution.")
         
         # Phase 3.12: Do not execute tasks in PLAN_REVIEW or REJECTED status
-        if runnable_task.status in {TaskStatus.PLAN_REVIEW, TaskStatus.REJECTED, TaskStatus.PLAN_PROPOSED}:
+        if runnable_task.status == TaskStatus.PLAN_REVIEW:
+            if runnable_task.autonomous:
+                emit(f"Task {runnable_task.task_id} is autonomous. Auto-approving plan.")
+                runnable_task.status = TaskStatus.PENDING
+                self.storage.save_task(runnable_task)
+            else:
+                emit(f"Task {runnable_task.task_id} is in '{runnable_task.status.value}' status. Skipping execution.")
+                return
+        elif runnable_task.status in {TaskStatus.REJECTED, TaskStatus.PLAN_PROPOSED}:
             emit(f"Task {runnable_task.task_id} is in '{runnable_task.status.value}' status. Skipping execution.")
             return
 

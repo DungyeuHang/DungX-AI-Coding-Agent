@@ -6,6 +6,7 @@ import shlex
 import uuid
 from pathlib import Path
 
+from .approval import ApprovalPolicyEngine
 from .coding_agent import CodingAgent, PatchValidationError, UnsafeModificationError
 from .commands import CommandRunner
 from .config import AgentConfig
@@ -14,7 +15,22 @@ from .failure import FailureAnalyzer
 from .filesystem import ProjectFilesystem
 from .git import GitIntegration
 from .impact import ChangeImpactAnalyzer
-from .models import ChangeImpact, Checkpoint, CommandSpec, ExecutionResult, FailureAnalysis, Plan, PlanProposal, ProjectContext, RunReport, Subtask, SubtaskStatus, TaskStatus, ValidationPlan
+from .models import (
+    ApprovalPolicy,
+    ChangeImpact,
+    Checkpoint,
+    CommandSpec,
+    ExecutionResult,
+    FailureAnalysis,
+    Plan,
+    PlanProposal,
+    ProjectContext,
+    RunReport,
+    Subtask,
+    SubtaskStatus,
+    TaskStatus,
+    ValidationPlan,
+)
 from .planner import Planner
 from .providers import AIProvider, ProviderError, QuotaExceededError, RateLimitError
 from .repository import RepositoryIntelligence
@@ -38,6 +54,8 @@ class Orchestrator:
         self.runner = CommandRunner(config.project, config.command_timeout_seconds)
         self.validation_intelligence = ValidationIntelligence(config.project)
         self.storage = storage
+        policies = [ApprovalPolicy.from_dict(p) for p in config.approval_policies]
+        self.approval_engine = ApprovalPolicyEngine(policies)
 
     def analyze(self):
         return self.analyzer.analyze()
@@ -166,7 +184,16 @@ class Orchestrator:
                     report.proposed_diff = proposed_diff
                     emit(f"[4/7] Dry run: {len(prepared)} proposed file changes; no files written")
                     break
-                if prepared and self.config.approval == "always":
+
+                requires_manual_approval = False
+                if prepared:
+                    if self.config.approval == "always" and not task.autonomous:
+                        requires_manual_approval = True
+                    elif self.config.approval == "policy":
+                        emit("[4.5/7] Evaluating approval policies...")
+                        requires_manual_approval = self.approval_engine.is_manual_approval_required(prepared, report.impact)
+
+                if requires_manual_approval:
                     report.approval_required = True
                     approved = bool(approval_callback(prepared)) if approval_callback else False
                     if not approved:

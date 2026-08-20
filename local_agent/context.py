@@ -81,9 +81,9 @@ class ContextSelector:
             for path, symbol in exact_matches:
                 reason = f"semantic symbol definition match: {symbol.name}"
                 current_boost, _ = semantic_boosts.get(path, (0.0, ""))
-                # Unqualified exact match boost: 0.50
-                if 0.50 > current_boost:
-                    semantic_boosts[path] = (0.50, reason)
+                # Unqualified exact match boost: 0.45
+                if 0.45 > current_boost:
+                    semantic_boosts[path] = (0.45, reason)
 
             # 3. Substring symbol matches for broader discovery (lowest priority)
             for query in unqualified_candidates:

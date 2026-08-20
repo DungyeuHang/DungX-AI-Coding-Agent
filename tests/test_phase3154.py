@@ -216,7 +216,7 @@ class TestPhase3154ContextSelectorIntegration(unittest.TestCase):
             "user_service.py should be prioritized for `UserService.save`",
         )
         reasons = self.context_selector.select(task, self.project_context).metadata["context_selection"]["selected_items"][0]["reason"]
-        self.assertTrue(any(reason.startswith("semantic symbol definition match:") for reason in reasons))
+        self.assertTrue(any(reason.startswith("semantic qualified symbol match:") for reason in reasons))
 
     def test_8_regression_existing_context_selector_behavior(self):
         # Test a generic task to ensure existing heuristics still work

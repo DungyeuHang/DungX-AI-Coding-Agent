@@ -57,7 +57,9 @@ class AIProvider:
     @property
     def provider_metrics(self) -> list[ProviderMetric]:
         return getattr(self, "_provider_metrics", [])
-    capabilities: set[ProviderCapability] = field(default_factory=set, init=False)
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        raise NotImplementedError
 
     def _record_metric(self, request_type: str, input_size: int, output_size: int, duration_seconds: float, model: str, succeeded: bool, error_category: str = "") -> None:
         if not getattr(self, "metrics_enabled", False):
@@ -122,8 +124,9 @@ class MockProvider(AIProvider):
     task was implemented.
     """
 
-    def __init__(self):
-        self.capabilities = {
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {
             ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
             ProviderCapability.REPAIR, ProviderCapability.REVIEW,
         }
@@ -168,11 +171,13 @@ class MockProvider(AIProvider):
 class OpenAIProvider(AIProvider):
     def __init__(self, config: AgentConfig):
         self.config = config
-        self.capabilities = {
+        self.metrics_enabled = config.metrics_enabled
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {
             ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
             ProviderCapability.REPAIR, ProviderCapability.REVIEW,
         }
-        self.metrics_enabled = config.metrics_enabled
         self.api_key = config.api_key
         if self.api_key is None:
             self.api_key = os.environ.get("OPENAI_API_KEY")
@@ -303,11 +308,13 @@ class GeminiProvider(AIProvider):
     def __init__(self, config: AgentConfig):
         self.config = config
         self.metrics_enabled = config.metrics_enabled
-        self.capabilities = {
+
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {
             ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
             ProviderCapability.REPAIR, ProviderCapability.REVIEW,
         }
-        # Prefer the explicit runtime credential; retain environment fallback
         # for direct CLI/provider construction.
         self.api_key = config.api_key
         if self.api_key is None:
@@ -515,7 +522,10 @@ class AntigravityProvider(GeminiProvider):
     def __init__(self, config: AgentConfig):
         super().__init__(config)
         self.agent = os.environ.get("ANTIGRAVITY_AGENT", ANTIGRAVITY_AGENT)
-        self.capabilities = {
+
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {
             ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
             ProviderCapability.REPAIR, ProviderCapability.REVIEW,
         }
@@ -754,4 +764,6 @@ def build_provider(config: AgentConfig, api_key: str | None = None) -> AIProvide
         return AntigravityProvider(config)
     if config.provider == "deepseek":
         return DeepSeekProvider(config)
+    if config.provider == "anthropic":
+        return AnthropicProvider(config)
     raise ProviderError(f"unsupported provider: {config.provider}")

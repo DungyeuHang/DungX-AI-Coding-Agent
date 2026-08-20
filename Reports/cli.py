@@ -73,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     # New commands for Phase 3.9
     create_task = subparsers.add_parser("create-task", help="create a new persistent task")
     add_common_arguments(create_task)
+    create_task.add_argument("--autonomous", action="store_true", help="Enable autonomous mode for this task")
     create_task.add_argument("objective", help="the objective of the new task")
 
     list_tasks = subparsers.add_parser("list-tasks", help="list all persistent tasks")
@@ -369,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
                 status=TaskStatus.PENDING,
                 created_at=now,
                 updated_at=now,
+                autonomous=args.autonomous,
             )
             storage.save_task(new_task)
             print(f"Created task: {new_task.task_id}")
