@@ -86,6 +86,25 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="run a health check on the agent and project environment")
     add_common_arguments(doctor)
 
+    # New for Phase 3.23
+    ci_repair = subparsers.add_parser("ci-repair", help="create an autonomous task to repair a CI failure")
+    add_common_arguments(ci_repair)
+    ci_repair.add_argument("--failure-file", required=True, help="path to a JSON file with CI failure details")
+
+    # New for Phase 3.24
+    commit_task = subparsers.add_parser("commit-task", help="commit the changes from a completed task to a new branch")
+    add_common_arguments(commit_task)
+    commit_task.add_argument("task_id", help="ID of the completed task to commit")
+    commit_task.add_argument("--branch-name", help="optional name for the new branch")
+
+    push_task = subparsers.add_parser("push-task", help="push a committed task branch to the remote")
+    add_common_arguments(push_task)
+    push_task.add_argument("task_id", help="ID of the committed task to push")
+
+    create_pr = subparsers.add_parser("create-pr", help="create a pull request for a pushed task branch")
+    add_common_arguments(create_pr)
+    create_pr.add_argument("task_id", help="ID of the pushed task to create a PR for")
+
     show_config = subparsers.add_parser("show-config", help="show the current agent configuration")
     add_common_arguments(show_config)
 
@@ -395,6 +414,119 @@ def main(argv: list[str] | None = None) -> int:
             task = storage.load_task(args.task_id)
             _print_task_details(task)
             return 0
+
+        if args.command == "ci-repair":
+            from .models import Task, CIFailureContext
+            import uuid
+
+            try:
+                failure_path = Path(args.failure_file)
+                if not failure_path.is_file():
+                    raise FileNotFoundError(f"Failure file not found: {failure_path}")
+                with failure_path.open('r', encoding='utf-8') as f:
+                    failure_data = json.load(f)
+                ci_context = CIFailureContext.from_dict(failure_data)
+            except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError) as e:
+                print(f"error: Invalid or missing failure file: {e}", file=sys.stderr)
+                return 1
+
+            now = datetime.datetime.now(datetime.timezone.utc)
+            objective = f"Autonomously repair CI failure from command: {ci_context.failed_command}"
+            new_task = Task(
+                task_id=str(uuid.uuid4()), objective=objective, status=TaskStatus.PENDING,
+                created_at=now, updated_at=now, autonomous=True,
+                initial_failure_context=ci_context
+            )
+            storage.save_task(new_task)
+            print(f"Created CI repair task: {new_task.task_id}")
+            return 0
+
+        if args.command == "commit-task":
+            from .git import GitIntegration
+            git = GitIntegration(config.project)
+            if not git.is_repository():
+                print("error: Project is not a Git repository.", file=sys.stderr)
+                return 1
+
+            task = storage.load_task(args.task_id)
+            if task.status != TaskStatus.COMPLETED:
+                print(f"error: Task {task.task_id} is not in COMPLETED state.", file=sys.stderr)
+                return 1
+            if not task.changed_files:
+                print(f"error: Task {task.task_id} has no recorded changes to commit.", file=sys.stderr)
+                return 1
+
+            if git.is_dirty(expected_changes=task.changed_files):
+                print("error: Working tree contains unexpected changes. Please stash or commit them before proceeding.", file=sys.stderr)
+                return 1
+
+            branch_name = args.branch_name or f"agent-task/{task.task_id[:8]}"
+            if not git.create_branch(branch_name):
+                print(f"error: Failed to create branch '{branch_name}'. It may already exist.", file=sys.stderr)
+                return 1
+            
+            if not git.add(task.changed_files):
+                print("error: Failed to stage changed files.", file=sys.stderr)
+                return 1
+
+            commit_message = f"feat: Complete task '{task.objective}'\n\nTask-ID: {task.task_id}"
+            if not git.commit(commit_message):
+                print("error: Failed to create commit.", file=sys.stderr)
+                return 1
+            
+            print(f"Successfully committed changes for task {task.task_id} to branch '{branch_name}'.")
+            return 0
+
+        if args.command == "push-task":
+            from .git import GitIntegration
+            git = GitIntegration(config.project)
+            branch_name = f"agent-task/{args.task_id[:8]}"
+            
+            # A simple check: does the current branch match the expected task branch?
+            if git.get_current_branch() != branch_name:
+                print(f"error: You are not on the task branch. Please check out '{branch_name}' first.", file=sys.stderr)
+                return 1
+
+            if not git.push(config.git_default_remote, branch_name, set_upstream=True):
+                print(f"error: Failed to push branch '{branch_name}' to remote '{config.git_default_remote}'.", file=sys.stderr)
+                return 1
+            
+            print(f"Successfully pushed branch '{branch_name}' to remote '{config.git_default_remote}'.")
+            return 0
+
+        if args.command == "create-pr":
+            from .git import GitIntegration
+            from .remotes import build_remote_provider, RemoteError
+
+            task = storage.load_task(args.task_id)
+            if task.status != TaskStatus.COMPLETED:
+                print(f"error: Task {task.task_id} is not in COMPLETED state.", file=sys.stderr)
+                return 1
+            
+            if task.pull_request:
+                print(f"Pull request for task {task.task_id} already exists: {task.pull_request.url}")
+                return 0
+
+            try:
+                remote_provider = build_remote_provider(config)
+                if not remote_provider:
+                    print("error: No remote provider configured (e.g., set AGENT_GIT_HOSTING_PROVIDER='github' and GITHUB_TOKEN).", file=sys.stderr)
+                    return 1
+
+                branch_name = f"agent-task/{task.task_id[:8]}"
+                existing_pr = remote_provider.find_pull_request_for_branch(branch_name)
+                if existing_pr:
+                    print(f"Pull request for branch '{branch_name}' already exists: {existing_pr.url}")
+                    task.pull_request = existing_pr
+                else:
+                    new_pr = remote_provider.create_pull_request(task, branch_name)
+                    print(f"Successfully created pull request: {new_pr.url}")
+                    task.pull_request = new_pr
+                storage.save_task(task)
+                return 0
+            except RemoteError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
 
         if args.command == "doctor":
             print("DungX AI Coding Agent Health Check")

@@ -6,7 +6,8 @@ import shlex
 import uuid
 from pathlib import Path
 
-from .approval import ApprovalPolicyEngine
+import threading
+from .approval import ApprovalPolicyEngine, RISK_LEVEL_MAP
 from .coding_agent import CodingAgent, PatchValidationError, UnsafeModificationError
 from .commands import CommandRunner
 from .config import AgentConfig
@@ -24,6 +25,8 @@ from .models import (
     FailureAnalysis,
     Plan,
     PlanProposal,
+    ProjectMemory,
+    Memory,
     ProjectContext,
     RunReport,
     Subtask,
@@ -31,7 +34,8 @@ from .models import (
     TaskStatus,
     ValidationPlan,
 )
-from .planner import Planner
+from .models import MemoryCategory
+from .planner import GraphValidator, Planner
 from .providers import AIProvider, ProviderError, QuotaExceededError, RateLimitError
 from .repository import RepositoryIntelligence
 from .reviewer import Reviewer
@@ -41,19 +45,18 @@ LOGGER = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    def __init__(self, config: AgentConfig, provider: AIProvider, storage: TaskStorage): # Orchestrator now takes storage
+    def __init__(self, config: AgentConfig, storage: "TaskStorage", scheduler: "Scheduler", repo_lock: threading.Lock, memory_lock: threading.Lock):
         self.config = config
-        self.provider = provider
+        self.storage = storage
+        self.scheduler = scheduler
+        self.repo_lock = repo_lock
+        self.memory_lock = memory_lock
         self.analyzer = RepositoryIntelligence(config.project)
         self.filesystem = ProjectFilesystem(config.project)
         self.git = GitIntegration(config.project)
-        self.planner = Planner(provider)
-        self.failure_analyzer = FailureAnalyzer(provider)
-        self.reviewer = Reviewer(provider)
         self.impact_analyzer = ChangeImpactAnalyzer(config.project)
         self.runner = CommandRunner(config.project, config.command_timeout_seconds)
         self.validation_intelligence = ValidationIntelligence(config.project)
-        self.storage = storage
         policies = [ApprovalPolicy.from_dict(p) for p in config.approval_policies]
         self.approval_engine = ApprovalPolicyEngine(policies)
 
@@ -68,6 +71,7 @@ class Orchestrator:
 
         emit("[1/7] Analyzing project...")
         context = self.analyzer.scan()
+        project_memory = self.storage.load_project_memory() if self.config.memory_enabled else ProjectMemory()
         if self.config.validation_commands:
             context.validation_commands = [CommandSpec(f"explicit-{index}", tuple(shlex.split(command)), "explicit CLI configuration") for index, command in enumerate(self.config.validation_commands, 1)]
         emit("[2/7] Building context...")
@@ -78,6 +82,7 @@ class Orchestrator:
             max_file_chars=self.config.max_context_file_bytes,
             max_tokens=self.config.max_context_tokens,
             dependency_depth=self.config.dependency_depth,
+            project_memory=project_memory,
         ).select(task.objective, context)
 
         emit("[2.5/7] Analyzing change impact...")
@@ -89,13 +94,22 @@ class Orchestrator:
         current_subtask = next((s for s in (task.plan.subtasks if task.plan else []) if s.subtask_id == subtask_id), None)
         task.current_subtask_id = subtask_id
 
-        emit("[3/7] Creating implementation plan...")
         try:
-            plan = self.planner.create_subtask_plan(current_subtask, context)
+            emit("[3/7] Creating implementation plan...")
+            plan = self._execute_with_specialist(
+                task,
+                ProviderCapability.PLANNING,
+                lambda provider: Planner(provider).create_subtask_plan(current_subtask, context),
+                "planning"
+            )
+            if plan is None:
+                raise ProviderError("No available provider for planning")
         except ProviderError as exc:
             self._record_provider_failure(task, current_subtask, exc, "planning provider request failed")
             emit(f"[3/7] Provider stopped the run: {report.outcome}")
             return report
+        except Exception as e:
+            LOGGER.exception("Unhandled exception during planning: %s", e)
         report.plan = plan
         preexisting = self._git_changed_paths()
         coding_agent = CodingAgent(self.filesystem, preexisting)
@@ -130,13 +144,36 @@ class Orchestrator:
         validation_plan = self.validation_intelligence.select_commands(
             task.objective, impact, list(getattr(context, "validation_commands", None) or [])
         )
+        
+        # Phase 3.23: Seed the first iteration with CI failure context if available
+        if iteration == 1 and task.initial_failure_context:
+            emit("[5/7] Seeding repair cycle with initial CI failure context.")
+            ci_context = task.initial_failure_context
+            initial_execution = ExecutionResult(
+                command=ci_context.failed_command,
+                exit_code=ci_context.exit_code,
+                stdout=ci_context.stdout,
+                stderr=ci_context.stderr
+            )
+            failure = FailureAnalysis(
+                probable_root_cause="Initial failure provided by CI environment.",
+                recommended_fix="Analyze the provided logs and fix the issue.",
+                diagnostic_evidence=[initial_execution]
+            )
+            task.initial_failure_context = None # Consume the context
+            self.storage.save_task(task)
 
         try:
             for iteration in range(1, self.config.max_iterations + 1):
                 report.iterations = iteration
                 emit("[4/7] Implementing changes..." if iteration == 1 else f"[5/7] Applying repair for iteration {iteration}...")
                 try:
-                    operations = self.provider.generate_code(task, plan, context, failure=failure, review=review)
+                    operations = self._execute_with_specialist(
+                        task,
+                        ProviderCapability.IMPLEMENTATION,
+                        lambda provider: provider.generate_code(task, plan, context, failure=failure, review=review),
+                        "implementation"
+                    )
                 except ProviderError as exc:
                     self._record_provider_failure(task, current_subtask, exc, "implementation provider request failed")
                     emit(f"[4/7] Provider stopped the run: {report.outcome}")
@@ -200,7 +237,8 @@ class Orchestrator:
                         emit("[4/7] Changes not approved; stopping before write")
                         report.proposed_diff = proposed_diff
                         break
-                report.changed_files.extend(coding_agent.apply_prepared(prepared))
+                with self.repo_lock: # Acquire lock for file system mutation
+                    report.changed_files.extend(coding_agent.apply_prepared(prepared))
                 report.proposed_diff = coding_agent.diff()
                 self._create_checkpoint(task, current_subtask, "After code generation, before validation", context, report) # Checkpoint
 
@@ -230,7 +268,12 @@ class Orchestrator:
                                 break
 
                             emit(f"[5.3/7] Executing selected diagnostic command: {selected_cmd_spec.display()}")
-                            diagnostic_result = self.runner.run(selected_cmd_spec)
+                            diagnostic_result = self._execute_with_specialist(
+                                task,
+                                ProviderCapability.REPAIR, # Assumes repairer can select diagnostics
+                                lambda provider: self.runner.run(selected_cmd_spec),
+                                "diagnostic selection"
+                            )
                             truncated_result = self._truncate_execution_result(diagnostic_result)
                         
                             current_diagnostic_evidence.append(truncated_result)
@@ -244,7 +287,12 @@ class Orchestrator:
                             self._create_checkpoint(task, current_subtask, f"After running diagnostic: {selected_cmd_spec.name}", context, report, extra_context=extra_context)
 
                     try:
-                        failure = self.failure_analyzer.analyze(failed, coding_agent.diff() or self.git.diff(), context, plan)
+                        failure = self._execute_with_specialist(
+                            task,
+                            ProviderCapability.REPAIR,
+                            lambda provider: FailureAnalyzer(provider).analyze(failed, coding_agent.diff() or self.git.diff(), context, plan),
+                            "failure analysis"
+                        )
                     except ProviderError as exc:
                         self._record_provider_failure(task, current_subtask, exc, "failure-analysis provider request failed")
                         emit(f"[5/7] Provider stopped the run: {report.outcome}")
@@ -256,7 +304,12 @@ class Orchestrator:
                     # Phase 3.14: Propose a plan modification if the failure seems architectural
                     if failure.category in {"MISSING_DEPENDENCY", "ARCHITECTURAL_FLAW"}: # Example categories
                         emit("[5.5/7] Failure suggests a planning issue. Proposing plan modification...")
-                        plan_proposal: PlanProposal | None = self.provider.propose_plan_modification(task.objective, task.plan, failure)
+                        plan_proposal: PlanProposal | None = self._execute_with_specialist(
+                            task,
+                            ProviderCapability.PLANNING,
+                            lambda provider: provider.propose_plan_modification(task.objective, task.plan, failure),
+                            "plan modification proposal"
+                        )
                         if plan_proposal:
                             report.plan_proposal = plan_proposal
                             # The orchestrator's job is done; it returns the proposal in the report.
@@ -273,7 +326,12 @@ class Orchestrator:
 
                 emit("[6/7] Reviewing changes...")
                 try:
-                    report.review = self.reviewer.review(current_subtask.goal, plan, coding_agent.diff() or self.git.diff(), context)
+                    report.review = self._execute_with_specialist(
+                        task,
+                        ProviderCapability.REVIEW,
+                        lambda provider: Reviewer(provider).review(current_subtask.goal, plan, coding_agent.diff() or self.git.diff(), context),
+                        "review"
+                    )
                 except (RateLimitError, QuotaExceededError) as exc: # Handle temporary provider errors
                     self._handle_temporary_provider_error(task, current_subtask, exc, "review provider request failed", context)
                     emit(f"[6/7] Provider temporarily unavailable: {task.outcome}. Task paused.")
@@ -296,6 +354,8 @@ class Orchestrator:
                 if report.completed:
                     task.status = TaskStatus.COMPLETED
                     current_subtask.status = SubtaskStatus.COMPLETED
+                    # Phase 3.24: Persist changed files on successful completion
+                    task.changed_files = sorted(list(set(report.changed_files)))
                     current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
                 else:
                     if task.status != TaskStatus.PAUSED: # Only set FAILED if not already paused
@@ -311,13 +371,147 @@ class Orchestrator:
             report.outcome = "UNHANDLED_EXCEPTION"
             report.failures.append(FailureAnalysis(probable_root_cause="Unhandled exception", recommended_fix=str(e)))
         finally:
+            # Consolidate metrics from all specialists used in this run
+            if report.completed:
+                # Phase 3.24: Autonomous commit on completion
+                branch_name = f"agent-task/{task.task_id[:8]}"
+                committed = False
+                if task.autonomous and self.config.git_commit_on_completion:
+                    emit("[7/7] Autonomous commit enabled, attempting to commit changes...")
+                    committed = self._perform_git_commit(task, branch_name)
+
+                # Phase 3.25: Autonomous push and PR creation
+                if committed and task.autonomous and self.config.git_push_on_completion:
+                    emit("[7/7] Autonomous push enabled, attempting to push changes...")
+                    pushed = self._perform_git_push(task, branch_name)
+                    if pushed and self.config.git_pr_on_completion:
+                        emit("[7/7] Autonomous PR creation enabled, attempting to create PR...")
+                        self._perform_pr_creation(task, branch_name)
+                
+                self._create_memories_from_run(task, report)
+            all_metrics = []
+            # This is a simplification; a more robust implementation would track providers used per stage
+            # For now, we'll just grab metrics from all known providers in the registry.
+            for reg_provider in self.scheduler.registry.providers.values():
+                try:
+                    # This is not ideal as it re-builds providers, but it's a way to access metrics
+                    # without a major refactor of how providers are held.
+                    provider_instance = self.scheduler._build_provider_instance(reg_provider.provider_id)
+                    if provider_instance:
+                        all_metrics.extend(provider_instance.provider_metrics)
+                except Exception:
+                    pass # Ignore if a provider can't be built
+
             task.updated_at = datetime.datetime.now(datetime.timezone.utc)
             self.storage.save_task(task)
-            report.provider_metrics = list(self.provider.provider_metrics) # Capture metrics for the run
+            report.provider_metrics = all_metrics
             task.provider_execution_history.extend(report.provider_metrics) # Add to task history
             self.storage.save_task(task) # Save task with updated metrics
 
         return self._build_run_report(task)
+
+    def _select_specialists(self, task: Task, capability: ProviderCapability):
+        provider_configs = self.scheduler._select_providers(task, {capability})
+        for provider_config in provider_configs:
+            try:
+                provider = self.scheduler._build_provider_instance(provider_config.provider)
+                if provider:
+                    yield provider
+            except Exception as e:
+                LOGGER.error("Failed to build provider %s: %s", provider_config.provider, e)
+                continue
+
+    def _execute_with_specialist(self, task: Task, capability: ProviderCapability, action, stage_name: str):
+        for provider in self._select_specialists(task, capability):
+            return action(provider)
+        raise ProviderError(f"No available and capable provider found for stage: {stage_name}")
+
+    def _perform_git_commit(self, task: Task, branch_name: str) -> bool:
+        """Handles the logic for creating a local git commit for a completed task."""
+        if not self.git.is_repository():
+            LOGGER.warning("Not a Git repository, skipping commit.")
+            return False
+
+        if self.git.is_dirty(expected_changes=task.changed_files):
+            LOGGER.warning("Working tree contains unexpected changes, skipping commit to avoid including unrelated work.")
+            return False
+
+        if not self.git.create_branch(branch_name):
+            LOGGER.error(f"Failed to create branch '{branch_name}'.")
+            return False
+
+        if not self.git.add(task.changed_files):
+            LOGGER.error("Failed to stage changed files for commit.")
+            return False
+
+        commit_message = f"feat: Complete task '{task.objective}'\n\nTask-ID: {task.task_id}"
+        if not self.git.commit(commit_message):
+            LOGGER.error("Failed to create commit.")
+            return False
+        
+        LOGGER.info(f"Successfully committed changes to branch '{branch_name}'.")
+        return True
+
+    def _perform_git_push(self, task: Task, branch_name: str) -> bool:
+        """Handles pushing a task branch to the remote."""
+        if not self.git.push(self.config.git_default_remote, branch_name, set_upstream=True):
+            LOGGER.error(f"Failed to push branch '{branch_name}' to remote '{self.config.git_default_remote}'.")
+            return False
+        LOGGER.info(f"Successfully pushed branch '{branch_name}'.")
+        return True
+
+    def _perform_pr_creation(self, task: Task, branch_name: str):
+        """Handles creating a pull request for a task."""
+        from .remotes import build_remote_provider, RemoteError
+
+        try:
+            remote_provider = build_remote_provider(self.config)
+            if not remote_provider:
+                LOGGER.warning("No remote provider configured, skipping PR creation.")
+                return
+
+            existing_pr = remote_provider.find_pull_request_for_branch(branch_name)
+            if existing_pr:
+                LOGGER.info(f"Pull request for branch '{branch_name}' already exists: {existing_pr.url}")
+                task.pull_request = existing_pr
+                self.storage.save_task(task)
+                return
+
+            new_pr = remote_provider.create_pull_request(task, branch_name)
+            LOGGER.info(f"Successfully created pull request: {new_pr.url}")
+            task.pull_request = new_pr
+            self.storage.save_task(task)
+
+        except RemoteError as e:
+            LOGGER.error(f"Failed to create pull request: {e}")
+        except Exception as e:
+            LOGGER.exception(f"An unexpected error occurred during PR creation: {e}")
+
+    def _create_memories_from_run(self, task: Task, report: RunReport):
+        if not self.config.memory_enabled or not report.changed_files:
+            return
+
+        with self.memory_lock:
+            memory = self.storage.load_project_memory()
+            
+            # Create a memory about the changed files' roles
+            for file_path in report.changed_files:
+                # Avoid creating duplicate memories for the same file from the same task
+                if any(m.category == MemoryCategory.FILE_ROLE and m.related_path == file_path and m.source_task_id == task.task_id for m in memory.memories):
+                    continue
+
+                new_memory = Memory(
+                    memory_id=str(uuid.uuid4()),
+                    category=MemoryCategory.FILE_ROLE,
+                    content=f"File '{file_path}' was modified to accomplish the task: '{task.objective}'. It likely plays a key role in this type of feature.",
+                    timestamp=datetime.datetime.now(datetime.timezone.utc),
+                    source_task_id=task.task_id,
+                    related_path=file_path,
+                    confidence=0.8
+                )
+                memory.memories.append(new_memory)
+            
+            self.storage.save_project_memory(memory)
 
     def _create_new_task(self, objective: str) -> Task:
         now = datetime.datetime.now(datetime.timezone.utc)

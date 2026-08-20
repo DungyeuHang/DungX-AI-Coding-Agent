@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import json
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,7 +25,7 @@ class PlanningOnlyProvider(AIProvider):
         return {ProviderCapability.PLANNING}
 
     def generate_plan(self, task, context):
-        return mock.MagicMock()
+        return json.loads('{"objective": "mock plan", "steps": ["step1"]}')
 
 
 class ImplementationOnlyProvider(AIProvider):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import shutil
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ from local_agent.credentials import MockCredentialStore
 from local_agent.models import (ProviderAvailability, ProviderCapability,
                                 ProviderConfig, ProviderError,
                                 QuotaExceededError, Task, TaskStatus)
-from local_agent.providers import AIProvider, build_provider
+from local_agent.providers import AIProvider, BaseHTTPProvider, build_provider
 from local_agent.scheduler import Scheduler
 from local_agent.storage import JsonFileStorage
 from .test_phase39 import MockTaskStorage
@@ -24,10 +25,14 @@ class MockProviderA(AIProvider):
         self.capabilities = {ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION}
         self.should_fail = False
 
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION}
+
     def generate_plan(self, task, context):
         if self.should_fail:
             raise QuotaExceededError("Quota exceeded on Provider A")
-        return mock.MagicMock()
+        return json.loads('{"objective": "mock plan", "steps": ["step1"]}')
 
     def generate_code(self, task, plan, context, failure=None, review=None):
         if self.should_fail:
@@ -38,13 +43,17 @@ class MockProviderA(AIProvider):
         return mock.MagicMock()
 
     def review_changes(self, task, plan, diff, context):
-        return mock.MagicMock(verdict="APPROVED")
+        return {"verdict": "APPROVED", "summary": "mock review", "findings": []}
 
 class MockProviderB(AIProvider):
     def __init__(self, config):
         self.config = config
         self.capabilities = {ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION}
         self.continuation_context_received = None
+
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION}
 
     def generate_plan(self, task, context):
         self.continuation_context_received = context.metadata.get("continuation_context")

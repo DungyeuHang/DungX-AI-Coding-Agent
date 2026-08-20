@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import datetime
 import re
 from collections import defaultdict
 from pathlib import Path
 
 from .filesystem import ProjectFilesystem, ProtectedPathError, SandboxViolation
-from .models import ProjectContext, SemanticIndex
+from .models import ProjectContext, ProjectMemory, SemanticIndex
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
@@ -27,13 +28,14 @@ _RELATION_BONUS = {
 class ContextSelector:
     """Deterministically selects task-relevant files before provider calls."""
 
-    def __init__(self, root: str | Path, max_files: int = 24, max_chars: int = 30000, max_file_chars: int = 5000, max_tokens: int = 7500, dependency_depth: int = 1):
+    def __init__(self, root: str | Path, max_files: int = 24, max_chars: int = 30000, max_file_chars: int = 5000, max_tokens: int = 7500, dependency_depth: int = 1, project_memory: ProjectMemory | None = None):
         self.filesystem = ProjectFilesystem(root)
         self.max_files = max_files
         self.max_chars = max_chars
         self.max_file_chars = max_file_chars
         self.max_tokens = max_tokens
         self.dependency_depth = dependency_depth
+        self.project_memory = project_memory or ProjectMemory()
 
     def select(self, task: str, context: ProjectContext) -> ProjectContext:
         keywords = self._keywords(task)
@@ -120,6 +122,24 @@ class ContextSelector:
                     if 0.15 > current_boost:
                         semantic_boosts[related_path] = (0.15, reason)
 
+        # Phase 3.22: Add boosts from Project Memory
+        memory_boosts: dict[str, tuple[float, str]] = {}  # path -> (boost, reason)
+        if self.project_memory:
+            task_keywords = self._keywords(task)
+            for memory in self.project_memory.memories:
+                # Simple relevance: memory content has task keywords, and it's related to a file
+                if memory.related_path and task_keywords & self._keywords(memory.content):
+                    # Stale memory check: decay score based on age.
+                    age_days = (datetime.datetime.now(datetime.timezone.utc) - memory.timestamp).days
+                    decay_factor = max(0, 1 - (age_days / 90))  # Memory influence decays over 90 days
+                    if decay_factor > 0:
+                        boost = 0.20 * memory.confidence * decay_factor
+                        reason = f"project memory: {memory.category.value}"
+
+                        current_boost, _ = memory_boosts.get(memory.related_path, (0.0, ""))
+                        if boost > current_boost:
+                            memory_boosts[memory.related_path] = (boost, reason)
+
         for relative in candidates:
             try:
                 with self.filesystem.resolve(relative).open("r", encoding="utf-8") as handle:
@@ -140,6 +160,11 @@ class ContextSelector:
 
             if relative in semantic_boosts:
                 boost, reason = semantic_boosts[relative]
+                score += boost
+                reasons.append(reason)
+
+            if relative in memory_boosts:
+                boost, reason = memory_boosts[relative]
                 score += boost
                 reasons.append(reason)
 

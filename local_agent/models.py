@@ -334,6 +334,24 @@ class ProviderMetric:
     def from_dict(cls, data: dict[str, Any]) -> Self:
         return cls(**data)
 
+# New for Phase 3.25
+@dataclass
+class PullRequestInfo:
+    provider: str
+    pr_id: str
+    url: str
+    status: str
+    created_at: datetime.datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["created_at"] = self.created_at.isoformat()
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        data["created_at"] = datetime.datetime.fromisoformat(data["created_at"])
+        return cls(**data)
 
 @dataclass
 class ChangeTarget:
@@ -517,6 +535,58 @@ class ApprovalPolicy:
         return cls(**data)
 
 
+# New for Phase 3.22
+class MemoryCategory(str, Enum):
+    ARCHITECTURE = "architecture"
+    FILE_ROLE = "file_role"
+    RECURRING_ERROR = "recurring_error"
+    SUCCESSFUL_FIX = "successful_fix"
+    PROJECT_CONVENTION = "project_convention"
+
+@dataclass
+class Memory:
+    memory_id: str
+    category: MemoryCategory
+    content: str
+    timestamp: datetime.datetime
+    source_task_id: str
+    related_path: str | None = None
+    confidence: float = 1.0
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["category"] = self.category.value
+        data["timestamp"] = self.timestamp.isoformat()
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        data["category"] = MemoryCategory(data["category"])
+        data["timestamp"] = datetime.datetime.fromisoformat(data["timestamp"])
+        return cls(**data)
+
+@dataclass
+class ProjectMemory:
+    memories: list[Memory] = field(default_factory=list)
+    def to_dict(self) -> dict[str, Any]: return {"memories": [m.to_dict() for m in self.memories]}
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self: return cls(memories=[Memory.from_dict(m) for m in data.get("memories", [])])
+
+# New for Phase 3.23
+@dataclass
+class CIFailureContext:
+    failed_command: str
+    exit_code: int
+    stdout: str
+    stderr: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(**data)
+
 @dataclass
 class Task:
     task_id: str
@@ -527,6 +597,9 @@ class Task:
     plan: TaskPlan | None = None # Changed from subtasks list to a full plan
     plan_proposal: PlanProposal | None = None # Added for Phase 3.14
     current_subtask_id: str | None = None
+    changed_files: list[str] = field(default_factory=list) # New for Phase 3.24
+    pull_request: PullRequestInfo | None = None # New for Phase 3.25
+    initial_failure_context: CIFailureContext | None = None # New for Phase 3.23
     autonomous: bool = False # New for autonomous mode
     execution_history: list[dict[str, Any]] = field(default_factory=list)
     latest_checkpoint_id: str | None = None
@@ -545,6 +618,10 @@ class Task:
             data["plan"] = self.plan.to_dict()
         if self.plan_proposal:
             data["plan_proposal"] = self.plan_proposal.to_dict()
+        if self.initial_failure_context:
+            data["initial_failure_context"] = self.initial_failure_context.to_dict()
+        if self.pull_request:
+            data["pull_request"] = self.pull_request.to_dict()
         data["provider_execution_history"] = [metric.to_dict() for metric in self.provider_execution_history] # Hardened
         return data
 
@@ -557,6 +634,10 @@ class Task:
             data["plan"] = TaskPlan.from_dict(data["plan"])
         if data.get("plan_proposal"):
             data["plan_proposal"] = PlanProposal.from_dict(data["plan_proposal"])
+        if data.get("initial_failure_context"):
+            data["initial_failure_context"] = CIFailureContext.from_dict(data["initial_failure_context"])
+        if data.get("pull_request"):
+            data["pull_request"] = PullRequestInfo.from_dict(data["pull_request"])
         data["provider_execution_history"] = [ProviderMetric.from_dict(metric_data) for metric_data in data.get("provider_execution_history", [])]
         if data.get("next_retry_at"):
             data["next_retry_at"] = datetime.datetime.fromisoformat(data["next_retry_at"])

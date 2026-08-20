@@ -116,6 +116,91 @@ class AIProvider:
         return None # Default implementation does nothing
 
 
+class BaseHTTPProvider(AIProvider):
+    """Base class for AI providers that communicate via HTTP/JSON APIs."""
+
+    def __init__(self, config: AgentConfig):
+        self.config = config
+        self.metrics_enabled = config.metrics_enabled
+        self.api_key = config.api_key
+        self.model = config.model
+        # Subclasses must set self.base_url
+
+    @staticmethod
+    def _parse_json(content: str) -> dict[str, Any]:
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if len(lines) < 3:
+                raise ProviderError("provider returned an incomplete JSON code fence")
+            cleaned = "\n".join(lines[1:-1])
+        try:
+            value = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(f"provider returned invalid JSON: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ProviderError("provider JSON must be an object")
+        return value
+
+    def _request_json_api(self, url: str, body: bytes | None, headers: dict[str, str], endpoint: str, model: str | None, timeout: int, method: str = "POST") -> dict[str, Any]:
+        attempts = 0
+        while True:
+            request = urllib.request.Request(url, data=body, headers=headers, method=method)
+            started = time.perf_counter()
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    raw = response.read()
+                    payload = json.loads(raw.decode("utf-8"))
+                self._record_metric(endpoint, len(body or b""), len(raw), time.perf_counter() - started, model or "", True)
+                return payload
+            except urllib.error.HTTPError as exc:
+                reason, retry_after = _http_error_reason(exc, self.api_key), _retry_after_seconds(getattr(exc, "headers", None), {})
+                error = _classify_http_error(exc.code, self.__class__.__name__, model, endpoint, reason, retry_after)
+                self._record_metric(endpoint, len(body or b""), 0, time.perf_counter() - started, model or "", False, error.category)
+                if isinstance(error, (RateLimitError, QuotaExceededError)) and retry_after is not None and attempts < self.config.provider_max_retries and retry_after <= self.config.max_retry_wait_seconds:
+                    attempts += 1
+                    time.sleep(max(0.0, retry_after))
+                    continue
+                raise error from exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                self._record_metric(endpoint, len(body or b""), 0, time.perf_counter() - started, model or "", False, NetworkError.category)
+                raise NetworkError(f"{self.__class__.__name__} request failed: {exc}") from exc
+            except json.JSONDecodeError as exc:
+                self._record_metric(endpoint, len(body or b""), 0, time.perf_counter() - started, model or "", False, UnknownProviderError.category)
+                raise UnknownProviderError(f"{self.__class__.__name__} request failed: malformed JSON response: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise UnknownProviderError(f"{self.__class__.__name__} request failed: response was not a JSON object")
+            return payload
+
+    def _context(self, context: ProjectContext, stage: str = "planning") -> str:
+        """Serialize project context for provider prompts.
+
+        Uses the provider's ``config`` when available; falls back to the
+        ``AgentConfig`` defaults so config-less providers (e.g. mock/test
+        providers) also satisfy the contract.
+        """
+        config = getattr(self, "config", None)
+        if config is None:
+            budget = 30000
+            max_files = 24
+            max_file_bytes = 5000
+        else:
+            budget = getattr(config, f"{stage}_context_bytes", 30000)
+            max_files = config.max_context_files
+            max_file_bytes = config.max_context_file_bytes
+        return json.dumps(_bounded_context(context, budget, max_files, max_file_bytes), ensure_ascii=False, indent=2)
+
+    def _failure_payload(self, failure: FailureAnalysis | None, task: str, plan: Plan) -> dict[str, Any]:
+        if failure is None:
+            return {}
+        if failure.category == "PATCH_VALIDATION":
+            return {"task": task, "plan": _repair_plan(plan), "failure": _bounded_repair_failure(failure, self.config.repair_context_bytes)}
+        return {"task": task, "plan": _repair_plan(plan), "failure": asdict(failure)}
+
+
+
+
+
 class MockProvider(AIProvider):
     """Offline provider used for tests and safe workflow dry runs.
 
@@ -168,11 +253,9 @@ class MockProvider(AIProvider):
         return None
 
 
-class OpenAIProvider(AIProvider):
+class OpenAIProvider(BaseHTTPProvider):
     def __init__(self, config: AgentConfig):
-        self.config = config
-        self.metrics_enabled = config.metrics_enabled
-    @property
+        super().__init__(config)
     def capabilities(self) -> set[ProviderCapability]:
         return {
             ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
@@ -186,33 +269,14 @@ class OpenAIProvider(AIProvider):
         self.model = config.model
         self.base_url = config.api_base_url.rstrip("/")
 
-    def _json_call(self, system: str, user: str) -> dict[str, Any]:
+    def _call_api(self, system: str, user: str) -> dict[str, Any]:
         body = json.dumps({
             "model": self.model,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         }).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base_url}/chat/completions", data=body,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}, method="POST",
-        )
-        started = time.perf_counter()
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                raw = response.read()
-                payload = json.loads(raw.decode("utf-8"))
-            self._record_metric("structured_request", len(body), len(raw), time.perf_counter() - started, self.model, True)
-        except urllib.error.HTTPError as exc:
-            reason = _http_error_reason(exc, self.api_key)
-            error = _classify_http_error(exc.code, "OpenAI", self.model, "chat.completions", reason, _retry_after_seconds(getattr(exc, "headers", None), {}))
-            self._record_metric("structured_request", len(body), 0, time.perf_counter() - started, self.model, False, error.category)
-            raise error from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            self._record_metric("structured_request", len(body), 0, time.perf_counter() - started, self.model, False, _error_category(exc))
-            if isinstance(exc, (urllib.error.URLError, TimeoutError)):
-                raise NetworkError(f"OpenAI request failed: {exc}") from exc
-            raise UnknownProviderError(f"OpenAI request failed: {exc}") from exc
+        payload = self._request_json_api(f"{self.base_url}/chat/completions", body, {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}, "chat.completions", self.model, 120)
         try:
             content = payload["choices"][0]["message"]["content"]
             if isinstance(content, list):
@@ -220,32 +284,6 @@ class OpenAIProvider(AIProvider):
             return self._parse_json(str(content))
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError("OpenAI response did not contain a message") from exc
-
-    @staticmethod
-    def _parse_json(content: str) -> dict[str, Any]:
-        cleaned = content.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.splitlines()
-            if len(lines) < 3:
-                raise ProviderError("provider returned an incomplete JSON code fence")
-            cleaned = "\n".join(lines[1:-1])
-        try:
-            value = json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            raise ProviderError(f"provider returned invalid JSON: {exc}") from exc
-        if not isinstance(value, dict):
-            raise ProviderError("provider JSON must be an object")
-        return value
-
-    def _context(self, context: ProjectContext, stage: str = "planning") -> str:
-        return json.dumps(_bounded_context(context, getattr(self.config, f"{stage}_context_bytes", 30000), self.config.max_context_files, self.config.max_context_file_bytes), ensure_ascii=False, indent=2)
-
-    def _failure_payload(self, failure: FailureAnalysis | None, task: str, plan: Plan) -> dict[str, Any]:
-        if failure is None:
-            return {}
-        if failure.category == "PATCH_VALIDATION":
-            return {"task": task, "plan": _repair_plan(plan), "failure": _bounded_repair_failure(failure, self.config.repair_context_bytes)}
-        return {"task": task, "plan": _repair_plan(plan), "failure": asdict(failure)}
 
     def generate_plan(self, task: str, context: ProjectContext) -> Plan:
         data = self._json_call(
@@ -302,13 +340,11 @@ GEMINI_STABLE_MODEL_PREFERENCE = (
 ANTIGRAVITY_AGENT = "antigravity-preview-05-2026"
 
 
-class GeminiProvider(AIProvider):
+class GeminiProvider(BaseHTTPProvider):
     """Gemini REST provider using the standard library to avoid a heavy SDK."""
 
     def __init__(self, config: AgentConfig):
-        self.config = config
-        self.metrics_enabled = config.metrics_enabled
-
+        super().__init__(config)
     @property
     def capabilities(self) -> set[ProviderCapability]:
         return {
@@ -326,7 +362,7 @@ class GeminiProvider(AIProvider):
         self.base_url = config.gemini_base_url.rstrip("/")
         self._available_models: list[dict[str, Any]] | None = None
 
-    def _json_call(self, system: str, user: str) -> dict[str, Any]:
+    def _call_api(self, system: str, user: str) -> dict[str, Any]:
         self._ensure_model()
         body = json.dumps({
             "systemInstruction": {"parts": [{"text": system}]},
@@ -393,39 +429,15 @@ class GeminiProvider(AIProvider):
         return f"{self.base_url}/models/{urllib.parse.quote(self._model_id(self.model), safe='')}:generateContent"
 
     def _request_json(self, url: str, body: bytes | None, endpoint: str, model: str | None, timeout: int, method: str = "POST") -> dict[str, Any]:
-        attempts = 0
-        while True:
-            request = urllib.request.Request(
-                url,
-                data=body,
-                headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
-                method=method,
-            )
-            started = time.perf_counter()
-            try:
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    raw = response.read()
-                    payload = json.loads(raw.decode("utf-8"))
-                self._record_metric(endpoint, len(body or b""), len(raw), time.perf_counter() - started, model or "", True)
-            except urllib.error.HTTPError as exc:
-                reason, retry_after = self._http_reason_and_retry(exc)
-                error = self._classified_http_error(exc.code, model, endpoint, reason, retry_after)
-                self._record_metric(endpoint, len(body or b""), 0, time.perf_counter() - started, model or "", False, error.category)
-                if isinstance(error, (RateLimitError, QuotaExceededError)) and retry_after is not None and attempts < self.config.provider_max_retries and retry_after <= self.config.max_retry_wait_seconds:
-                    attempts += 1
-                    time.sleep(max(0.0, retry_after))
-                    continue
-                raise error from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
-                self._record_metric(endpoint, len(body or b""), 0, time.perf_counter() - started, model or "", False, NetworkError.category)
-                reason = getattr(exc, "reason", type(exc).__name__)
-                raise NetworkError(f"{self.provider_label} request failed:\nHTTP <network>\nModel: {model or '<model discovery>'}\nEndpoint: {endpoint}\nReason: {reason}") from exc
-            except json.JSONDecodeError as exc:
-                self._record_metric(endpoint, len(body or b""), 0, time.perf_counter() - started, model or "", False, UnknownProviderError.category)
-                raise UnknownProviderError(f"{self.provider_label} request failed:\nHTTP {getattr(response, 'status', '<unknown>')}\nModel: {model or '<model discovery>'}\nEndpoint: {endpoint}\nReason: malformed JSON response") from exc
-            if not isinstance(payload, dict):
-                raise UnknownProviderError(f"{self.provider_label} request failed:\nHTTP <unknown>\nModel: {model or '<model discovery>'}\nEndpoint: {endpoint}\nReason: response was not a JSON object")
-            return payload
+        headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
+        payload = self._request_json_api(url, body, headers, endpoint, model, timeout, method)
+        if not isinstance(payload, dict):
+            raise UnknownProviderError(f"{self.provider_label} request failed: response was not a JSON object")
+        return payload
+
+    def _json_call(self, system: str, user: str) -> dict[str, Any]:
+        # This is a wrapper for the Gemini-specific _call_api
+        return self._call_api(system, user)
 
     def _http_reason_and_retry(self, error: urllib.error.HTTPError) -> tuple[str, float | None]:
         try:
@@ -459,16 +471,6 @@ class GeminiProvider(AIProvider):
         if not content:
             raise ProviderError("Gemini response contained no text")
         return content
-
-    def _context(self, context: ProjectContext, stage: str = "planning") -> str:
-        return json.dumps(_bounded_context(context, getattr(self.config, f"{stage}_context_bytes", 30000), self.config.max_context_files, self.config.max_context_file_bytes), ensure_ascii=False, indent=2)
-
-    def _failure_payload(self, failure: FailureAnalysis | None, task: str, plan: Plan) -> dict[str, Any]:
-        if failure is None:
-            return {}
-        if failure.category == "PATCH_VALIDATION":
-            return {"task": task, "plan": _repair_plan(plan), "failure": _bounded_repair_failure(failure, self.config.repair_context_bytes)}
-        return {"task": task, "plan": _repair_plan(plan), "failure": asdict(failure)}
 
     def generate_plan(self, task: str, context: ProjectContext) -> Plan:
         data = self._json_call(

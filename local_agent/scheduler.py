@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import datetime
+import concurrent.futures
 import logging
 import time
+import threading
 from typing import cast
 
 from .config import AgentConfig
@@ -50,6 +52,9 @@ class Scheduler:
         self.credential_store = credential_store
         self.base_config = base_config # Base config from CLI/env
         self.registry = ProviderRegistry()
+        self._repo_lock = threading.Lock() # New for Phase 3.21: Protects file system mutations
+        self._memory_lock = threading.Lock() # New for Phase 3.22: Protects memory file mutations
+        self._worker_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.base_config.max_parallel_subtasks) # New for Phase 3.21
         self.state = self.storage.load_scheduler_state()
 
         provider_configs = self.storage.load_provider_configs()
@@ -65,6 +70,7 @@ class Scheduler:
             if not self.credential_store.has("dungx-ai-coding-agent", pc.provider_id):
                 self.state.provider_states[pc.provider_id].availability = ProviderAvailability.NOT_CONFIGURED
         self.storage.save_scheduler_state(self.state)
+        self._running_subtasks: set[str] = set() # New for Phase 3.21: Track subtasks currently in execution
         self.planner = None # To be initialized with a selected provider
 
     def run_once(self, progress=None) -> None:
@@ -357,6 +363,15 @@ class Scheduler:
         final_config_dict["provider"] = provider_config.provider_id
         return AgentConfig(**final_config_dict)
 
+    def _build_provider_instance(self, provider_id: str) -> AIProvider | None:
+        provider_configs = self.storage.load_provider_configs()
+        profile = next((p for p in provider_configs if p.provider_id == provider_id), None)
+        if not profile: return None
+        config = self._build_agent_config(profile)
+        api_key = self.credential_store.get("dungx-ai-coding-agent", config.provider)
+        if not api_key: return None
+        return build_provider(config, api_key)
+
     def _plan_task_with_provider(self, task: Task, config: AgentConfig) -> None:
         """Uses the Planner to create a subtask graph for a task."""
         api_key = self.credential_store.get("dungx-ai-coding-agent", config.provider) # Namespace is hardcoded for now
@@ -364,8 +379,8 @@ class Scheduler:
             raise ValueError(f"No API key for planning provider {config.provider}")
         
         provider = build_provider(config, api_key)
-        planner = Planner(provider)
-        context = Orchestrator(config, provider, self.storage).analyze() # Get repo context
+        planner = Planner(provider) # Planner is a specialist
+        context = Orchestrator(config, self.storage, self, self._repo_lock).analyze() # Get repo context
         
         task_plan = planner.create_task_plan(task.objective, context)
         task.plan = task_plan

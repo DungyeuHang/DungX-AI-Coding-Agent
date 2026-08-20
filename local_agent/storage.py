@@ -4,12 +4,13 @@ import datetime
 import json
 import os
 import shutil
+import threading
 import uuid
 from abc import ABC, abstractmethod # noqa: F401
 from pathlib import Path
 from typing import Any, TypeVar
 
-from .models import Checkpoint, ProviderConfig, SchedulerState, Subtask, Task
+from .models import Checkpoint, ProjectMemory, ProviderConfig, SchedulerState, Subtask, Task
 
 T = TypeVar("T", Task, Checkpoint)
 from .models import SemanticIndex # Added for Phase 3.15
@@ -72,6 +73,14 @@ class TaskStorage(ABC):
     def load_semantic_index(self) -> SemanticIndex:
         pass
 
+    @abstractmethod
+    def save_project_memory(self, memory: ProjectMemory) -> None:
+        pass
+
+    @abstractmethod
+    def load_project_memory(self) -> ProjectMemory:
+        pass
+
 class JsonFileStorage(TaskStorage):
     def __init__(self, base_dir: str | Path):
         self.base_dir = Path(base_dir)
@@ -95,6 +104,9 @@ class JsonFileStorage(TaskStorage):
 
     def _provider_configs_path(self) -> Path:
         return self.base_dir / "providers.json"
+
+    def _project_memory_path(self) -> Path:
+        return self.base_dir / "project_memory.json"
 
     def _atomic_write(self, path: Path, data: dict[str, Any]) -> None:
         temp_path = path.with_suffix(".json.tmp")
@@ -187,3 +199,21 @@ class JsonFileStorage(TaskStorage):
             # Log error but return empty index for robustness
             print(f"Warning: Failed to load semantic index due to malformed data: {e}. Returning empty index.")
             return SemanticIndex()
+
+    def save_project_memory(self, memory: ProjectMemory) -> None:
+        # The lock must be handled by the caller (Scheduler/Orchestrator)
+        # to ensure the read-modify-write cycle is atomic.
+        self._atomic_write(self._project_memory_path(), memory.to_dict())
+
+    def load_project_memory(self) -> ProjectMemory:
+        path = self._project_memory_path()
+        if not path.exists():
+            return ProjectMemory()
+        try:
+            # Reading is generally safe without a lock if writes are atomic,
+            # but the caller should still lock if performing a read-modify-write.
+            with path.open("r", encoding="utf-8") as f:
+                return ProjectMemory.from_dict(json.load(f))
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Warning: Failed to load project memory due to malformed data: {e}. Returning empty memory.")
+            return ProjectMemory()

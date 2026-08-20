@@ -37,6 +37,12 @@ class AgentConfig:
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     dry_run: bool = False
     approval: str = "never"
+    git_commit_on_completion: bool = False # New for Phase 3.24
+    git_default_remote: str = "origin" # New for Phase 3.24
+    git_protected_branches: list[str] = field(default_factory=lambda: ["main", "master", "develop"]) # New for Phase 3.24
+    git_pr_on_completion: bool = False # New for Phase 3.25
+    git_hosting_provider: str = "github" # New for Phase 3.25
+    max_parallel_subtasks: int = 1 # New for Phase 3.21
     autonomous_mode: bool = False # New for autonomous mode
     approval_policies: list[dict[str, Any]] = field(default_factory=list)
     max_context_files: int = 24
@@ -52,6 +58,7 @@ class AgentConfig:
     max_secondary_validations_per_iteration: int = 1 # Added for Phase 3.13
     max_diagnostic_output_bytes: int = 4000 # Added for Phase 3.13
     max_retry_wait_seconds: int = 60
+    memory_enabled: bool = True # New for Phase 3.22
     metrics_enabled: bool = False
 
     @classmethod
@@ -68,6 +75,12 @@ class AgentConfig:
             "deepseek_base_url": "DEEPSEEK_BASE_URL",
             "dry_run": "AGENT_DRY_RUN",
             "approval": "AGENT_APPROVAL",
+            "git_commit_on_completion": "AGENT_GIT_COMMIT_ON_COMPLETION",
+            "git_default_remote": "AGENT_GIT_DEFAULT_REMOTE",
+            "git_protected_branches": "AGENT_GIT_PROTECTED_BRANCHES",
+            "git_pr_on_completion": "AGENT_GIT_PR_ON_COMPLETION",
+            "git_hosting_provider": "AGENT_GIT_HOSTING_PROVIDER",
+            "max_parallel_subtasks": "AGENT_MAX_PARALLEL_SUBTASKS",
             "autonomous_mode": "AGENT_AUTONOMOUS",
             "approval_policies": "AGENT_APPROVAL_POLICIES",
             "max_context_files": "AGENT_MAX_CONTEXT_FILES",
@@ -83,6 +96,7 @@ class AgentConfig:
             "max_secondary_validations_per_iteration": "AGENT_MAX_SECONDARY_VALIDATIONS", # Added for Phase 3.13
             "max_diagnostic_output_bytes": "AGENT_MAX_DIAGNOSTIC_OUTPUT_BYTES", # Added for Phase 3.13
             "max_retry_wait_seconds": "AGENT_MAX_RETRY_WAIT_SECONDS",
+            "memory_enabled": "AGENT_MEMORY_ENABLED",
             "metrics_enabled": "AGENT_METRICS",
         }
 
@@ -131,6 +145,12 @@ class AgentConfig:
             deepseek_base_url=str(value("deepseek_base_url", "https://api.deepseek.com/v1")),
             dry_run=_bool(value("dry_run", False)),
             approval=str(value("approval", "never")).lower(),
+            git_commit_on_completion=_bool(value("git_commit_on_completion", False)),
+            git_default_remote=str(value("git_default_remote", "origin")),
+            git_protected_branches=[b.strip() for b in str(value("git_protected_branches", "main,master,develop")).split(',')],
+            git_pr_on_completion=_bool(value("git_pr_on_completion", False)),
+            git_hosting_provider=str(value("git_hosting_provider", "github")).lower(),
+            max_parallel_subtasks=_positive_int(value("max_parallel_subtasks", 1), "max_parallel_subtasks"),
             autonomous_mode=_bool(value("autonomous_mode", False)),
             approval_policies=approval_policies_val,
             max_context_files=_positive_int(value("max_context_files", 24), "max_context_files"),
@@ -147,6 +167,7 @@ class AgentConfig:
             max_secondary_validations_per_iteration=_positive_int(value("max_secondary_validations_per_iteration", 1), "max_secondary_validations_per_iteration", minimum=0), # Added for Phase 3.13
             max_diagnostic_output_bytes=_positive_int(value("max_diagnostic_output_bytes", 4000), "max_diagnostic_output_bytes"), # Added for Phase 3.13
             provider_max_retries=_positive_int(value("provider_max_retries", 1), "provider_max_retries", minimum=0),
+            memory_enabled=_bool(value("memory_enabled", True)),
             max_retry_wait_seconds=_positive_int(value("max_retry_wait_seconds", 60), "max_retry_wait_seconds"),
             metrics_enabled=_bool(value("metrics_enabled", False)),
         )
@@ -162,6 +183,8 @@ class AgentConfig:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
         if self.command_timeout_seconds < 1:
             raise ValueError("command_timeout_seconds must be positive")
+        if self.max_parallel_subtasks < 1:
+            raise ValueError("max_parallel_subtasks must be at least 1")
         for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
@@ -180,8 +203,12 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING"))
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
     parser.add_argument("--approval", choices=("never", "always", "policy"), default=None, help="control code change approval behavior")
+    parser.add_argument("--git-pr-on-completion", type=_bool, default=None, help="[Autonomous] create a pull request on successful push")
+    parser.add_argument("--git-commit-on-completion", type=_bool, default=None, help="[Autonomous] create a local commit on successful completion")
+    parser.add_argument("--max-parallel-subtasks", type=int, default=None, help="maximum number of subtasks to run in parallel")
     parser.add_argument("--autonomous", action="store_true", help="enable experimental autonomous execution mode")
     parser.add_argument("--approval-policy-file", default=None, help="path to a JSON file containing approval policies")
+    parser.add_argument("--memory", type=_bool, default=None, help="enable or disable project memory (true/false)")
     parser.add_argument("--approval-mode", choices=("never", "plan_review", "always"), default=None, help="control plan approval behavior") # Added for Phase 3.12
     if include_provider_args:
         parser.add_argument("--api-key", default=None, help="provider API key (defaults to environment variable)")
@@ -201,7 +228,11 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,
             "approval": args.approval,
+            "git_pr_on_completion": args.git_pr_on_completion,
+            "git_commit_on_completion": args.git_commit_on_completion,
+            "max_parallel_subtasks": args.max_parallel_subtasks,
             "autonomous_mode": args.autonomous if args.autonomous else None,
+            "memory_enabled": args.memory,
             "approval_mode": args.approval_mode, # Added for Phase 3.12
             "api_key": getattr(args, "api_key", None),
             "api_base_url": getattr(args, "api_base_url", None),

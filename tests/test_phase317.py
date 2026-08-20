@@ -75,7 +75,7 @@ class Phase317AnthropicProviderTests(unittest.TestCase):
         provider = AnthropicProvider(self.config)
         result = provider._json_call("system prompt", "user prompt")
 
-        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(result, {"status": "ok"}) # AnthropicProvider._json_call now calls _call_api
         mock_urlopen.assert_called_once()
         request = mock_urlopen.call_args[0][0]
         self.assertEqual(request.full_url, "https://api.anthropic.com/v1/messages")
@@ -102,4 +102,4 @@ class Phase317AnthropicProviderTests(unittest.TestCase):
                 mock_urlopen.side_effect = error_response
                 provider = AnthropicProvider(self.config)
                 with self.assertRaises(error_class):
-                    provider._json_call("system", "user")
+                    provider._call_api("system", "user") # AnthropicProvider._json_call now calls _call_api

@@ -43,8 +43,8 @@ class AutonomousTestProvider(AIProvider):
         }
 
     def generate_plan(self, task: str, context: ProjectContext) -> Plan:
-        s1 = Subtask(subtask_id="1", title="Modify app", goal="Modify app.py to print 'hello world'")
-        return TaskPlan(objective=task, subtasks=[s1])
+        s1 = Subtask(subtask_id="1", title="Modify app", goal="Modify app.py to print 'hello world'", created_at=datetime.datetime.now(datetime.timezone.utc))
+        return json.loads(json.dumps({"objective": task, "subtasks": [s1.to_dict()]}))
 
     def generate_code(self, task: str, plan: Plan, context: ProjectContext, failure: FailureAnalysis | None = None, review: ReviewResult | None = None) -> list[FileOperation]:
         if failure:  # This is a repair attempt
