@@ -8,11 +8,11 @@ from unittest import mock
 
 from local_agent.config import AgentConfig
 from local_agent.credentials import MockCredentialStore
-from local_agent.models import (
-    ProviderAvailability, ProviderCapability, ProviderConfig, QuotaExceededError, Subtask,
-    SubtaskStatus, Task, TaskPlan, TaskStatus,
-)
+from local_agent.models import (ProviderAvailability, ProviderCapability,
+                                ProviderConfig, Subtask, SubtaskStatus, Task,
+                                TaskPlan, TaskStatus)
 from local_agent.planner import GraphValidator
+from local_agent.providers import QuotaExceededError
 from local_agent.scheduler import Scheduler
 from local_agent.storage import JsonFileStorage
 

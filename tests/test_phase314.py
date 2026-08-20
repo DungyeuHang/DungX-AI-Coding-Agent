@@ -58,7 +58,7 @@ class Phase314Tests(unittest.TestCase):
         # Arrange
         s1 = Subtask(subtask_id="1", title="A", goal="A")
         plan = TaskPlan(objective="Test", subtasks=[s1])
-        task = self._create_task(plan=plan, status=TaskStatus.RUNNING)
+        task = self._create_task(plan=plan, status=TaskStatus.PENDING)
 
         new_subtask = Subtask(subtask_id="new_sub", title="New Prerequisite", goal="Do this first")
         proposal = PlanProposal(reason="Missing step", additions=[AddSubtask(subtask=new_subtask)])

@@ -74,8 +74,8 @@ class ValidationIntelligence:
 
         # Python projects
         if any(f.extension == ".py" for f in repo_map.files):
-            # unittest
-            if any("unittest" in f.path for f in repo_map.test_files):
+                                    # unittest
+            if any("unittest" in path for path in repo_map.tests):
                 discovered.append(ValidationCommand(
                     name="unittest",
                     command=("python", "-m", "unittest", "discover"),
@@ -85,8 +85,8 @@ class ValidationIntelligence:
                     working_directory=".",
                     risk="low",
                 ))
-            # pytest
-            if any("pytest" in f.path for f in repo_map.test_files) or (self.root / "pytest.ini").exists():
+                        # pytest
+            if any("pytest" in path for path in repo_map.tests) or (self.root / "pytest.ini").exists():
                 discovered.append(ValidationCommand(
                     name="pytest",
                     command=("pytest",),

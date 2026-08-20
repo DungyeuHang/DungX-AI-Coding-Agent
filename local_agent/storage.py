@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import shutil
@@ -12,6 +13,19 @@ from .models import Checkpoint, ProviderConfig, SchedulerState, Subtask, Task
 
 T = TypeVar("T", Task, Checkpoint)
 from .models import SemanticIndex # Added for Phase 3.15
+
+def _to_jsonable(obj: Any) -> Any:
+    """JSON default handler: serialize datetime/date as ISO 8601 strings.
+
+    This is a safety net so that any datetime that leaks through a model's
+    ``to_dict`` (e.g. nested inside ``asdict`` output) round-trips correctly
+    instead of raising ``TypeError: Object of type datetime is not JSON
+    serializable``.
+    """
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
 
 class TaskStorage(ABC):
     @abstractmethod
@@ -86,7 +100,7 @@ class JsonFileStorage(TaskStorage):
         temp_path = path.with_suffix(".json.tmp")
         try:
             with temp_path.open("w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+                                json.dump(data, f, indent=2, ensure_ascii=False, default=_to_jsonable)
             os.replace(temp_path, path)
         except Exception:
             if temp_path.exists():

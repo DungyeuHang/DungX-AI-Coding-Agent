@@ -29,6 +29,7 @@ from .storage import JsonFileStorage
 IGNORED_DIRECTORIES = {
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".cache", "dist", "build", "coverage", "target", ".tox",
+    ".agent_data", # Agent's own persistence dir; must not pollute the scanned tree
 }
 SECRET_NAMES = {".env", ".env.local", ".env.production", "credentials.json", "secrets.json", "id_rsa", "id_ed25519", "token.json"}
 LOGGER = logging.getLogger(__name__)

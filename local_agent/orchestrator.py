@@ -265,15 +265,16 @@ class Orchestrator:
                 emit("[7/7] Complete")
 
             # Status setting logic moved outside the loop to ensure it always runs
-            if report.completed:
-                task.status = TaskStatus.COMPLETED
-                current_subtask.status = SubtaskStatus.COMPLETED
-                current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
-            else:
-                if task.status != TaskStatus.PAUSED: # Only set FAILED if not already paused
-                    task.status = TaskStatus.FAILED
-                    current_subtask.status = SubtaskStatus.FAILED
+            if not report.plan_proposal:
+                if report.completed:
+                    task.status = TaskStatus.COMPLETED
+                    current_subtask.status = SubtaskStatus.COMPLETED
                     current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                else:
+                    if task.status != TaskStatus.PAUSED: # Only set FAILED if not already paused
+                        task.status = TaskStatus.FAILED
+                        current_subtask.status = SubtaskStatus.FAILED
+                        current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
 
         except Exception as e:
             LOGGER.exception("Unhandled exception during task execution: %s", e)

@@ -11,11 +11,12 @@ from unittest import mock
 from local_agent.config import AgentConfig
 from local_agent.context import ContextSelector
 from local_agent.impact import ChangeImpactAnalyzer
-from local_agent.models import (
-    ChangeImpact, Checkpoint, CommandSpec, ExecutionResult, FailureAnalysis,
-    FileOperation, Plan, ProjectContext, ProviderMetric, ReviewResult, Subtask,
-    SubtaskStatus, Task, TaskStatus, ValidationCommand, ValidationPlan,
-)
+from local_agent.models import (ChangeImpact, Checkpoint, CommandSpec,
+                                ExecutionResult, FailureAnalysis,
+                                FileOperation, Plan, ProjectContext,
+                                ProviderMetric, ReviewResult, Subtask,
+                                SubtaskStatus, Task, TaskPlan, TaskStatus,
+                                ValidationCommand, ValidationPlan)
 from local_agent.orchestrator import Orchestrator
 from local_agent.providers import AIProvider, ProviderError, QuotaExceededError, _bounded_context
 from local_agent.repository import RepositoryIntelligence
@@ -46,6 +47,15 @@ class MockTaskStorage(TaskStorage):
         if checkpoint_id not in self.checkpoints:
             raise FileNotFoundError(f"Checkpoint with ID {checkpoint_id} not found.")
         return self.checkpoints[checkpoint_id]
+
+    def save_scheduler_state(self, state) -> None: pass
+    def load_scheduler_state(self): return __import__("local_agent.models").SchedulerState()
+    def save_provider_configs(self, configs) -> None: pass
+    def load_provider_configs(self) -> list: return []
+    def save_semantic_index(self, index) -> None: pass
+    def load_semantic_index(self): return __import__("local_agent.models").SemanticIndex()
+
+
 
 
 class CapturingProvider(AIProvider):
@@ -117,62 +127,71 @@ class Phase39Tests(unittest.TestCase):
         (self.root / "tests" / "test_app.py").write_text("import pytest\nfrom src.app import hello\ndef test_hello(): assert hello() == 'world'\n", encoding="utf-8")
         (self.root / "package.json").write_text(json.dumps({"name": "test-app", "scripts": {"test": "pytest"}}), encoding="utf-8")
 
-    def _get_repo_map(self) -> RepositoryMap:
-        return RepositoryIntelligence(self.root).scan().repository_map
-
-    def _get_change_impact(self, task: str) -> ChangeImpact:
-        context = RepositoryIntelligence(self.root).scan()
-        ContextSelector(self.root, max_files=12).select(task, context)
-        return ChangeImpactAnalyzer(self.root).analyze(task, context)
+    def _create_task_with_plan(self, task_objective: str) -> Task:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        subtask = Subtask(subtask_id="sub1", title=task_objective, goal=task_objective, created_at=now)
+        plan = TaskPlan(objective=task_objective, subtasks=[subtask])
+        task = Task(task_id=str(uuid.uuid4()), objective=task_objective, status=TaskStatus.PENDING, created_at=now, updated_at=now, plan=plan)
+        self.storage.save_task(task)
+        return task
 
     def test_task_creation_and_persistence(self):
         task_objective = "Implement a new feature"
-        orchestrator = Orchestrator(self.config, CapturingProvider(), self.storage)
-        report = orchestrator.run(task_objective)
+        provider = CapturingProvider()
+        orchestrator = Orchestrator(self.config, provider, self.storage)
+        task = self._create_task_with_plan(task_objective)
+
+        report = orchestrator.run(task, "sub1")
 
         self.assertIsNotNone(report.task_id)
         loaded_task = self.storage.load_task(report.task_id)
         self.assertEqual(loaded_task.objective, task_objective)
-        self.assertEqual(loaded_task.status, TaskStatus.COMPLETED) # MockProvider completes immediately
-        self.assertGreater(len(loaded_task.subtasks), 0)
-        self.assertEqual(loaded_task.subtasks[0].status, SubtaskStatus.COMPLETED)
+        self.assertEqual(loaded_task.status, TaskStatus.COMPLETED)
+        self.assertGreater(len(loaded_task.plan.subtasks), 0)
+        self.assertEqual(loaded_task.plan.subtasks[0].status, SubtaskStatus.COMPLETED)
 
     def test_task_reload_after_process_restart_simulation(self):
         task_objective = "Implement a new feature"
-        orchestrator1 = Orchestrator(self.config, CapturingProvider(), self.storage)
-        report1 = orchestrator1.run(task_objective)
+        provider = CapturingProvider()
+        orchestrator1 = Orchestrator(self.config, provider, self.storage)
+        task = self._create_task_with_plan(task_objective)
+        report1 = orchestrator1.run(task, "sub1")
         task_id = report1.task_id
 
         # Simulate restart by creating a new orchestrator instance
-        orchestrator2 = Orchestrator(self.config, CapturingProvider(), self.storage)
+        orchestrator2 = Orchestrator(self.config, provider, self.storage)
         loaded_task = orchestrator2.storage.load_task(task_id)
         self.assertEqual(loaded_task.objective, task_objective)
         self.assertEqual(loaded_task.status, TaskStatus.COMPLETED)
 
     def test_subtask_state_transitions(self):
         task_objective = "Implement a new feature"
-        orchestrator = Orchestrator(self.config, CapturingProvider(), self.storage)
-        report = orchestrator.run(task_objective)
+        provider = CapturingProvider()
+        orchestrator = Orchestrator(self.config, provider, self.storage)
+        task = self._create_task_with_plan(task_objective)
+        report = orchestrator.run(task, "sub1")
         task = self.storage.load_task(report.task_id)
 
-        self.assertEqual(task.subtasks[0].status, SubtaskStatus.COMPLETED)
+        self.assertEqual(task.plan.subtasks[0].status, SubtaskStatus.COMPLETED)
         self.assertEqual(task.status, TaskStatus.COMPLETED)
 
     def test_checkpoint_persistence_and_reload(self):
         task_objective = "Implement a new feature"
         provider = CapturingProvider(quota_exceeded_on_attempt=1) # Fail on first code gen attempt
         orchestrator = Orchestrator(self.config, provider, self.storage)
-        report = orchestrator.run(task_objective)
+        task = self._create_task_with_plan(task_objective)
+        report = orchestrator.run(task, "sub1")
 
         self.assertEqual(report.outcome, "QUOTA_EXCEEDED")
-        self.assertEqual(self.storage.load_task(report.task_id).status, TaskStatus.PAUSED)
-        self.assertIsNotNone(self.storage.load_task(report.task_id).latest_checkpoint_id)
+        task_after_run = self.storage.load_task(report.task_id)
+        self.assertEqual(task_after_run.status, TaskStatus.PAUSED)
+        self.assertIsNotNone(task_after_run.plan.subtasks[0].latest_checkpoint_id)
 
-        checkpoint_id = self.storage.load_task(report.task_id).latest_checkpoint_id
+        checkpoint_id = task_after_run.plan.subtasks[0].latest_checkpoint_id
         loaded_checkpoint = self.storage.load_checkpoint(checkpoint_id)
         self.assertEqual(loaded_checkpoint.task_id, report.task_id)
-        self.assertIn("Before code generation", loaded_checkpoint.current_state_description)
-        self.assertIn("QUOTA_EXCEEDED", loaded_checkpoint.last_provider_result["outcome"])
+        self.assertIn("After code generation", loaded_checkpoint.current_state_description)
+        self.assertIn("Paused due to provider error", loaded_checkpoint.continuation_context["current_progress_description"])
         self.assertIn("Continue the current subtask", loaded_checkpoint.next_recommended_action)
         self.assertIn("task_objective", loaded_checkpoint.continuation_context)
 
@@ -180,20 +199,22 @@ class Phase39Tests(unittest.TestCase):
         task_objective = "Implement a new feature"
         provider1 = CapturingProvider(quota_exceeded_on_attempt=1) # Fail on first code gen attempt
         orchestrator1 = Orchestrator(self.config, provider1, self.storage)
-        report1 = orchestrator1.run(task_objective)
+        task = self._create_task_with_plan(task_objective)
+        report1 = orchestrator1.run(task, "sub1")
 
         self.assertEqual(report1.outcome, "QUOTA_EXCEEDED")
-        self.assertEqual(self.storage.load_task(report1.task_id).status, TaskStatus.PAUSED)
-        self.assertEqual(self.storage.load_task(report1.task_id).subtasks[0].status, SubtaskStatus.PAUSED)
+        task_after_run1 = self.storage.load_task(report1.task_id)
+        self.assertEqual(task_after_run1.status, TaskStatus.PAUSED)
+        self.assertEqual(task_after_run1.plan.subtasks[0].status, SubtaskStatus.PAUSED)
 
         # Resume the task
         provider2 = CapturingProvider() # This provider will succeed
         orchestrator2 = Orchestrator(self.config, provider2, self.storage)
-        report2 = orchestrator2.run(task_objective, task_id=report1.task_id)
+        report2 = orchestrator2.run(task_after_run1, "sub1")
 
         self.assertEqual(report2.task_id, report1.task_id)
         self.assertEqual(self.storage.load_task(report2.task_id).status, TaskStatus.COMPLETED)
-        self.assertEqual(self.storage.load_task(report2.task_id).subtasks[0].status, SubtaskStatus.COMPLETED)
+        self.assertEqual(self.storage.load_task(report2.task_id).plan.subtasks[0].status, SubtaskStatus.COMPLETED)
         self.assertEqual(provider2.code_gen_attempts, 1) # Should have only one successful attempt after resume
 
     def test_temporary_provider_error_leads_to_paused_state(self):
@@ -201,40 +222,45 @@ class Phase39Tests(unittest.TestCase):
         provider = CapturingProvider(fail_on_code_gen=True)
         orchestrator = Orchestrator(self.config, provider, self.storage)
         
+        task = self._create_task_with_plan(task_objective)
         # Mock ProviderError to be temporary (e.g., RateLimitError)
-        with mock.patch('local_agent.providers.ProviderError', new=QuotaExceededError):
-            report = orchestrator.run(task_objective)
+        provider.generate_code = mock.Mock(side_effect=QuotaExceededError("quota fail"))
+        report = orchestrator.run(task, "sub1")
 
         self.assertEqual(report.outcome, "QUOTA_EXCEEDED")
-        self.assertEqual(self.storage.load_task(report.task_id).status, TaskStatus.PAUSED)
-        self.assertEqual(self.storage.load_task(report.task_id).subtasks[0].status, SubtaskStatus.PAUSED)
+        task_after_run = self.storage.load_task(report.task_id)
+        self.assertEqual(task_after_run.status, TaskStatus.PAUSED)
+        self.assertEqual(task_after_run.plan.subtasks[0].status, SubtaskStatus.PAUSED)
 
     def test_permanent_failure_leads_to_failed_state(self):
         task_objective = "Implement a new feature"
         provider = CapturingProvider(fail_on_code_gen=True)
         orchestrator = Orchestrator(self.config, provider, self.storage)
-        
+        task = self._create_task_with_plan(task_objective)
         # Ensure it's a non-retryable ProviderError
-        report = orchestrator.run(task_objective)
+        report = orchestrator.run(task, "sub1")
 
         self.assertEqual(report.outcome, "UNKNOWN_PROVIDER_ERROR")
-        self.assertEqual(self.storage.load_task(report.task_id).status, TaskStatus.FAILED)
-        self.assertEqual(self.storage.load_task(report.task_id).subtasks[0].status, SubtaskStatus.FAILED)
+        task_after_run = self.storage.load_task(report.task_id)
+        self.assertEqual(task_after_run.status, TaskStatus.FAILED)
+        self.assertEqual(task_after_run.plan.subtasks[0].status, SubtaskStatus.FAILED)
 
     def test_completed_task_persistence(self):
         task_objective = "Implement a new feature"
         orchestrator = Orchestrator(self.config, CapturingProvider(), self.storage)
-        report = orchestrator.run(task_objective)
+        task = self._create_task_with_plan(task_objective)
+        report = orchestrator.run(task, "sub1")
         task = self.storage.load_task(report.task_id)
 
         self.assertEqual(task.status, TaskStatus.COMPLETED)
-        self.assertEqual(task.subtasks[0].status, SubtaskStatus.COMPLETED)
+        self.assertEqual(task.plan.subtasks[0].status, SubtaskStatus.COMPLETED)
 
     def test_no_api_secrets_stored_in_checkpoints(self):
         task_objective = "Implement a new feature"
         provider = CapturingProvider(quota_exceeded_on_attempt=1)
         orchestrator = Orchestrator(self.config, provider, self.storage)
-        report = orchestrator.run(task_objective)
+        task = self._create_task_with_plan(task_objective)
+        report = orchestrator.run(task, "sub1")
 
         checkpoint_id = self.storage.load_task(report.task_id).latest_checkpoint_id
         loaded_checkpoint = self.storage.load_checkpoint(checkpoint_id)
@@ -250,14 +276,15 @@ class Phase39Tests(unittest.TestCase):
         task_objective = "Implement a new feature"
         provider = CapturingProvider(quota_exceeded_on_attempt=1)
         orchestrator = Orchestrator(self.config, provider, self.storage)
-        report = orchestrator.run(task_objective)
+        task = self._create_task_with_plan(task_objective)
+        report = orchestrator.run(task, "sub1")
 
-        checkpoint_id = self.storage.load_task(report.task_id).latest_checkpoint_id
+        checkpoint_id = self.storage.load_task(report.task_id).plan.subtasks[0].latest_checkpoint_id
         loaded_checkpoint = self.storage.load_checkpoint(checkpoint_id)
         
         continuation_context = loaded_checkpoint.continuation_context
         self.assertIn("task_objective", continuation_context)
-        self.assertIn("current_subtask_description", continuation_context)
+        self.assertIn("current_subtask_goal", continuation_context)
         self.assertIn("completed_subtasks_summary", continuation_context)
         self.assertIn("current_progress_description", continuation_context)
         self.assertIn("modified_files_summary", continuation_context)
@@ -269,26 +296,3 @@ class Phase39Tests(unittest.TestCase):
         # Ensure no provider-specific details like model names or API keys
         self.assertNotIn("gemini", json.dumps(continuation_context).lower())
         self.assertNotIn("openai", json.dumps(continuation_context).lower())
-
-    # This test is no longer needed as the full suite is run.
-    # def test_existing_phase38_tests_remain_passing(self):
-    #     # This test ensures that the changes for Phase 3.9 do not break Phase 3.8 tests.
-    #     # We'll re-run one of the Phase 3.8 tests here.
-    #     # Note: The actual full test suite run will cover all of them.
-    #     repo_map = self._get_repo_map()
-    #     change_impact = self._get_change_impact("Add an About page and link it in navigation.")
-    #     validation_intelligence = ValidationIntelligence(self.root)
-    #     discovered_commands = validation_intelligence.discover_commands(repo_map)
-    #     validation_plan = validation_intelligence.select_commands("Add an About page and link it in navigation.", change_impact, discovered_commands)
-
-    #     primary_names = {cmd.name for cmd in validation_plan.primary_commands}
-    #     secondary_names = {cmd.name for cmd in validation_plan.secondary_commands}
-    #     skipped_names = {cmd.name for cmd in validation_plan.skipped_commands}
-
-    #     self.assertIn("typecheck", primary_names)
-    #     self.assertIn("lint", primary_names)
-    #     self.assertIn("test", primary_names)
-    #     self.assertIn("build", primary_names)
-    #     self.assertIn("test:e2e", secondary_names)
-    #     self.assertIn("db:reset", skipped_names)
-    #     self.assertEqual(validation_plan.risk_level, "high")

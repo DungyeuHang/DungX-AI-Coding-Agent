@@ -156,9 +156,9 @@ class AgentConfig:
             raise ValueError("dependency_depth cannot be negative")
 
 
-def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args: bool = False) -> None:
     parser.add_argument("--project", default=".", help="local project directory")
-    parser.add_argument("--provider", choices=("mock", "openai", "gemini", "antigravity"), default=None)
+    parser.add_argument("--provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek"), default=None)
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-iterations", type=int, default=None)
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
@@ -166,6 +166,11 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
     parser.add_argument("--approval", choices=("never", "always"), default=None, help="pause for approval before applying changes")
     parser.add_argument("--approval-mode", choices=("never", "plan_review", "always"), default=None, help="control plan approval behavior") # Added for Phase 3.12
+    if include_provider_args:
+        parser.add_argument("--api-key", default=None, help="provider API key (defaults to environment variable)")
+        parser.add_argument("--api-base-url", default=None, help="override the provider API base URL")
+        parser.add_argument("--gemini-base-url", default=None, help="override the Gemini API base URL")
+        parser.add_argument("--deepseek-base-url", default=None, help="override the DeepSeek API base URL")
 
 
 def config_from_args(args: argparse.Namespace) -> AgentConfig:
@@ -179,6 +184,10 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "dry_run": args.dry_run if args.dry_run else None,
             "approval": args.approval,
             "approval_mode": args.approval_mode, # Added for Phase 3.12
+            "api_key": getattr(args, "api_key", None),
+            "api_base_url": getattr(args, "api_base_url", None),
+            "gemini_base_url": getattr(args, "gemini_base_url", None),
+            "deepseek_base_url": getattr(args, "deepseek_base_url", None),
         }.items() if value is not None
     }
     config = AgentConfig.from_environment(args.project, **overrides)

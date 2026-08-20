@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import datetime
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from local_agent.config import AgentConfig
-from local_agent.models import (
-    ProviderAvailability, ProviderCapability, ProviderConfig, ProviderError, ProviderRuntimeState,
-    QuotaExceededError, RateLimitError, SchedulerState, Subtask, SubtaskStatus,
-    Task, TaskStatus,
-)
+from local_agent.credentials import MockCredentialStore
+from local_agent.models import (ProviderAvailability, ProviderCapability,
+                                ProviderConfig, ProviderError,
+                                QuotaExceededError, Task, TaskStatus)
 from local_agent.providers import AIProvider, build_provider
 from local_agent.scheduler import Scheduler
 from local_agent.storage import JsonFileStorage
@@ -68,10 +68,9 @@ class Phase310Tests(unittest.TestCase):
         self.config_a = AgentConfig.from_environment(self.root, provider="provider_a")
         self.config_b = AgentConfig.from_environment(self.root, provider="provider_b")
         self.provider_map = {"provider_a": MockProviderA, "provider_b": MockProviderB}
-        self.mock_credential_store = mock.MagicMock() # This will be used in 3.10.1
+        self.mock_credential_store = MockCredentialStore()
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.root)
 
     def _create_task(self, status=TaskStatus.PENDING, next_retry_at=None) -> Task:
@@ -91,14 +90,16 @@ class Phase310Tests(unittest.TestCase):
     @mock.patch("local_agent.scheduler.Orchestrator")
     def test_provider_selection_and_priority(self, mock_orchestrator, mock_build_provider):
         self._create_task()
-        # In 3.10, provider configs were passed directly. In 3.10.1 this moves to storage.
-        # We adapt the test to the 3.10 style.
-        provider_configs_tuples = [
-            (self.config_a, 20),
-            (self.config_b, 10),
+        provider_configs = [
+            ProviderConfig(provider_id="provider_a", priority=20, enabled=True),
+            ProviderConfig(provider_id="provider_b", priority=10, enabled=True),
         ]
+        self.storage.save_provider_configs(provider_configs)
+        self.mock_credential_store.save("dungx-ai-coding-agent", "provider_a", "key-a")
+        self.mock_credential_store.save("dungx-ai-coding-agent", "provider_b", "key-b")
+
         # Provider B has higher priority (lower number)
-        scheduler = Scheduler(provider_configs_tuples, self.storage)
+        scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
         
         def build_side_effect(config):
             return self.provider_map[config.provider](config)
@@ -113,12 +114,16 @@ class Phase310Tests(unittest.TestCase):
     @mock.patch("local_agent.scheduler.Orchestrator")
     def test_unavailable_provider_is_skipped(self, mock_orchestrator, mock_build_provider):
         self._create_task()
-        provider_configs_tuples = [
-            (self.config_a, 20),
-            (self.config_b, 10),
+        provider_configs = [
+            ProviderConfig(provider_id="provider_a", priority=20, enabled=True),
+            ProviderConfig(provider_id="provider_b", priority=10, enabled=True),
         ]
-        scheduler = Scheduler(provider_configs_tuples, self.storage)
+        self.storage.save_provider_configs(provider_configs)
+        self.mock_credential_store.save("dungx-ai-coding-agent", "provider_a", "key-a")
+        self.mock_credential_store.save("dungx-ai-coding-agent", "provider_b", "key-b")
+        scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
         scheduler.state.provider_states["provider_b"].availability = ProviderAvailability.UNAVAILABLE
+        self.storage.save_scheduler_state(scheduler.state)
 
         def build_side_effect(config):
             return self.provider_map[config.provider](config)
@@ -133,11 +138,15 @@ class Phase310Tests(unittest.TestCase):
     @mock.patch("local_agent.scheduler.Orchestrator")
     def test_fallback_on_quota_exhaustion(self, mock_orchestrator, mock_build_provider):
         task = self._create_task()
-        provider_configs_tuples = [
-            (self.config_a, 10),
-            (self.config_b, 20),
+        provider_configs = [
+            ProviderConfig(provider_id="provider_a", priority=10, enabled=True),
+            ProviderConfig(provider_id="provider_b", priority=20, enabled=True),
         ]
-        scheduler = Scheduler(provider_configs_tuples, self.storage)
+        self.storage.save_provider_configs(provider_configs)
+        self.mock_credential_store.save("dungx-ai-coding-agent", "provider_a", "key-a")
+        self.mock_credential_store.save("dungx-ai-coding-agent", "provider_b", "key-b")
+
+        scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
 
         # First run: Provider A fails with QuotaExceededError
         provider_a_instance = MockProviderA(self.config_a)
@@ -197,8 +206,12 @@ class Phase310Tests(unittest.TestCase):
 
     def test_all_providers_unavailable_pauses_task(self):
         task = self._create_task()
-        provider_configs_tuples = [(self.config_a, 10)]
-        scheduler = Scheduler(provider_configs_tuples, self.storage)
+        provider_configs = [ProviderConfig(provider_id="provider_a", priority=10, enabled=True)]
+        self.storage.save_provider_configs(provider_configs)
+        self.mock_credential_store.save("dungx-ai-coding-agent", "provider_a", "key-a")
+        with mock.patch("local_agent.scheduler.build_provider") as mock_build_provider:
+            mock_build_provider.return_value.capabilities = {ProviderCapability.PLANNING}
+            scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
         scheduler.state.provider_states["provider_a"].availability = ProviderAvailability.COOLDOWN
         scheduler.state.provider_states["provider_a"].cooldown_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5)
 
@@ -209,23 +222,35 @@ class Phase310Tests(unittest.TestCase):
         self.assertIsNotNone(paused_task.next_retry_at)
         self.assertGreater(paused_task.next_retry_at, datetime.datetime.now(datetime.timezone.utc))
 
+    @mock.patch("local_agent.scheduler.build_provider")
     def test_scheduler_persistence(self):
         real_storage = JsonFileStorage(self.root / ".agent_data")
-        provider_configs_tuples = [(self.config_a, 10)]
-        scheduler1 = Scheduler(provider_configs_tuples, real_storage)
+        provider_configs = [ProviderConfig(provider_id="provider_a", priority=10, enabled=True)]
+        real_storage.save_provider_configs(provider_configs)
+        mock_credential_store = MockCredentialStore()
+        mock_credential_store.save("dungx-ai-coding-agent", "provider_a", "key-a")
+
+        def build_side_effect(config, api_key=None):
+            return self.provider_map[config.provider](config)
+        mock.patch("local_agent.scheduler.build_provider", side_effect=build_side_effect)
+
+        scheduler1 = Scheduler(self.base_config, real_storage, mock_credential_store)
         scheduler1.state.provider_states["provider_a"].availability = ProviderAvailability.COOLDOWN
         cooldown_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=10)
         scheduler1.state.provider_states["provider_a"].cooldown_until = cooldown_time
         real_storage.save_scheduler_state(scheduler1.state)
 
         # Simulate restart
-        scheduler2 = Scheduler(provider_configs_tuples, real_storage)
+        scheduler2 = Scheduler(self.base_config, real_storage, mock_credential_store)
         provider_a_state = scheduler2.state.provider_states["provider_a"]
         self.assertEqual(provider_a_state.availability, ProviderAvailability.COOLDOWN)
         self.assertAlmostEqual(provider_a_state.cooldown_until, cooldown_time, delta=datetime.timedelta(seconds=1))
 
     def test_respects_retry_after(self):
-        scheduler = Scheduler([], self.storage) # No providers needed for this direct call
+        provider_configs = [ProviderConfig(provider_id="provider_a", priority=10, enabled=True)]
+        self.storage.save_provider_configs(provider_configs)
+        self.mock_credential_store.save("dungx-ai-coding-agent", "provider_a", "key-a")
+        scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
         now = datetime.datetime.now(datetime.timezone.utc)
         
         with mock.patch('datetime.datetime') as mock_dt:
@@ -241,7 +266,7 @@ class Phase310Tests(unittest.TestCase):
         task.assigned_to = "some_other_worker"
         self.storage.save_task(task)
 
-        scheduler = Scheduler([], self.storage)
+        scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
         
         # The scheduler should find no runnable tasks because the only one is assigned
         runnable = scheduler._find_runnable_task(self.storage.list_tasks())
@@ -249,6 +274,6 @@ class Phase310Tests(unittest.TestCase):
 
     def test_completed_task_is_not_executed(self):
         self._create_task(status=TaskStatus.COMPLETED)
-        scheduler = Scheduler([], self.storage)
+        scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
         runnable = scheduler._find_runnable_task(self.storage.list_tasks())
         self.assertIsNone(runnable)

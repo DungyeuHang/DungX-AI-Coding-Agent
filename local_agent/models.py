@@ -516,6 +516,8 @@ class Task:
     retry_info: dict[str, Any] = field(default_factory=dict)
     provider_execution_history: list[ProviderMetric] = field(default_factory=list)
     outcome: str = ""
+    next_retry_at: datetime.datetime | None = None # Added for Phase 3.10
+    assigned_to: str | None = None # Added for Phase 3.10
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -528,9 +530,6 @@ class Task:
             data["plan_proposal"] = self.plan_proposal.to_dict()
         data["provider_execution_history"] = [metric.to_dict() for metric in self.provider_execution_history] # Hardened
         return data
-
-    next_retry_at: datetime.datetime | None = None # Added for Phase 3.10
-    assigned_to: str | None = None # Added for Phase 3.10
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -545,6 +544,10 @@ class Task:
         if data.get("next_retry_at"):
             data["next_retry_at"] = datetime.datetime.fromisoformat(data["next_retry_at"])
         return cls(**data)
+
+    @property
+    def subtasks(self) -> list[Subtask]:
+        return self.plan.subtasks if self.plan else []
 
 @dataclass
 class ProviderRuntimeState:

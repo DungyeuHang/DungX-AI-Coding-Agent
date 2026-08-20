@@ -1,0 +1,289 @@
+﻿python : test_planning_fallback_to_secondary_provider (tests.test_phase316.Phase316_SchedulerPlanningFallbackTest.test_planning_fallback_to_secondary_provider)
+At line:1 char:37
++ ... ding-Agent; python -m unittest tests.test_phase316 tests.test_phase31 ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (test_planning_f...ndary_provider):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Tests that if the primary planning provider fails, the scheduler ... Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: Language library not found at 
+D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to 
+compile the tree-sitter grammars.
+ok
+test_approve_proposal_applies_changes_and_sets_pending (tests.test_phase314.Phase314Tests.test_approve_proposal_applies_changes_and_sets_pending) ... ERROR
+test_backward_compatibility_with_pre_314_tasks (tests.test_phase314.Phase314Tests.test_backward_compatibility_with_pre_314_tasks) ... ok
+test_plan_proposed_task_is_not_executed (tests.test_phase314.Phase314Tests.test_plan_proposed_task_is_not_executed) ... ok
+test_proposal_survives_restart (tests.test_phase314.Phase314Tests.test_proposal_survives_restart) ... ok
+test_proposal_with_add_subtask_survives_roundtrip (tests.test_phase314.Phase314Tests.test_proposal_with_add_subtask_survives_roundtrip) ... ERROR
+test_reject_proposal_clears_proposal_and_sets_paused (tests.test_phase314.Phase314Tests.test_reject_proposal_clears_proposal_and_sets_paused) ... ERROR
+test_scheduler_accepts_valid_proposal_and_sets_plan_proposed (tests.test_phase314.Phase314Tests.test_scheduler_accepts_valid_proposal_and_sets_plan_proposed) ... FAIL
+test_js_command_discovery (tests.test_phase38.Phase38Tests.test_js_command_discovery) ... Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: Language library not 
+found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+ERROR
+test_orchestrator_executes_primary_validation_commands (tests.test_phase38.Phase38Tests.test_orchestrator_executes_primary_validation_commands) ... ERROR
+test_orchestrator_passes_validation_plan_to_provider_and_report (tests.test_phase38.Phase38Tests.test_orchestrator_passes_validation_plan_to_provider_and_report) ... ERROR
+test_orchestrator_stops_on_validation_failure (tests.test_phase38.Phase38Tests.test_orchestrator_stops_on_validation_failure) ... ERROR
+test_python_command_discovery (tests.test_phase38.Phase38Tests.test_python_command_discovery) ... Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: Language library 
+not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+ERROR
+test_task_aware_validation_selection_add_page (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_add_page) ... Tree-sitter parser for Python not available. Semantic indexing will be 
+disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to 
+compile the tree-sitter grammars.
+ERROR
+test_task_aware_validation_selection_fix_auth (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_fix_auth) ... Tree-sitter parser for Python not available. Semantic indexing will be 
+disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to 
+compile the tree-sitter grammars.
+ERROR
+test_task_aware_validation_selection_refactor_component (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_refactor_component) ... Tree-sitter parser for Python not available. 
+Semantic indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to 
+compile the tree-sitter grammars.
+ERROR
+test_validation_plan_serialization (tests.test_phase38.Phase38Tests.test_validation_plan_serialization) ... Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: 
+Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to 
+compile the tree-sitter grammars.
+ERROR
+test_context_budget_limits_bytes_and_estimated_tokens (tests.test_phase35.Phase35Tests.test_context_budget_limits_bytes_and_estimated_tokens) ... Tree-sitter parser for Python not available. Semantic 
+indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+ok
+test_context_cli_does_not_call_provider (tests.test_phase35.Phase35Tests.test_context_cli_does_not_call_provider) ... ERROR
+test_context_limits_are_configurable (tests.test_phase35.Phase35Tests.test_context_limits_are_configurable) ... ok
+test_relevance_ranking_expands_dependencies_and_respects_depth (tests.test_phase35.Phase35Tests.test_relevance_ranking_expands_dependencies_and_respects_depth) ... Tree-sitter parser for Python not 
+available. Semantic indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to 
+compile the tree-sitter grammars.
+ok
+test_scan_builds_deterministic_map_and_protects_ignored_files (tests.test_phase35.Phase35Tests.test_scan_builds_deterministic_map_and_protects_ignored_files) ... Tree-sitter parser for Python not 
+available. Semantic indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+Tree-sitter parser for Python not available. Semantic indexing will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to 
+compile the tree-sitter grammars.
+FAIL
+test_secret_values_do_not_enter_provider_context (tests.test_phase35.Phase35Tests.test_secret_values_do_not_enter_provider_context) ... Tree-sitter parser for Python not available. Semantic indexing 
+will be disabled. Error: Language library not found at D:\GitHub\DungX-AI-Coding-Agent\build\languages.so. Please run the build script to compile the tree-sitter grammars.
+ok
+test_phase312 (unittest.loader._FailedTest.test_phase312) ... ERROR
+test_phase311 (unittest.loader._FailedTest.test_phase311) ... ERROR
+
+======================================================================
+ERROR: test_approve_proposal_applies_changes_and_sets_pending (tests.test_phase314.Phase314Tests.test_approve_proposal_applies_changes_and_sets_pending)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase314.py", line 104, in test_approve_proposal_applies_changes_and_sets_pending
+    main(["approve-proposal", "--project", str(self.root), task.task_id])
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 165, in main
+    args = build_parser().parse_args(argv)
+           ^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 22, in build_parser
+    add_common_arguments(run, include_provider_args=True)
+TypeError: add_common_arguments() got an unexpected keyword argument 'include_provider_args'
+
+======================================================================
+ERROR: test_proposal_with_add_subtask_survives_roundtrip (tests.test_phase314.Phase314Tests.test_proposal_with_add_subtask_survives_roundtrip)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase314.py", line 181, in test_proposal_with_add_subtask_survives_roundtrip
+    self.storage.save_task(task)
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\storage.py", line 97, in save_task
+    self._atomic_write(self._task_path(task.task_id), task.to_dict())
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\storage.py", line 89, in _atomic_write
+    json.dump(data, f, indent=2, ensure_ascii=False)
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\__init__.py", line 179, in dump
+    for chunk in iterable:
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 432, in _iterencode
+    yield from _iterencode_dict(o, _current_indent_level)
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 326, in _iterencode_list
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 439, in _iterencode
+    o = _default(o)
+        ^^^^^^^^^^^
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\json\encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type datetime is not JSON serializable
+
+======================================================================
+ERROR: test_reject_proposal_clears_proposal_and_sets_paused (tests.test_phase314.Phase314Tests.test_reject_proposal_clears_proposal_and_sets_paused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase314.py", line 126, in test_reject_proposal_clears_proposal_and_sets_paused
+    main(["reject-proposal", "--project", str(self.root), task.task_id])
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 165, in main
+    args = build_parser().parse_args(argv)
+           ^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 22, in build_parser
+    add_common_arguments(run, include_provider_args=True)
+TypeError: add_common_arguments() got an unexpected keyword argument 'include_provider_args'
+
+======================================================================
+ERROR: test_js_command_discovery (tests.test_phase38.Phase38Tests.test_js_command_discovery)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 99, in test_js_command_discovery
+    commands = validation_intelligence.discover_commands(repo_map)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_orchestrator_executes_primary_validation_commands (tests.test_phase38.Phase38Tests.test_orchestrator_executes_primary_validation_commands)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 252, in test_orchestrator_executes_primary_validation_commands
+    report = Orchestrator(config, provider).run("Test task.")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: test_orchestrator_passes_validation_plan_to_provider_and_report (tests.test_phase38.Phase38Tests.test_orchestrator_passes_validation_plan_to_provider_and_report)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 201, in test_orchestrator_passes_validation_plan_to_provider_and_report
+    report = Orchestrator(config, provider).run("Add an About page and link it in navigation.")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: test_orchestrator_stops_on_validation_failure (tests.test_phase38.Phase38Tests.test_orchestrator_stops_on_validation_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 283, in test_orchestrator_stops_on_validation_failure
+    report = Orchestrator(config, provider).run("Test task.")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Orchestrator.__init__() missing 1 required positional argument: 'storage'
+
+======================================================================
+ERROR: test_python_command_discovery (tests.test_phase38.Phase38Tests.test_python_command_discovery)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 126, in test_python_command_discovery
+    commands = validation_intelligence.discover_commands(repo_map)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_task_aware_validation_selection_add_page (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_add_page)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 146, in test_task_aware_validation_selection_add_page
+    discovered_commands = validation_intelligence.discover_commands(repo_map)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_task_aware_validation_selection_fix_auth (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_fix_auth)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 166, in test_task_aware_validation_selection_fix_auth
+    discovered_commands = validation_intelligence.discover_commands(repo_map)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_task_aware_validation_selection_refactor_component (tests.test_phase38.Phase38Tests.test_task_aware_validation_selection_refactor_component)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 184, in test_task_aware_validation_selection_refactor_component
+    discovered_commands = validation_intelligence.discover_commands(repo_map)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_validation_plan_serialization (tests.test_phase38.Phase38Tests.test_validation_plan_serialization)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase38.py", line 297, in test_validation_plan_serialization
+    discovered_commands = validation_intelligence.discover_commands(repo_map)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\validation.py", line 78, in discover_commands
+    if any("unittest" in f.path for f in repo_map.test_files):
+                                         ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RepositoryMap' object has no attribute 'test_files'
+
+======================================================================
+ERROR: test_context_cli_does_not_call_provider (tests.test_phase35.Phase35Tests.test_context_cli_does_not_call_provider)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase35.py", line 128, in test_context_cli_does_not_call_provider
+    result = main(["context", "--project", str(root), "teacher dashboard", "--log-level", "CRITICAL"]) # Suppress logging
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 165, in main
+    args = build_parser().parse_args(argv)
+           ^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\local_agent\cli.py", line 22, in build_parser
+    add_common_arguments(run, include_provider_args=True)
+TypeError: add_common_arguments() got an unexpected keyword argument 'include_provider_args'
+
+======================================================================
+ERROR: test_phase312 (unittest.loader._FailedTest.test_phase312)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_phase312
+Traceback (most recent call last):
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\loader.py", line 137, in loadTestsFromName
+    module = __import__(module_name)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase312.py", line 13, in <module>
+    from local_agent.models import (
+ImportError: cannot import name 'QuotaExceededError' from 'local_agent.models' (D:\GitHub\DungX-AI-Coding-Agent\local_agent\models.py)
+
+
+======================================================================
+ERROR: test_phase311 (unittest.loader._FailedTest.test_phase311)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_phase311
+Traceback (most recent call last):
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\loader.py", line 137, in loadTestsFromName
+    module = __import__(module_name)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase311.py", line 11, in <module>
+    from local_agent.models import (
+ImportError: cannot import name 'QuotaExceededError' from 'local_agent.models' (D:\GitHub\DungX-AI-Coding-Agent\local_agent\models.py)
+
+
+======================================================================
+FAIL: test_scheduler_accepts_valid_proposal_and_sets_plan_proposed (tests.test_phase314.Phase314Tests.test_scheduler_accepts_valid_proposal_and_sets_plan_proposed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Admin\AppData\Local\Programs\Python\Python312\Lib\unittest\mock.py", line 1390, in patched
+    return func(*newargs, **newkeywargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase314.py", line 78, in test_scheduler_accepts_valid_proposal_and_sets_plan_proposed
+    self.assertEqual(loaded_task.status, TaskStatus.PLAN_PROPOSED)
+AssertionError: <TaskStatus.RUNNING: 'running'> != <TaskStatus.PLAN_PROPOSED: 'plan_proposed'>
+
+======================================================================
+FAIL: test_scan_builds_deterministic_map_and_protects_ignored_files (tests.test_phase35.Phase35Tests.test_scan_builds_deterministic_map_and_protects_ignored_files)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\GitHub\DungX-AI-Coding-Agent\tests\test_phase35.py", line 69, in test_scan_builds_deterministic_map_and_protects_ignored_files
+    self.assertEqual(context.repository_map.compact(), RepositoryAnalyzer(root).analyze().repository_map.compact())
+AssertionError: {'roo[182 chars]nt': 8}, 'languages': ['Python'], 'frameworks'[110 chars]': 5} != {'roo[182 chars]nt': 9}, 'languages': ['Python'], 'frameworks'[110 chars]': 5}
+Diff is 654 characters long. Set self.maxDiff to None to see it.
+
+----------------------------------------------------------------------
+Ran 25 tests in 1.467s
+
+FAILED (failures=2, errors=15)
