@@ -316,19 +316,17 @@ class Orchestrator:
                                 break
 
                             target_goal = current_subtask.goal if current_subtask else task.objective
-                            selected_cmd_spec = self.provider.select_diagnostic_command(target_goal, plan, context, failed, available_diagnostics)
-
+                            selected_cmd_spec = self._execute_with_specialist(
+                                task,
+                                ProviderCapability.REPAIR,
+                                lambda provider: provider.select_diagnostic_command(target_goal, plan, context, failed, available_diagnostics),
+                                "diagnostic command selection",
+                            )
                             if selected_cmd_spec is None or selected_cmd_spec not in available_diagnostics:
                                 emit("[5.2/7] Provider did not select a valid diagnostic command. Proceeding to repair.")
                                 break
-
                             emit(f"[5.3/7] Executing selected diagnostic command: {selected_cmd_spec.display()}")
-                            diagnostic_result = self._execute_with_specialist(
-                                task,
-                                ProviderCapability.REPAIR, # Assumes repairer can select diagnostics
-                                lambda provider: self.runner.run(selected_cmd_spec),
-                                "diagnostic selection"
-                            )
+                            diagnostic_result = self.runner.run(selected_cmd_spec)
                             truncated_result = self._truncate_execution_result(diagnostic_result)
                         
                             current_diagnostic_evidence.append(truncated_result)

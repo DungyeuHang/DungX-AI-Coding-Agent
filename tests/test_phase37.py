@@ -147,7 +147,7 @@ class Phase37Tests(unittest.TestCase):
         storage = JsonFileStorage(root / ".agent_data")
         orchestrator = Orchestrator(config, storage, None, threading.Lock(), threading.Lock())
         with mock.patch("local_agent.orchestrator.build_provider", return_value=provider):
-            report = orchestrator.run(task=task, subtask_id="mock-subtask-id")
+            report = orchestrator.run("Fix the student HomePage.")
 
         self.assertTrue(report.completed)
         self.assertIs(report.project, provider.plan_context)
