@@ -91,9 +91,9 @@ class Phase323_CI_IntegrationTests(unittest.TestCase):
 
     def test_ci_repair_handles_invalid_json(self):
         self.failure_file.write_text("{not_json")
-        with self.assertRaises(SystemExit) as cm, mock.patch("sys.stderr", new=__import__("io").StringIO()) as fake_err:
-            cli_main(["ci-repair", "--project", str(self.root), "--failure-file", str(self.failure_file)])
-        self.assertEqual(cm.exception.code, 1)
+        with mock.patch("sys.stderr", new=__import__("io").StringIO()) as fake_err:
+            result = cli_main(["ci-repair", "--project", str(self.root), "--failure-file", str(self.failure_file)])
+        self.assertEqual(result, 1)
         self.assertIn("Invalid or missing failure file", fake_err.getvalue())
 
     @mock.patch("local_agent.orchestrator.build_provider")

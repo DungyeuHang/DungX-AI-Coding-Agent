@@ -11,7 +11,9 @@ from local_agent.models import (
     ApprovalPolicy,
     ChangeImpact,
     ChangeTarget,
+    FileOperation,
     PreparedChange,
+    ReviewResult,
 )
 from local_agent.orchestrator import Orchestrator
 from local_agent.providers import MockProvider
@@ -25,11 +27,13 @@ class MockStorage(TaskStorage):
     def save_checkpoint(self, checkpoint): pass
     def load_checkpoint(self, checkpoint_id): pass
     def save_scheduler_state(self, state): pass
-    def load_scheduler_state(self): return __import__("local_agent.models").SchedulerState()
+    def load_scheduler_state(self): from local_agent.models import SchedulerState; return SchedulerState()
     def save_provider_configs(self, configs): pass
     def load_provider_configs(self): return []
     def save_semantic_index(self, index): pass
-    def load_semantic_index(self): return __import__("local_agent.models").SemanticIndex()
+    def load_semantic_index(self): from local_agent.models import SemanticIndex; return SemanticIndex()
+    def save_project_memory(self, memory): pass
+    def load_project_memory(self): from local_agent.models import ProjectMemory; return ProjectMemory()
 
 
 class Phase319_ApprovalPolicyTests(unittest.TestCase):
@@ -105,17 +109,22 @@ class Phase319_ApprovalPolicyTests(unittest.TestCase):
         config = AgentConfig.from_environment(self.root, approval="policy", approval_policies=policies)
         
         provider = MockProvider()
-        provider.generate_code = mock.Mock(return_value=[__import__("local_agent.models").FileOperation("modify", "a.py", content="new")])
+        provider.generate_code = mock.Mock(return_value=[FileOperation("modify", "a.py", content="new")])
         mock_coding_agent_instance = MockCodingAgent.return_value
         prepared_changes = [PreparedChange("modify", "a.py", "old", "new", "diff")]
         mock_coding_agent_instance.prepare.return_value = prepared_changes
         
-        orchestrator = Orchestrator(config, provider, self.mock_storage)
+        mock_scheduler = mock.MagicMock()
+        mock_scheduler.registry.providers = {}
+        mock_scheduler._select_providers.return_value = [config]
+        mock_scheduler._build_provider_instance.return_value = provider
+        import threading
+        orchestrator = Orchestrator(config, self.mock_storage, mock_scheduler, threading.Lock(), threading.Lock())
         approval_callback = mock.Mock(return_value=True)
         
         with mock.patch.object(orchestrator, '_validate', return_value=[]), \
-             mock.patch.object(orchestrator, 'reviewer') as mock_reviewer:
-            mock_reviewer.review.return_value = __import__("local_agent.models").ReviewResult("APPROVED", "LGTM", [])
+             mock.patch('local_agent.orchestrator.Reviewer') as MockReviewer:
+            MockReviewer.return_value.review.return_value = ReviewResult("APPROVED", "LGTM", [])
             orchestrator.run(mock.MagicMock(objective="test", plan=mock.MagicMock(subtasks=[mock.MagicMock(subtask_id="sub1")])), subtask_id="sub1", approval_callback=approval_callback)
 
         approval_callback.assert_not_called()
@@ -127,12 +136,17 @@ class Phase319_ApprovalPolicyTests(unittest.TestCase):
         config = AgentConfig.from_environment(self.root, approval="policy", approval_policies=policies)
         
         provider = MockProvider()
-        provider.generate_code = mock.Mock(return_value=[__import__("local_agent.models").FileOperation("modify", "src/a.py", content="new")])
+        provider.generate_code = mock.Mock(return_value=[FileOperation("modify", "src/a.py", content="new")])
         mock_coding_agent_instance = MockCodingAgent.return_value
         prepared_changes = [PreparedChange("modify", "src/a.py", "old", "new", "diff")]
         mock_coding_agent_instance.prepare.return_value = prepared_changes
         
-        orchestrator = Orchestrator(config, provider, self.mock_storage)
+        mock_scheduler = mock.MagicMock()
+        mock_scheduler.registry.providers = {}
+        mock_scheduler._select_providers.return_value = [config]
+        mock_scheduler._build_provider_instance.return_value = provider
+        import threading
+        orchestrator = Orchestrator(config, self.mock_storage, mock_scheduler, threading.Lock(), threading.Lock())
         approval_callback = mock.Mock(return_value=False)
         
         with mock.patch.object(orchestrator, '_validate', return_value=[]):

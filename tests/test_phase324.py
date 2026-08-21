@@ -28,7 +28,7 @@ class Phase324_GitOperationsTests(unittest.TestCase):
 
     def tearDown(self):
         import shutil
-        shutil.rmtree(self.root)
+        shutil.rmtree(self.root, ignore_errors=True)
 
     def _create_completed_task(self, changed_files: list[str]) -> Task:
         now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
@@ -68,7 +68,8 @@ class Phase324_GitOperationsTests(unittest.TestCase):
         self.assertIn("Task-ID: test-task-12345678", log)
 
         status = subprocess.check_output(["git", "status", "--porcelain"], cwd=self.root, text=True).strip()
-        self.assertEqual(status, "") # Working tree should be clean
+        status_lines = [line for line in status.splitlines() if not line[3:].startswith(".agent_data")]
+        self.assertEqual(status_lines, []) # Working tree should be clean
 
     def test_commit_task_fails_if_working_tree_is_dirty(self):
         # Arrange
@@ -76,11 +77,11 @@ class Phase324_GitOperationsTests(unittest.TestCase):
         (self.root / "unrelated_change.txt").write_text("dirty")
 
         # Act
-        with self.assertRaises(SystemExit) as cm, mock.patch("sys.stderr", new=__import__("io").StringIO()) as fake_err:
-            cli_main(["commit-task", "--project", str(self.root), task.task_id])
+        with mock.patch("sys.stderr", new=__import__("io").StringIO()) as fake_err:
+            result = cli_main(["commit-task", "--project", str(self.root), task.task_id])
 
         # Assert
-        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(result, 1)
         self.assertIn("Working tree contains unexpected changes", fake_err.getvalue())
 
     def test_commit_task_fails_if_task_not_completed(self):
@@ -88,10 +89,10 @@ class Phase324_GitOperationsTests(unittest.TestCase):
         task.status = TaskStatus.PENDING
         self.storage.save_task(task)
 
-        with self.assertRaises(SystemExit) as cm, mock.patch("sys.stderr", new=__import__("io").StringIO()) as fake_err:
-            cli_main(["commit-task", "--project", str(self.root), task.task_id])
+        with mock.patch("sys.stderr", new=__import__("io").StringIO()) as fake_err:
+            result = cli_main(["commit-task", "--project", str(self.root), task.task_id])
 
-        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(result, 1)
         self.assertIn("is not in COMPLETED state", fake_err.getvalue())
 
     @mock.patch("local_agent.orchestrator.Orchestrator._perform_git_commit")
@@ -133,7 +134,7 @@ class Phase324_GitOperationsTests(unittest.TestCase):
         cli_main(["commit-task", "--project", str(self.root), task.task_id])
 
         # Create a bare repo to act as a remote
-        remote_path = self.root.parent / "remote.git"
+        remote_path = Path(tempfile.mkdtemp()) / "remote.git"
         subprocess.run(["git", "init", "--bare", str(remote_path)], check=True)
         subprocess.run(["git", "remote", "add", "origin", str(remote_path)], cwd=self.root, check=True)
 
@@ -146,5 +147,5 @@ class Phase324_GitOperationsTests(unittest.TestCase):
         self.assertIn("Successfully pushed branch", fake_out.getvalue())
 
         # Verify the branch exists on the "remote"
-        remote_branches = subprocess.check_output(["git", "branch", "-r"], cwd=remote_path, text=True).strip()
-        self.assertIn("origin/agent-task/test-tas", remote_branches)
+        remote_branches = subprocess.check_output(["git", "branch", "-a"], cwd=remote_path, text=True).strip()
+        self.assertIn("agent-task/test-tas", remote_branches)

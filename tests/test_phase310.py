@@ -10,9 +10,11 @@ from unittest import mock
 
 from local_agent.config import AgentConfig
 from local_agent.credentials import MockCredentialStore
-from local_agent.models import (ProviderAvailability, ProviderCapability,
-                                ProviderConfig, ProviderError,
-                                QuotaExceededError, Task, TaskStatus)
+from local_agent.models import (
+    Plan, ProviderAvailability, ProviderCapability,
+    ProviderConfig, ProviderError,
+    QuotaExceededError, SubtaskStatus, Task, TaskStatus,
+)
 from local_agent.providers import AIProvider, BaseHTTPProvider, build_provider
 from local_agent.scheduler import Scheduler
 from local_agent.storage import JsonFileStorage
@@ -22,7 +24,6 @@ from .test_phase39 import MockTaskStorage
 class MockProviderA(AIProvider):
     def __init__(self, config):
         self.config = config
-        self.capabilities = {ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION}
         self.should_fail = False
 
     @property
@@ -30,9 +31,7 @@ class MockProviderA(AIProvider):
         return {ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION}
 
     def generate_plan(self, task, context):
-        if self.should_fail:
-            raise QuotaExceededError("Quota exceeded on Provider A")
-        return json.loads('{"objective": "mock plan", "steps": ["step1"]}')
+        return Plan(objective="mock plan", steps=["step1"])
 
     def generate_code(self, task, plan, context, failure=None, review=None):
         if self.should_fail:
@@ -48,7 +47,6 @@ class MockProviderA(AIProvider):
 class MockProviderB(AIProvider):
     def __init__(self, config):
         self.config = config
-        self.capabilities = {ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION}
         self.continuation_context_received = None
 
     @property
@@ -57,7 +55,7 @@ class MockProviderB(AIProvider):
 
     def generate_plan(self, task, context):
         self.continuation_context_received = context.metadata.get("continuation_context")
-        return mock.MagicMock()
+        return Plan(objective="mock plan", steps=["step1"])
 
     def generate_code(self, task, plan, context, failure=None, review=None):
         return []
@@ -107,12 +105,12 @@ class Phase310Tests(unittest.TestCase):
         self.mock_credential_store.save("dungx-ai-coding-agent", "provider_a", "key-a")
         self.mock_credential_store.save("dungx-ai-coding-agent", "provider_b", "key-b")
 
-        # Provider B has higher priority (lower number)
-        scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
-        
-        def build_side_effect(config):
+        def build_side_effect(config, *args, **kwargs):
             return self.provider_map[config.provider](config)
         mock_build_provider.side_effect = build_side_effect
+
+        # Provider B has higher priority (lower number)
+        scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
 
         scheduler.run_once()
 
@@ -130,13 +128,14 @@ class Phase310Tests(unittest.TestCase):
         self.storage.save_provider_configs(provider_configs)
         self.mock_credential_store.save("dungx-ai-coding-agent", "provider_a", "key-a")
         self.mock_credential_store.save("dungx-ai-coding-agent", "provider_b", "key-b")
+
+        def build_side_effect(config, *args, **kwargs):
+            return self.provider_map[config.provider](config)
+        mock_build_provider.side_effect = build_side_effect
+
         scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
         scheduler.state.provider_states["provider_b"].availability = ProviderAvailability.UNAVAILABLE
         self.storage.save_scheduler_state(scheduler.state)
-
-        def build_side_effect(config):
-            return self.provider_map[config.provider](config)
-        mock_build_provider.side_effect = build_side_effect
 
         scheduler.run_once()
 
@@ -155,17 +154,17 @@ class Phase310Tests(unittest.TestCase):
         self.mock_credential_store.save("dungx-ai-coding-agent", "provider_a", "key-a")
         self.mock_credential_store.save("dungx-ai-coding-agent", "provider_b", "key-b")
 
-        scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
-
         # First run: Provider A fails with QuotaExceededError
         provider_a_instance = MockProviderA(self.config_a)
         provider_a_instance.should_fail = True
         
-        def build_side_effect_run1(config):
+        def build_side_effect_run1(config, *args, **kwargs):
             if config.provider == "provider_a":
                 return provider_a_instance
             return self.provider_map[config.provider](config)
         mock_build_provider.side_effect = build_side_effect_run1
+
+        scheduler = Scheduler(self.base_config, self.storage, self.mock_credential_store)
 
         # Mock orchestrator to simulate a paused task
         def orchestrator_run_effect(*args, **kwargs):
@@ -187,18 +186,19 @@ class Phase310Tests(unittest.TestCase):
 
         # Second run: Provider A is on cooldown, so Provider B should be chosen
         provider_b_instance = MockProviderB(self.config_b)
-        def build_side_effect_run2(config):
+        def build_side_effect_run2(config, *args, **kwargs):
             if config.provider == "provider_b":
                 return provider_b_instance
             return self.provider_map[config.provider](config)
         mock_build_provider.side_effect = build_side_effect_run2
 
-        # Reset orchestrator mock for the second run
         mock_orchestrator.reset_mock()
         def orchestrator_run_effect_2(*args, **kwargs):
             task.status = TaskStatus.COMPLETED
+            if task.plan and task.plan.subtasks:
+                task.plan.subtasks[0].status = SubtaskStatus.COMPLETED
             self.storage.save_task(task)
-            return mock.MagicMock(outcome="COMPLETED")
+            return mock.MagicMock(outcome="COMPLETED", plan_proposal=None)
         mock_orchestrator.return_value.run.side_effect = orchestrator_run_effect_2
 
         # Simulate time passing to get past cooldown for the task retry, but not provider
@@ -232,7 +232,7 @@ class Phase310Tests(unittest.TestCase):
         self.assertGreater(paused_task.next_retry_at, datetime.datetime.now(datetime.timezone.utc))
 
     @mock.patch("local_agent.scheduler.build_provider")
-    def test_scheduler_persistence(self):
+    def test_scheduler_persistence(self, mock_build_provider):
         real_storage = JsonFileStorage(self.root / ".agent_data")
         provider_configs = [ProviderConfig(provider_id="provider_a", priority=10, enabled=True)]
         real_storage.save_provider_configs(provider_configs)
@@ -241,7 +241,7 @@ class Phase310Tests(unittest.TestCase):
 
         def build_side_effect(config, api_key=None):
             return self.provider_map[config.provider](config)
-        mock.patch("local_agent.scheduler.build_provider", side_effect=build_side_effect)
+        mock_build_provider.side_effect = build_side_effect
 
         scheduler1 = Scheduler(self.base_config, real_storage, mock_credential_store)
         scheduler1.state.provider_states["provider_a"].availability = ProviderAvailability.COOLDOWN

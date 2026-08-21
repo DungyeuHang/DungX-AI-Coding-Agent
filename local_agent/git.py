@@ -70,7 +70,7 @@ class GitIntegration:
 
     def is_dirty(self, expected_changes: list[str] | None = None) -> bool:
         """Checks if the working tree is dirty with unexpected changes."""
-        status_output = self._run("status", "--porcelain")
+        status_output = self._run("status", "--porcelain", "-uall")
         if not status_output:
             return False # Clean
 
@@ -79,11 +79,13 @@ class GitIntegration:
         for line in status_output.splitlines():
             # Porcelain format: XY PATH
             # For renames: R  ORIG -> NEW
-            path_str = line[3:]
+            path_str = line[3:].strip().strip('"')
             if " -> " in path_str:
-                path_str = path_str.split(" -> ")[1]
+                path_str = path_str.split(" -> ")[1].strip().strip('"')
             
             path = Path(path_str.strip()).as_posix()
+            if path == ".agent_data" or path.startswith(".agent_data/"):
+                continue
             if path not in expected_set:
                 return True # Found an unexpected change
         

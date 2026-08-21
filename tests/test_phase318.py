@@ -12,6 +12,7 @@ from local_agent.models import (
     ProviderCapability,
     ProviderConfig,
     Task,
+    TaskPlan,
     TaskStatus,
 )
 from local_agent.providers import AIProvider, MockProvider
@@ -104,7 +105,7 @@ class Phase318_DynamicCapabilityTests(unittest.TestCase):
         self.assertEqual(planning_providers[0].provider, "planning_only")
 
         # Act & Assert for IMPLEMENTATION
-        mock_plan = __import__("local_agent.models").TaskPlan(
+        mock_plan = TaskPlan(
             objective="Test", subtasks=[]
         )
         task_with_plan = self._create_task(plan=mock_plan)

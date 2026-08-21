@@ -23,6 +23,14 @@ _RELATION_BONUS = {
     "page_uses": 0.12,
     "tested_by": 0.16,
 }
+_SYNONYM_MAP = {
+    "login": {"auth", "authentication", "signin", "user", "session"},
+    "auth": {"login", "authentication", "signin", "user", "session"},
+    "authentication": {"login", "auth", "signin", "user", "session"},
+    "signin": {"login", "auth", "authentication"},
+    "signup": {"register", "registration", "user"},
+    "register": {"signup", "registration", "user"},
+}
 
 
 class ContextSelector:
@@ -119,16 +127,20 @@ class ContextSelector:
 
                     reason = f"related to semantic match in {seed_path}"
                     current_boost, _ = semantic_boosts.get(related_path, (0.0, ""))
-                    if 0.15 > current_boost:
-                        semantic_boosts[related_path] = (0.15, reason)
+                    if 0.12 > current_boost:
+                        semantic_boosts[related_path] = (0.12, reason)
 
         # Phase 3.22: Add boosts from Project Memory
         memory_boosts: dict[str, tuple[float, str]] = {}  # path -> (boost, reason)
         if self.project_memory:
             task_keywords = self._keywords(task)
+            expanded_task_keywords = set(task_keywords)
+            for kw in task_keywords:
+                expanded_task_keywords.update(_SYNONYM_MAP.get(kw, set()))
             for memory in self.project_memory.memories:
-                # Simple relevance: memory content has task keywords, and it's related to a file
-                if memory.related_path and task_keywords & self._keywords(memory.content):
+                # Relevance: memory content has task keywords or synonyms, and it's related to a file
+                mem_keywords = self._keywords(memory.content)
+                if memory.related_path and (expanded_task_keywords & mem_keywords):
                     # Stale memory check: decay score based on age.
                     age_days = (datetime.datetime.now(datetime.timezone.utc) - memory.timestamp).days
                     decay_factor = max(0, 1 - (age_days / 90))  # Memory influence decays over 90 days
@@ -225,7 +237,7 @@ class ContextSelector:
                 if target not in scored:
                     continue
                 bonus = _RELATION_BONUS.get(kind, 0.08)
-                if base_scores[source] >= 0.20:
+                if (base_scores[source] - semantic_boosts.get(source, (0.0, ""))[0]) >= 0.20:
                     scored[target]["score"] = min(0.99, float(scored[target]["score"]) + bonus * 0.65)
                     if kind == "router_route":
                         explanation = "direct router relationship"
@@ -235,7 +247,7 @@ class ContextSelector:
                         explanation = f"direct {kind} relationship from {source}"
                     scored[target]["reasons"] = list(scored[target]["reasons"]) + [explanation]
         for target, sources in incoming.items():
-            if target not in scored or base_scores[target] < 0.20:
+            if target not in scored or (base_scores[target] - semantic_boosts.get(target, (0.0, ""))[0]) < 0.20:
                 continue
             for source, kind in sources:
                 if source not in scored:
@@ -266,6 +278,7 @@ class ContextSelector:
             seed_paths = [path for path in ranked if not (records.get(path) and records[path].is_test)][:1]
         pending = [(path, 0) for path in seed_paths]
         scheduled = set(seed_paths)
+        pre_expansion_scores = {path: float(scored[path]["score"]) for path in scored}
         while pending and len(selected) < self.max_files:
             pending.sort(key=lambda item: (-float(scored[item[0]]["score"]), item[0]))
             relative, depth = pending.pop(0)
@@ -292,7 +305,7 @@ class ContextSelector:
             if depth:
                 parent = next((source for source, targets in relationships.items() if any(target == relative for target, _ in targets)), None)
                 reasons.append(f"dependency of {parent}" if parent else "dependency expansion")
-            selected_items.append({"path": relative, "score": round(float(scored[relative]["score"]), 3), "reason": reasons, "dependency_depth": depth})
+            selected_items.append({"path": relative, "score": round(float(pre_expansion_scores[relative]), 3), "reason": reasons, "dependency_depth": depth})
             if depth < self.dependency_depth:
                 for target, kind in relationships.get(relative, []):
                     if target in scored and target not in selected and target not in {item[0] for item in pending}:
@@ -330,7 +343,8 @@ class ContextSelector:
 
     @staticmethod
     def _keywords(value: str) -> set[str]:
-        camel_case = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+        cleaned = re.sub(r"`[^`]+`", " ", value)
+        camel_case = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", cleaned)
         return {word.lower() for word in _WORD_RE.findall(camel_case) if len(word) > 2 and word.lower() not in _STOP_WORDS}
 
     def _extract_candidate_symbols(self, task: str) -> set[str]:

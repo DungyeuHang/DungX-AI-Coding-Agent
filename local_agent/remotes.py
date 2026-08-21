@@ -9,10 +9,11 @@ import urllib.request
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from .models import PullRequestInfo, Task
+
 if TYPE_CHECKING:
     from .config import AgentConfig
     from .git import GitIntegration
-    from .models import PullRequestInfo, Task
 
 
 class RemoteError(Exception):
@@ -77,7 +78,7 @@ class GitHubProvider(RemoteProvider):
             pr_id=str(pr_data["number"]),
             url=pr_data["html_url"],
             status=pr_data["state"],
-            created_at=datetime.datetime.fromisoformat(pr_data["created_at"].replace("Z", "+00:00")),
+            created_at=_parse_iso_datetime(pr_data["created_at"]),
         )
 
     def create_pull_request(self, task: Task, branch_name: str) -> PullRequestInfo:
@@ -99,8 +100,16 @@ class GitHubProvider(RemoteProvider):
             pr_id=str(pr_data["number"]),
             url=pr_data["html_url"],
             status=pr_data["state"],
-            created_at=datetime.datetime.fromisoformat(pr_data["created_at"].replace("Z", "+00:00")),
+            created_at=_parse_iso_datetime(pr_data["created_at"]),
         )
+
+
+def _parse_iso_datetime(val: str) -> datetime.datetime:
+    if val.endswith("+00:00Z"):
+        val = val[:-1]
+    elif val.endswith("Z"):
+        val = val[:-1] + "+00:00"
+    return datetime.datetime.fromisoformat(val)
 
 
 def build_remote_provider(config: AgentConfig) -> RemoteProvider | None:

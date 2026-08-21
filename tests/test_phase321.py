@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import tempfile
 import time
 import unittest
@@ -119,7 +120,9 @@ class Phase321_ParallelSubtaskExecutionTests(unittest.TestCase):
         shutil.rmtree(self.root)
 
     def _build_mock_provider(self, config: AgentConfig, api_key: str | None = None) -> AIProvider:
-        if config.provider == "planning":
+        if config.provider in self.mock_providers:
+            instance = self.mock_providers[config.provider]
+        elif config.provider == "planning":
             instance = MockPlanningProvider()
         elif config.provider == "coding":
             instance = MockCodingProvider()

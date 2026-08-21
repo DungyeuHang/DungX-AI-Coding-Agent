@@ -5,11 +5,13 @@ import datetime
 import logging
 import json
 import sys
+from pathlib import Path
 
 from .config import AgentConfig, add_common_arguments, config_from_args
 from .context import ContextSelector
 from .orchestrator import Orchestrator
 from .providers import MockProvider, ProviderError, build_provider
+from .repository import RepositoryIntelligence
 from .storage import JsonFileStorage
 from .models import TaskStatus
 from .planner import GraphValidator
@@ -23,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     context = subparsers.add_parser("context", help="retrieve task-relevant project context")
     add_common_arguments(context)
     context.add_argument("task", help="task used to select relevant context")
+    context.add_argument("--verbose", action="store_true", help="display detailed selection metadata")
     run = subparsers.add_parser("run", help="plan, implement, validate, repair, and review a task")
     add_common_arguments(run, include_provider_args=True)
     run.add_argument("task", help="implementation task objective or ID to resume")
@@ -73,7 +76,6 @@ def build_parser() -> argparse.ArgumentParser:
     # New commands for Phase 3.9
     create_task = subparsers.add_parser("create-task", help="create a new persistent task")
     add_common_arguments(create_task)
-    create_task.add_argument("--autonomous", action="store_true", help="Enable autonomous mode for this task")
     create_task.add_argument("objective", help="the objective of the new task")
 
     list_tasks = subparsers.add_parser("list-tasks", help="list all persistent tasks")
@@ -138,7 +140,13 @@ def _print_selected_context(context, args) -> None:
     print(f"  - Selected Files: {selection_metadata.get('selected_count', 'N/A')}")
     print(f"  - Estimated Tokens: {selection_metadata.get('estimated_tokens', 'N/A')}")
 
-    if args.verbose:
+    selected_files = context.metadata.get("selected_files", [item["path"] for item in selection_metadata.get("selected_items", [])])
+    if selected_files:
+        print("  Files:")
+        for path in selected_files:
+            print(f"    - {path}")
+
+    if getattr(args, "verbose", False):
         print("\n  Selected Items (ranked):")
         for item in selection_metadata.get('selected_items', []):
             print(f"    - Path: {item['path']} (Score: {item['score']:.3f}, Depth: {item['dependency_depth']})")
@@ -247,14 +255,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = config_from_args(args)
         logging.basicConfig(level=getattr(logging, config.log_level), format="%(levelname)s %(message)s")
-        storage = JsonFileStorage(config.data_dir)
+        storage = JsonFileStorage(getattr(config, "data_dir", None) or (config.project / ".agent_data"))
 
         if args.command == "analyze":
-            _print_context(Orchestrator(config, MockProvider(), storage).analyze())
+            _print_context(RepositoryIntelligence(config.project).scan())
             return 0
 
         if args.command == "context":
-            context = Orchestrator(config, MockProvider(), storage).analyze()
+            context = RepositoryIntelligence(config.project).scan()
             ContextSelector(
                 config.project,
                 max_files=config.max_context_files,
@@ -269,13 +277,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "approve-plan":
             task = storage.load_task(args.task_id)
             if task.status != TaskStatus.PLAN_REVIEW:
-                print(f"error: Task {args.task_id} is not in PLAN_REVIEW status.", file=sys.stderr)
-                return 1
+                print(f"error: Task {args.task_id} is not in PLAN_REVIEW status.")
+                raise SystemExit(1)
             if task.plan:
                 errors = GraphValidator(task.plan.subtasks).validate()
                 if errors:
-                    print(f"error: Plan for task {args.task_id} is invalid and cannot be approved: {'; '.join(errors)}", file=sys.stderr)
-                    return 1
+                    print(f"error: Plan for task {args.task_id} is invalid and cannot be approved: {'; '.join(errors)}")
+                    raise SystemExit(1)
             task.status = TaskStatus.PENDING
             task.updated_at = datetime.datetime.now(datetime.timezone.utc)
             storage.save_task(task)
@@ -285,8 +293,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "reject-plan":
             task = storage.load_task(args.task_id)
             if task.status != TaskStatus.PLAN_REVIEW:
-                print(f"error: Task {args.task_id} is not in PLAN_REVIEW status.", file=sys.stderr)
-                return 1
+                print(f"error: Task {args.task_id} is not in PLAN_REVIEW status.")
+                raise SystemExit(1)
             task.status = TaskStatus.REJECTED
             task.updated_at = datetime.datetime.now(datetime.timezone.utc)
             storage.save_task(task)
@@ -296,16 +304,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "edit-plan":
             task = storage.load_task(args.task_id)
             if task.status not in {TaskStatus.PLAN_REVIEW, TaskStatus.PENDING, TaskStatus.PAUSED}:
-                print(f"error: Task {args.task_id} is in status {task.status.value} and cannot be edited.", file=sys.stderr)
-                return 1
+                print(f"error: Task {args.task_id} is in status {task.status.value} and cannot be edited.")
+                raise SystemExit(1)
             if not task.plan:
-                print(f"error: Task {args.task_id} has no plan to edit.", file=sys.stderr)
-                return 1
+                print(f"error: Task {args.task_id} has no plan to edit.")
+                raise SystemExit(1)
 
             subtask_map = {s.subtask_id: s for s in task.plan.subtasks}
             if args.subtask not in subtask_map:
-                print(f"error: Subtask {args.subtask} not found in plan for task {args.task_id}.", file=sys.stderr)
-                return 1
+                print(f"error: Subtask {args.subtask} not found in plan for task {args.task_id}.")
+                raise SystemExit(1)
 
             subtask_to_edit = subtask_map[args.subtask]
             if args.title is not None: subtask_to_edit.title = args.title
@@ -315,8 +323,8 @@ def main(argv: list[str] | None = None) -> int:
 
             errors = GraphValidator(task.plan.subtasks).validate()
             if errors:
-                print(f"error: Edited plan is invalid: {'; '.join(errors)}", file=sys.stderr)
-                return 1
+                print(f"error: Edited plan is invalid: {'; '.join(errors)}")
+                raise SystemExit(1)
 
             if task.status == TaskStatus.PENDING:
                 task.status = TaskStatus.PLAN_REVIEW
@@ -540,13 +548,14 @@ def main(argv: list[str] | None = None) -> int:
             # 2. Project and Storage
             print(f"\n[2/5] Project and Storage")
             print(f"  - Project Root: {config.project}")
+            storage_dir = getattr(storage, "base_dir", getattr(storage, "data_dir", config.project / ".agent_data"))
             try:
-                storage.data_dir.mkdir(exist_ok=True)
-                (storage.data_dir / "write_test.tmp").touch()
-                (storage.data_dir / "write_test.tmp").unlink()
-                print(f"  - Storage Directory: {storage.data_dir} (Writable)")
+                storage_dir.mkdir(exist_ok=True)
+                (storage_dir / "write_test.tmp").touch()
+                (storage_dir / "write_test.tmp").unlink()
+                print(f"  - Storage Directory: {storage_dir} (Writable)")
             except OSError as e:
-                print(f"  - Storage Directory: {storage.data_dir} (NOT WRITABLE: {e})")
+                print(f"  - Storage Directory: {storage_dir} (NOT WRITABLE: {e})")
 
             # 3. Git Repository
             print(f"\n[3/5] Git Repository")

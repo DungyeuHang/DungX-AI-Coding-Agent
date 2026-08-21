@@ -8,9 +8,11 @@ from unittest import mock
 
 from local_agent.config import AgentConfig
 from local_agent.credentials import MockCredentialStore
-from local_agent.models import (ProviderAvailability, ProviderCapability,
-                                ProviderConfig, Subtask, SubtaskStatus, Task,
-                                TaskPlan, TaskStatus)
+from local_agent.models import (
+    Checkpoint, ProviderAvailability, ProviderCapability,
+    ProviderConfig, Subtask, SubtaskStatus, Task,
+    TaskPlan, TaskStatus,
+)
 from local_agent.planner import GraphValidator
 from local_agent.providers import QuotaExceededError
 from local_agent.scheduler import Scheduler
@@ -200,12 +202,13 @@ class Phase311Tests(unittest.TestCase):
         with mock.patch("local_agent.scheduler.Orchestrator") as mock_orchestrator:
             # We need to capture the context passed to the orchestrator's provider
             orchestrator_instance = mock.MagicMock()
+            orchestrator_instance.run.return_value = mock.MagicMock(outcome="COMPLETED", plan_proposal=None)
             mock_orchestrator.return_value = orchestrator_instance
 
             # Simulate a checkpoint being created for the paused subtask
-            checkpoint = __import__("local_agent.models").Checkpoint(
+            checkpoint = Checkpoint(
                 checkpoint_id="chk-1", task_id=task.task_id, subtask_id="2",
-                timestamp=datetime.datetime.now(), current_state_description="Paused mid-flight",
+                timestamp=datetime.datetime.now(datetime.timezone.utc), current_state_description="Paused mid-flight",
                 files_changed=[], repository_diff="", validation_state={},
                 last_provider_result={"outcome": "QUOTA_EXCEEDED"},
                 next_recommended_action="resume",
@@ -251,10 +254,12 @@ class Phase311Tests(unittest.TestCase):
             subtask = next(s for s in t.plan.subtasks if s.subtask_id == subtask_id)
             subtask.status = SubtaskStatus.COMPLETED
             self.storage.save_task(t)
-            return mock.MagicMock(outcome="COMPLETED")
+            return mock.MagicMock(outcome="COMPLETED", plan_proposal=None)
 
         with mock.patch("local_agent.scheduler.Orchestrator") as MockOrchestrator, \
              mock.patch("local_agent.planner.Planner.create_task_plan") as mock_create_plan:
+
+            MockOrchestrator.return_value.run.return_value = mock.MagicMock(outcome="COMPLETED", plan_proposal=None)
 
             # 2. Run 1: Plan the task.
             s1 = Subtask(subtask_id="1", title="Step 1", goal="A", status=SubtaskStatus.PENDING)

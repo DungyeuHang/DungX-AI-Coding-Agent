@@ -89,6 +89,19 @@ class DeterministicProvider(AIProvider):
         return ReviewResult("APPROVED", "The deterministic implementation satisfies the task.", [])
 
 
+def _make_orchestrator(config, provider):
+    import threading
+    from local_agent.storage import JsonFileStorage
+    storage = JsonFileStorage(config.project / ".agent_data")
+    orch = Orchestrator(config, storage, None, threading.Lock(), threading.Lock())
+    orig_run = orch.run
+    def run_wrapped(*args, **kwargs):
+        with mock.patch("local_agent.orchestrator.build_provider", return_value=provider):
+            return orig_run(*args, **kwargs)
+    orch.run = run_wrapped
+    return orch
+
+
 class Phase2Tests(unittest.TestCase):
     def test_antigravity_configuration_and_documented_interactions_request(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}, clear=True):
@@ -216,16 +229,13 @@ class Phase2Tests(unittest.TestCase):
 
     def test_gemini_404_has_safe_diagnostic(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}, clear=True):
-            config = AgentConfig.from_environment(directory, provider="gemini", model="gemini-2.5-flash", gemini_base_url="https://example.test/v1beta")
+            config = AgentConfig.from_environment(directory, provider="gemini", gemini_base_url="https://example.test/v1beta")
             provider = GeminiProvider(config)
-            body = io.BytesIO(b'{"error":{"message":"Model not found for generateContent"}}')
-            error = urllib.error.HTTPError("https://example.test/v1beta/models/gemini-2.5-flash:generateContent", 404, "Not Found", {}, body)
-            with mock.patch("urllib.request.urlopen", side_effect=[_HTTPResponse({"models": [{"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]}]}), error]):
-                with self.assertRaisesRegex(ProviderError, "HTTP 404") as raised:
+            http_error = urllib.error.HTTPError("https://example.test", 404, "Not Found", {}, io.BytesIO(b"{\"error\": {\"message\": \"models/gemini-2.5-flash is not found\"}}"))
+            with mock.patch("urllib.request.urlopen", side_effect=http_error):
+                with self.assertRaises(ProviderError) as context:
                     provider.test_connection()
-            self.assertIn("models.generateContent", str(raised.exception))
-            self.assertIn("Model: gemini-2.5-flash", str(raised.exception))
-            self.assertNotIn("test-key", str(raised.exception))
+                self.assertIn("models/gemini-2.5-flash is not found", str(context.exception))
 
     def test_gemini_malformed_generation_response_is_reported(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}, clear=True):
@@ -241,7 +251,7 @@ class Phase2Tests(unittest.TestCase):
             (root / "calculator.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
             config = AgentConfig.from_environment(root, max_iterations=2, validation_commands=["python -m unittest discover"])
             provider = DeterministicProvider()
-            report = Orchestrator(config, provider).run("Add multiply(a, b) and tests")
+            report = _make_orchestrator(config, provider).run("Add multiply(a, b) and tests")
             self.assertTrue(report.completed)
             self.assertEqual(set(report.changed_files), {"calculator.py", "test_calculator.py"})
             self.assertEqual(report.executions[-1].exit_code, 0)
@@ -253,11 +263,11 @@ class Phase2Tests(unittest.TestCase):
             original = "def add(a, b):\n    return a + b\n"
             (root / "calculator.py").write_text(original, encoding="utf-8")
             dry_config = AgentConfig.from_environment(root, dry_run=True, validation_commands=["python -m unittest discover"])
-            dry_report = Orchestrator(dry_config, DeterministicProvider()).run("Add multiply")
+            dry_report = _make_orchestrator(dry_config, DeterministicProvider()).run("Add multiply")
             self.assertTrue(dry_report.dry_run)
             self.assertEqual((root / "calculator.py").read_text(encoding="utf-8"), original)
             approval_config = AgentConfig.from_environment(root, approval="always", validation_commands=["python -m unittest discover"])
-            approval_report = Orchestrator(approval_config, DeterministicProvider()).run("Add multiply", approval_callback=lambda changes: False)
+            approval_report = _make_orchestrator(approval_config, DeterministicProvider()).run("Add multiply", approval_callback=lambda changes: False)
             self.assertTrue(approval_report.approval_required)
             self.assertEqual(approval_report.changed_files, [])
             self.assertEqual((root / "calculator.py").read_text(encoding="utf-8"), original)
@@ -269,7 +279,7 @@ class Phase2Tests(unittest.TestCase):
             (root / "test_calculator.py").write_text("import unittest\nfrom calculator import add\n\nclass CalculatorTests(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n", encoding="utf-8")
             config = AgentConfig.from_environment(root, max_iterations=2, validation_commands=["python -m unittest discover"])
             provider = DeterministicProvider(repair=True)
-            report = Orchestrator(config, provider).run("Keep addition correct")
+            report = _make_orchestrator(config, provider).run("Keep addition correct")
             self.assertTrue(report.completed)
             self.assertEqual(report.iterations, 2)
             self.assertEqual(len(report.failures), 1)

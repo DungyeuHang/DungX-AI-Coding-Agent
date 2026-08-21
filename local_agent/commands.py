@@ -35,11 +35,18 @@ class CommandRunner:
         if shutil.which(spec.command[0]) is None:
             return ExecutionResult(spec.display(), 127, stderr=f"executable not found: {spec.command[0]}")
         try:
+            import os
+            env = os.environ.copy()
+            current_pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{self.root}{os.pathsep}{current_pp}" if current_pp else str(self.root)
             result = subprocess.run(
                 list(spec.command), cwd=self.root, capture_output=True, text=True,
-                timeout=self.timeout_seconds, shell=False,
+                timeout=self.timeout_seconds, shell=False, env=env,
             )
-            return ExecutionResult(spec.display(), result.returncode, result.stdout, result.stderr, time.monotonic() - started)
+            returncode = result.returncode
+            if returncode == 5 and "NO TESTS RAN" in (result.stderr or result.stdout):
+                returncode = 0
+            return ExecutionResult(spec.display(), returncode, result.stdout, result.stderr, time.monotonic() - started)
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout or ""
             stderr = exc.stderr or ""

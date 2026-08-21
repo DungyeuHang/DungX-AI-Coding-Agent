@@ -33,7 +33,12 @@ class CodingAgent:
 
     def prepare(self, operations: list[FileOperation], plan: Plan | None = None) -> list[PreparedChange]:
         """Validate all operations and calculate results without writing files."""
-        allowed = set(plan.files_likely_to_change + plan.files_likely_to_create) if plan else set()
+        if isinstance(plan, dict):
+            allowed = set(plan.get("files_likely_to_change", []) + plan.get("files_likely_to_create", []))
+        elif plan:
+            allowed = set(getattr(plan, "files_likely_to_change", []) + getattr(plan, "files_likely_to_create", []))
+        else:
+            allowed = set()
         normalized_allowed = {self._normalize(item) for item in allowed}
         prepared: list[PreparedChange] = []
         seen: set[str] = set()

@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from local_agent.config import AgentConfig
 from local_agent.context import ContextSelector
 from local_agent.impact import ChangeImpactAnalyzer
-from local_agent.models import ChangeImpact, CommandSpec, FileOperation, FailureAnalysis, Plan, ProjectContext, ReviewResult, ValidationCommand, ValidationPlan
+from local_agent.models import ChangeImpact, CommandSpec, FileOperation, FailureAnalysis, Plan, ProjectContext, ProviderCapability, ReviewResult, ValidationCommand, ValidationPlan
 from local_agent.orchestrator import Orchestrator
 from local_agent.providers import AIProvider, _bounded_context
 from local_agent.repository import RepositoryIntelligence
+from local_agent.storage import JsonFileStorage
 from local_agent.validation import ValidationIntelligence
 
 
@@ -19,6 +22,13 @@ class CapturingProvider(AIProvider):
     def __init__(self):
         self.plan_context = None
         self.serialized_context = None
+
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {
+            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
+            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+        }
 
     def generate_plan(self, task: str, context: ProjectContext) -> Plan:
         self.plan_context = context
@@ -198,7 +208,12 @@ class Phase38Tests(unittest.TestCase):
         provider = CapturingProvider()
         config = AgentConfig.from_environment(root, max_iterations=1)
 
-        report = Orchestrator(config, provider).run("Add an About page and link it in navigation.")
+        storage = JsonFileStorage(root / ".agent_data")
+        orchestrator = Orchestrator(config, storage, None, threading.Lock(), threading.Lock())
+        from local_agent.models import ExecutionResult
+        with mock.patch("local_agent.orchestrator.build_provider", return_value=provider), \
+             mock.patch.object(orchestrator.runner, "run", return_value=ExecutionResult("mock", 0)):
+            report = orchestrator.run("Add an About page and link it in navigation.")
 
         self.assertTrue(report.completed)
         self.assertIsNotNone(report.impact)
@@ -246,10 +261,13 @@ class Phase38Tests(unittest.TestCase):
                     risk_level="low",
                 )
 
-        with unittest.mock.patch('local_agent.orchestrator.ValidationIntelligence', new=MockValidationIntelligence):
+        with mock.patch('local_agent.orchestrator.ValidationIntelligence', new=MockValidationIntelligence):
             provider = CapturingProvider()
             config = AgentConfig.from_environment(root, max_iterations=1)
-            report = Orchestrator(config, provider).run("Test task.")
+            storage = JsonFileStorage(root / ".agent_data")
+            orchestrator = Orchestrator(config, storage, None, threading.Lock(), threading.Lock())
+            with mock.patch("local_agent.orchestrator.build_provider", return_value=provider):
+                report = orchestrator.run("Test task.")
 
             self.assertTrue(report.completed)
             self.assertEqual(len(report.executions), 1)
@@ -277,10 +295,13 @@ class Phase38Tests(unittest.TestCase):
                     risk_level="low",
                 )
 
-        with unittest.mock.patch('local_agent.orchestrator.ValidationIntelligence', new=MockValidationIntelligence):
+        with mock.patch('local_agent.orchestrator.ValidationIntelligence', new=MockValidationIntelligence):
             provider = CapturingProvider()
             config = AgentConfig.from_environment(root, max_iterations=1)
-            report = Orchestrator(config, provider).run("Test task.")
+            storage = JsonFileStorage(root / ".agent_data")
+            orchestrator = Orchestrator(config, storage, None, threading.Lock(), threading.Lock())
+            with mock.patch("local_agent.orchestrator.build_provider", return_value=provider):
+                report = orchestrator.run("Test task.")
 
             self.assertFalse(report.completed) # Should not be completed due to failure
             self.assertEqual(len(report.executions), 1)

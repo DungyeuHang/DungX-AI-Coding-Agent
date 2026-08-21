@@ -194,10 +194,10 @@ key in the command line or commit it to the target project.
 
 ## Roadmap
 
-1.  **Add semantic code search and incremental project indexing. (Completed in Phase 3.15)**
-    - The agent now maintains an incremental semantic code index using tree-sitter for Python, JavaScript, and TypeScript.
+1. Add semantic code search and incremental project indexing. (Completed in Phase 3.15)
+    - The agent now maintains an incremental semantic code index with semantic code indexing using tree-sitter for Python, JavaScript, and TypeScript.
     - The context selector uses this index to find relevant files based on symbol definitions, including qualified symbol matches (e.g., `UserService.save`) and dependency-aware retrieval (including files that import or are imported by a semantically matched file).
-2.  Add more providers and provider capability negotiation.
-3.  Add approval policies and richer command permissions.
-4.  Add parallel specialist agents, CI integration, and project memory.
-5.  Add optional Git commits, pull requests, dashboard, and IDE integrations.
+2. Add more providers and provider capability negotiation.
+3. Add approval policies and richer command permissions.
+4. Add parallel specialist agents, CI integration, and project memory.
+5. Add optional Git commits, pull requests, dashboard, and IDE integrations.

@@ -131,7 +131,7 @@ class AgentConfig:
             configured_model = os.environ.get(model_env, "gemini-2.5-flash" if provider_name == "gemini" else "gpt-4.1-mini")
             if provider_name == "antigravity" and model_env not in os.environ:
                 configured_model = "gemini-3.7-flash"
-        return cls(
+        config = cls(
             project=Path(project).expanduser().resolve(),
             provider=provider_name,
             model=str(configured_model),
@@ -171,6 +171,9 @@ class AgentConfig:
             max_retry_wait_seconds=_positive_int(value("max_retry_wait_seconds", 60), "max_retry_wait_seconds"),
             metrics_enabled=_bool(value("metrics_enabled", False)),
         )
+        if config.approval_mode not in {"never", "plan_review", "always"}:
+            raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
+        return config
 
     def validate(self) -> None:
         if not self.project.is_dir():
@@ -200,7 +203,7 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-iterations", type=int, default=None)
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
-    parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING"))
+    parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
     parser.add_argument("--approval", choices=("never", "always", "policy"), default=None, help="control code change approval behavior")
     parser.add_argument("--git-pr-on-completion", type=_bool, default=None, help="[Autonomous] create a pull request on successful push")

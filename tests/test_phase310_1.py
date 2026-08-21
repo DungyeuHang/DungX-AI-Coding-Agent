@@ -9,7 +9,8 @@ from unittest import mock
 from local_agent.config import AgentConfig
 from local_agent.credentials import MockCredentialStore
 from local_agent.models import (
-    ProviderAvailability, ProviderConfig, SchedulerState, Task, TaskStatus,
+    Checkpoint, ProviderAvailability, ProviderConfig,
+    SchedulerState, Subtask, SubtaskStatus, Task, TaskPlan, TaskStatus,
 )
 from local_agent.scheduler import Scheduler
 from local_agent.storage import JsonFileStorage
@@ -95,23 +96,24 @@ class Phase310_1_Tests(unittest.TestCase):
         self.storage.save_provider_configs(provider_configs)
         self.credential_store.save("dungx-ai-coding-agent", "gemini", secret)
         task = self._create_task()
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        subtask = Subtask(subtask_id="sub-1", title="test", goal="test", status=SubtaskStatus.PENDING, created_at=now)
+        task.plan = TaskPlan(objective="Test", subtasks=[subtask])
+        self.storage.save_task(task)
 
         # Mock orchestrator to create a checkpoint
         def orchestrator_run_effect(*args, **kwargs):
-            orchestrator_instance = mock_orchestrator.return_value
-            orchestrator_instance.storage.save_task(task)
-            # Manually create a checkpoint as the real orchestrator would
-            checkpoint = __import__("local_agent.models").Checkpoint(
+            checkpoint = Checkpoint(
                 checkpoint_id="chk-1", task_id=task.task_id, subtask_id="sub-1",
-                timestamp=__import__("datetime").datetime.now(),
+                timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
                 current_state_description="test state", files_changed=[], repository_diff="",
                 validation_state={}, last_provider_result={"outcome": "TEST"},
                 next_recommended_action="resume", continuation_context={"objective": "Test"}
             )
-            orchestrator_instance.storage.save_checkpoint(checkpoint)
+            self.storage.save_checkpoint(checkpoint)
             task.latest_checkpoint_id = "chk-1"
             self.storage.save_task(task)
-            return mock.MagicMock(outcome="COMPLETED")
+            return mock.MagicMock(outcome="COMPLETED", plan_proposal=None)
         mock_orchestrator.return_value.run.side_effect = orchestrator_run_effect
 
         scheduler = Scheduler(self.base_config, self.storage, self.credential_store)

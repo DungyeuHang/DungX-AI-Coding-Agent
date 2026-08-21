@@ -55,6 +55,18 @@ class Phase313Tests(unittest.TestCase):
     def _get_config(self, **overrides) -> AgentConfig:
         return AgentConfig.from_environment(self.root, **overrides)
 
+    def _make_orchestrator(self, config=None, provider=None):
+        import threading
+        cfg = config or self._get_config()
+        prov = provider or MockProvider()
+        orch = Orchestrator(cfg, self.storage, None, threading.Lock(), threading.Lock())
+        orig_run = orch.run
+        def run_wrapped(*args, **kwargs):
+            with mock.patch("local_agent.orchestrator.build_provider", return_value=prov):
+                return orig_run(*args, **kwargs)
+        orch.run = run_wrapped
+        return orch
+
     def _create_task_with_plan(self) -> Task:
         now = datetime.datetime.now(datetime.timezone.utc)
         subtask = Subtask(subtask_id="sub1", title="Test Subtask", goal="Goal", status=SubtaskStatus.PENDING, created_at=now, updated_at=now)
@@ -75,7 +87,7 @@ class Phase313Tests(unittest.TestCase):
         
         provider = MockProviderWithDiagnostics(command_to_select=secondary_cmd, fail_repair=True)
         config = self._get_config(max_iterations=2)
-        orchestrator = Orchestrator(config, provider, self.storage)
+        orchestrator = self._make_orchestrator(config, provider)
 
         with mock.patch.object(orchestrator, "validation_intelligence") as mock_vi:
             mock_vi.select_commands.return_value = validation_plan
@@ -106,7 +118,7 @@ class Phase313Tests(unittest.TestCase):
         config = self._get_config(max_iterations=2, max_secondary_validations_per_iteration=1) # Set budget to 1
 
         with mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
-            orchestrator = Orchestrator(config, provider, self.storage)
+            orchestrator = self._make_orchestrator(config, provider)
             with mock.patch.object(orchestrator, "validation_intelligence") as mock_vi:
                 MockCommandRunner.return_value.run.side_effect = [ExecutionResult("primary", 1), ExecutionResult("secondary1", 0), ExecutionResult("primary", 1)]
                 mock_vi.select_commands.return_value = validation_plan
@@ -131,7 +143,7 @@ class Phase313Tests(unittest.TestCase):
         config = self._get_config(max_iterations=2)
 
         with mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
-            orchestrator = Orchestrator(config, provider, self.storage)
+            orchestrator = self._make_orchestrator(config, provider)
             with mock.patch.object(orchestrator, "validation_intelligence") as mock_vi:
                 MockCommandRunner.return_value.run.return_value = primary_fail
                 mock_vi.select_commands.return_value = validation_plan
@@ -157,7 +169,7 @@ class Phase313Tests(unittest.TestCase):
         config = self._get_config(max_iterations=2, max_diagnostic_output_bytes=100)
 
         with mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
-            orchestrator = Orchestrator(config, provider, self.storage)
+            orchestrator = self._make_orchestrator(config, provider)
             with mock.patch.object(orchestrator, "validation_intelligence") as mock_vi:
                 MockCommandRunner.return_value.run.side_effect = [primary_fail, secondary_result, primary_fail]
                 mock_vi.select_commands.return_value = validation_plan
@@ -185,7 +197,7 @@ class Phase313Tests(unittest.TestCase):
         provider1 = MockProviderWithDiagnostics(command_to_select=secondary_cmd)
         config = self._get_config(max_iterations=2)
         with mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
-            orchestrator1 = Orchestrator(config, provider1, self.storage)
+            orchestrator1 = self._make_orchestrator(config, provider1)
             with mock.patch.object(orchestrator1, "validation_intelligence") as mock_vi:
                 mock_vi.select_commands.return_value = validation_plan
                 MockCommandRunner.return_value.run.side_effect = [primary_fail, secondary_success]
@@ -207,11 +219,10 @@ class Phase313Tests(unittest.TestCase):
         # Run 2: Resume. The diagnostic should not run again.
         provider2 = MockProviderWithDiagnostics(command_to_select=secondary_cmd)
         with mock.patch("local_agent.orchestrator.CommandRunner") as MockCommandRunner:
-            orchestrator2 = Orchestrator(config, provider2, self.storage)
+            orchestrator2 = self._make_orchestrator(config, provider2)
             with mock.patch.object(orchestrator2, "validation_intelligence") as mock_vi, \
-                 mock.patch.object(orchestrator2, "reviewer") as mock_reviewer:
+                 mock.patch("local_agent.orchestrator.Reviewer.review", return_value=ReviewResult("APPROVED", "All good", [])):
                 mock_vi.select_commands.return_value = validation_plan
-                mock_reviewer.review.return_value = ReviewResult("APPROVED", "All good", [])
                 # On resume, only the primary validation of the *new* patch runs.
                 MockCommandRunner.return_value.run.return_value = ExecutionResult("primary", 0)
 
@@ -236,7 +247,7 @@ class Phase313Tests(unittest.TestCase):
 
         # Act: Reload the task and try to build a report (which deserializes history)
         reloaded_task = self.storage.load_task(task.task_id)
-        orchestrator = Orchestrator(self._get_config(), MockProvider(), self.storage)
+        orchestrator = self._make_orchestrator(self._get_config(), MockProvider())
         try:
             report = orchestrator._build_run_report(reloaded_task)
         except Exception as e:
@@ -266,7 +277,7 @@ class Phase313Tests(unittest.TestCase):
         self.storage.save_task(task)
 
         # Act & Assert: The orchestrator should be able to load this and not crash
-        orchestrator = Orchestrator(self._get_config(), MockProvider(), self.storage)
+        orchestrator = self._make_orchestrator(self._get_config(), MockProvider())
         try:
             # We don't need to run the full loop, just verify the initial load
             with mock.patch.object(orchestrator.provider, 'generate_code', return_value=[]):

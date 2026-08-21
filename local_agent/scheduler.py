@@ -15,8 +15,12 @@ from .models import (
     Task, TaskStatus,
 )
 from .orchestrator import Orchestrator
-from .providers import AIProvider, ProviderError, build_provider
+from .providers import (
+    AIProvider, AuthenticationError, ProviderError,
+    QuotaExceededError, RateLimitError, build_provider,
+)
 from .planner import Planner
+from .repository import RepositoryIntelligence
 from .storage import TaskStorage
 
 LOGGER = logging.getLogger(__name__)
@@ -27,17 +31,31 @@ class ProviderRegistry:
     def __init__(self):
         self.providers: dict[str, RegisteredProvider] = {}
 
-    def register(self, config: AgentConfig, priority: int) -> None:
+    def register(self, config: AgentConfig, priority: int, api_key: str | None = None) -> None:
         provider_id = config.provider
         if provider_id in self.providers:
             return
         try:
             # Instantiate provider to get its capabilities
-            provider_instance = build_provider(config)
-            capabilities = provider_instance.capabilities # This is now a property
-        except ProviderError:
-            # Cannot instantiate, assume no capabilities for now
-            capabilities = set()
+            provider_instance = build_provider(config, api_key=api_key or "dummy_key_for_capabilities")
+            capabilities = getattr(provider_instance, "capabilities", set())
+            if isinstance(capabilities, (list, tuple)):
+                capabilities = set(capabilities)
+            if not capabilities:
+                capabilities = {
+                    ProviderCapability.PLANNING,
+                    ProviderCapability.IMPLEMENTATION,
+                    ProviderCapability.REPAIR,
+                    ProviderCapability.REVIEW,
+                }
+        except Exception:
+            # Cannot instantiate, assume default capabilities for known providers
+            capabilities = {
+                ProviderCapability.PLANNING,
+                ProviderCapability.IMPLEMENTATION,
+                ProviderCapability.REPAIR,
+                ProviderCapability.REVIEW,
+            }
 
         self.providers[provider_id] = RegisteredProvider(
             provider_id=provider_id,
@@ -61,14 +79,17 @@ class Scheduler:
         for pc in provider_configs:
             if not pc.enabled:
                 continue
+            api_key = self.credential_store.get("dungx-ai-coding-agent", pc.provider_id)
             # Create a temporary AgentConfig to instantiate provider for capabilities
             temp_config = self._build_agent_config(pc)
-            self.registry.register(temp_config, pc.priority)
+            self.registry.register(temp_config, pc.priority, api_key=api_key)
             if pc.provider_id not in self.state.provider_states:
                 self.state.provider_states[pc.provider_id] = ProviderRuntimeState(provider_id=pc.provider_id, availability=ProviderAvailability.AVAILABLE)
             # Check for credentials and update availability
             if not self.credential_store.has("dungx-ai-coding-agent", pc.provider_id):
                 self.state.provider_states[pc.provider_id].availability = ProviderAvailability.NOT_CONFIGURED
+            elif self.state.provider_states[pc.provider_id].availability == ProviderAvailability.NOT_CONFIGURED:
+                self.state.provider_states[pc.provider_id].availability = ProviderAvailability.AVAILABLE
         self.storage.save_scheduler_state(self.state)
         self._running_subtasks: set[str] = set() # New for Phase 3.21: Track subtasks currently in execution
         self.planner = None # To be initialized with a selected provider
@@ -143,8 +164,8 @@ class Scheduler:
 
             planned_in_this_run = True
             
-            # Phase 3.12: After planning, if approval_mode is 'plan_review', set task to PLAN_REVIEW
-            if self.base_config.approval_mode == "plan_review":
+            # Phase 3.12: After planning, if approval_mode is 'plan_review', set task to PLAN_REVIEW (unless autonomous)
+            if not runnable_task.autonomous and self.base_config.approval_mode == "plan_review":
                 runnable_task.status = TaskStatus.PLAN_REVIEW
                 runnable_task.updated_at = datetime.datetime.now(datetime.timezone.utc)
                 self.storage.save_task(runnable_task)
@@ -184,10 +205,16 @@ class Scheduler:
                 try:
                     api_key = self.credential_store.get("dungx-ai-coding-agent", provider_config.provider)
                     if not api_key:
-                        raise ProviderError(f"No API key for {provider_config.provider}", category="AUTHENTICATION_ERROR")
+                        raise AuthenticationError(f"No API key for {provider_config.provider}")
                     
                     provider = build_provider(provider_config, api_key)
-                    orchestrator = Orchestrator(provider_config, provider, self.storage)
+                    orchestrator = Orchestrator(
+                        self._build_agent_config(provider_config),
+                        self.storage,
+                        self,
+                        self._repo_lock,
+                        self._memory_lock,
+                    )
                     report = orchestrator.run(task=runnable_task, subtask_id=next_subtask.subtask_id, progress=progress)
 
                     final_task_state = self.storage.load_task(runnable_task.task_id)
@@ -225,16 +252,40 @@ class Scheduler:
 
                 except ProviderError as e:
                     last_error = e
-                    emit(f"Provider '{provider_config.provider}' failed: {e}. Trying next available provider.")
+                    emit(f"Provider '{provider_config.provider}' failed: {e}.")
                     self._update_provider_state_after_failure(provider_config.provider, e.category, e.retry_after_seconds)
+                    if isinstance(e, (RateLimitError, QuotaExceededError)):
+                        final_task = self.storage.load_task(runnable_task.task_id)
+                        final_task.status = TaskStatus.PAUSED
+                        retry_after = e.retry_after_seconds or DEFAULT_RETRY_BACKOFF_SECONDS
+                        final_task.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=retry_after)
+                        subtask_in_task = next((s for s in final_task.plan.subtasks if s.subtask_id == next_subtask.subtask_id), None)
+                        if subtask_in_task:
+                            subtask_in_task.status = SubtaskStatus.PAUSED
+                        self.storage.save_task(final_task)
+                        subtask_completed = False
+                        break
                     continue # to next provider
 
-            if not subtask_completed:
+            if subtask_completed:
+                final_task = self.storage.load_task(runnable_task.task_id)
+                self._check_and_complete_task(final_task)
+            else:
                 final_task = self.storage.load_task(runnable_task.task_id)
                 if final_task.status not in {TaskStatus.PAUSED, TaskStatus.PLAN_PROPOSED}:
-                    emit("All available providers failed to execute the subtask.")
-                    final_task.status = TaskStatus.FAILED
-                    final_task.outcome = getattr(last_error, 'category', 'ALL_PROVIDERS_FAILED') if last_error else 'ALL_PROVIDERS_FAILED'
+                    if planned_in_this_run:
+                        final_task.status = TaskStatus.PENDING
+                    elif isinstance(last_error, (RateLimitError, QuotaExceededError)):
+                        emit("All providers failed with quota/rate limits. Pausing task.")
+                        final_task.status = TaskStatus.PAUSED
+                        final_task.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=DEFAULT_RETRY_BACKOFF_SECONDS)
+                        subtask_in_task = next((s for s in final_task.plan.subtasks if s.subtask_id == next_subtask.subtask_id), None)
+                        if subtask_in_task:
+                            subtask_in_task.status = SubtaskStatus.PAUSED
+                    else:
+                        emit("All available providers failed to execute the subtask.")
+                        final_task.status = TaskStatus.FAILED
+                        final_task.outcome = getattr(last_error, 'category', 'ALL_PROVIDERS_FAILED') if last_error else 'ALL_PROVIDERS_FAILED'
                     self.storage.save_task(final_task)
 
         finally:
@@ -249,7 +300,7 @@ class Scheduler:
         for task in tasks:
             if task.assigned_to:
                 continue
-            if task.status == TaskStatus.PENDING:
+            if task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}:
                 runnable.append(task)
             elif task.status == TaskStatus.PLAN_REVIEW and not task.plan: # If plan is missing, it needs to be generated
                 runnable.append(task)
@@ -262,7 +313,7 @@ class Scheduler:
             return None
         
         # Simple policy: oldest first
-        runnable.sort(key=lambda t: t.created_at)
+        runnable.sort(key=lambda t: (t.created_at is None, t.created_at or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)))
         return runnable[0]
 
     def _find_next_runnable_subtask(self, task: Task) -> Subtask | None:
@@ -271,7 +322,7 @@ class Scheduler:
 
         completed_ids = {s.subtask_id for s in task.plan.subtasks if s.status == SubtaskStatus.COMPLETED}
         
-        for subtask in sorted(task.plan.subtasks, key=lambda s: s.created_at):
+        for subtask in sorted(task.plan.subtasks, key=lambda s: (s.created_at is None, s.created_at or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))):
             if subtask.status in {SubtaskStatus.PENDING, SubtaskStatus.PAUSED}:
                 if all(dep_id in completed_ids for dep_id in subtask.dependencies):
                     return subtask
@@ -286,15 +337,21 @@ class Scheduler:
             task.status = TaskStatus.COMPLETED
             task.updated_at = datetime.datetime.now(datetime.timezone.utc)
             self.storage.save_task(task)
+            return
+
+        has_failed = any(s.status == SubtaskStatus.FAILED for s in task.plan.subtasks)
+        has_running = any(s.status == SubtaskStatus.RUNNING for s in task.plan.subtasks)
+        next_runnable = self._find_next_runnable_subtask(task)
+        if has_failed and not has_running and not next_runnable and task.status != TaskStatus.FAILED:
+            task.status = TaskStatus.FAILED
+            task.updated_at = datetime.datetime.now(datetime.timezone.utc)
+            self.storage.save_task(task)
 
     def _select_providers(self, task: Task, required_capabilities: set[ProviderCapability] | None = None) -> list[AgentConfig]:
         if required_capabilities is None:
-            # Default capabilities for a standard implementation subtask
+            # Default capabilities for executing an implementation subtask
             required_capabilities = {
-                ProviderCapability.PLANNING, # For sub-plan
                 ProviderCapability.IMPLEMENTATION,
-                ProviderCapability.REPAIR,
-                ProviderCapability.REVIEW,
             }
 
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -355,8 +412,10 @@ class Scheduler:
         state.cooldown_until = None
         self.storage.save_scheduler_state(self.state)
 
-    def _build_agent_config(self, provider_config: ProviderConfig) -> AgentConfig:
+    def _build_agent_config(self, provider_config: ProviderConfig | AgentConfig) -> AgentConfig:
         """Builds a full AgentConfig from a base config and a provider profile."""
+        if isinstance(provider_config, AgentConfig):
+            return provider_config
         # Create a copy of the base config and apply overrides
         final_config_dict = self.base_config.__dict__.copy()
         final_config_dict.update(provider_config.config_overrides)
@@ -380,7 +439,7 @@ class Scheduler:
         
         provider = build_provider(config, api_key)
         planner = Planner(provider) # Planner is a specialist
-        context = Orchestrator(config, self.storage, self, self._repo_lock).analyze() # Get repo context
+        context = RepositoryIntelligence(config.project).scan() # Get repo context
         
         task_plan = planner.create_task_plan(task.objective, context)
         task.plan = task_plan

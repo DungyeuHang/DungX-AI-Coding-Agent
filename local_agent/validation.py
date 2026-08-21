@@ -34,7 +34,7 @@ _ENTITY_KEYWORDS = {
 _DANGEROUS_COMMAND_PATTERNS = [
     re.compile(r"\b(rm|del)\s+.*(--force|-f)\b", re.I),
     re.compile(r"\b(git\s+(reset|clean|push|rebase|merge))\b", re.I),
-    re.compile(r"\b(db:migrate:reset|db:drop|migrate:rollback)\b", re.I), # Rails-like
+    re.compile(r"\b(db:migrate:reset|db:drop|migrate:rollback|db:reset|prisma\s+migrate\s+reset|migrate\s+reset)\b", re.I), # Rails/Prisma-like
     re.compile(r"\b(deploy|publish)\b", re.I),
 ]
 
@@ -74,19 +74,18 @@ class ValidationIntelligence:
 
         # Python projects
         if any(f.extension == ".py" for f in repo_map.files):
-                                    # unittest
-            if any("unittest" in path for path in repo_map.tests):
-                discovered.append(ValidationCommand(
-                    name="unittest",
-                    command=("python", "-m", "unittest", "discover"),
-                    category="unit_test",
-                    confidence=0.8,
-                    reason="Python unittest files detected",
-                    working_directory=".",
-                    risk="low",
-                ))
-                        # pytest
-            if any("pytest" in path for path in repo_map.tests) or (self.root / "pytest.ini").exists():
+            # unittest
+            discovered.append(ValidationCommand(
+                name="unittest",
+                command=("python", "-m", "unittest", "discover"),
+                category="unit_test",
+                confidence=0.8,
+                reason="Python unittest files detected",
+                working_directory=".",
+                risk="low",
+            ))
+            # pytest
+            if any("pytest" in path for path in repo_map.tests) or (self.root / "pytest.ini").exists() or (self.root / "requirements.txt").exists() and "pytest" in (self.root / "requirements.txt").read_text(encoding="utf-8").lower() or any("test" in path for path in repo_map.tests):
                 discovered.append(ValidationCommand(
                     name="pytest",
                     command=("pytest",),
@@ -97,7 +96,7 @@ class ValidationIntelligence:
                     risk="low",
                 ))
             # mypy
-            if (self.root / "mypy.ini").exists() or any("mypy" in f.path for f in repo_map.configuration_files):
+            if (self.root / "mypy.ini").exists() or any("mypy" in (f.path if hasattr(f, "path") else str(f)) for f in repo_map.configuration_files):
                 discovered.append(ValidationCommand(
                     name="mypy",
                     command=("mypy", "."),
@@ -152,7 +151,7 @@ class ValidationIntelligence:
         destructive = False
 
         # Check for destructive commands first
-        if any(pattern.search(lower_cmd) for pattern in _DANGEROUS_COMMAND_PATTERNS):
+        if any(pattern.search(lower_cmd) or pattern.search(lower_name) for pattern in _DANGEROUS_COMMAND_PATTERNS):
             category = "destructive"
             risk = "high"
             destructive = True
@@ -220,7 +219,7 @@ class ValidationIntelligence:
                     reasons.append(f"Included {cmd.name} (unit_test) for code changes.")
 
             # Build commands if relevant
-            if "build" in entities or any(t.role in {"create", "modify"} for t in change_impact.targets if t.relationship == "build"):
+            if "build" in entities or "page" in entities or "component" in entities or any(t.role in {"create", "modify"} for t in change_impact.targets if t.relationship in {"build", "page", "component", "router", "navigation"}):
                 for cmd in discovered_commands:
                     if cmd.category == "build" and not cmd.destructive:
                         primary_commands.append(CommandSpec(cmd.name, cmd.command, cmd.reason, cmd.category, cmd.risk, cmd.destructive))
@@ -237,25 +236,29 @@ class ValidationIntelligence:
 
         elif "fix" in intents:
             reasons.append("Task involves fixing an issue.")
-            # Prioritize tests related to affected files
-            affected_paths = {t.path for t in change_impact.targets if t.role in {"modify", "create"}}
-            for cmd in discovered_commands:
-                if cmd.category in {"unit_test", "integration_test", "e2e_test"} and not cmd.destructive:
-                    # Heuristic: if test command name or script contains keywords from affected paths
-                    cmd_keywords = _name_tokens(" ".join(cmd.command))
-                    if any(pk in cmd_keywords for path in affected_paths for pk in _name_tokens(path)):
-                        primary_commands.append(CommandSpec(cmd.name, cmd.command, cmd.reason, cmd.category, cmd.risk, cmd.destructive))
-                        reasons.append(f"Included {cmd.name} (test) as it seems related to affected files.")
-                        if cmd.risk == "medium": overall_risk = "medium"
-                    else:
-                        secondary_commands.append(CommandSpec(cmd.name, cmd.command, cmd.reason, cmd.category, cmd.risk, cmd.destructive)) # Include other tests as secondary
-
             # Type checks and linting
             for cmd in discovered_commands:
                 if cmd.category in {"type_check", "lint", "format"} and not cmd.destructive:
                     primary_commands.append(CommandSpec(cmd.name, cmd.command, cmd.reason, cmd.category, cmd.risk, cmd.destructive))
                     reasons.append(f"Included {cmd.name} ({cmd.category}) for code quality during fix.")
                     if cmd.risk == "medium": overall_risk = "medium"
+
+            # Unit tests for fix
+            for cmd in discovered_commands:
+                if cmd.category == "unit_test" and not cmd.destructive:
+                    primary_commands.append(CommandSpec(cmd.name, cmd.command, cmd.reason, cmd.category, cmd.risk, cmd.destructive))
+                    reasons.append(f"Included {cmd.name} (unit_test) for fix.")
+
+            # Build commands
+            for cmd in discovered_commands:
+                if cmd.category == "build" and not cmd.destructive:
+                    primary_commands.append(CommandSpec(cmd.name, cmd.command, cmd.reason, cmd.category, cmd.risk, cmd.destructive))
+
+            # E2E/Integration tests if navigation/routing/API/auth is affected
+            if "navigation" in entities or "route" in entities or "api" in entities or "auth" in entities:
+                for cmd in discovered_commands:
+                    if cmd.category in {"e2e_test", "integration_test"} and not cmd.destructive:
+                        secondary_commands.append(CommandSpec(cmd.name, cmd.command, cmd.reason, cmd.category, cmd.risk, cmd.destructive))
 
             # Backend-specific fixes
             if "backend" in entities or any(t.relationship == "backend" for t in change_impact.targets):
@@ -266,12 +269,17 @@ class ValidationIntelligence:
                         if cmd.risk == "medium": overall_risk = "medium"
 
         # General rules for all tasks
+        if not primary_commands and discovered_commands:
+            for cmd in discovered_commands:
+                if not getattr(cmd, "destructive", False) and getattr(cmd, "risk", "low") != "high":
+                    primary_commands.append(CommandSpec(cmd.name, cmd.command, getattr(cmd, "reason", "configured validation command"), getattr(cmd, "category", "unit_test"), getattr(cmd, "risk", "low"), getattr(cmd, "destructive", False)))
+
         for cmd in discovered_commands:
-            if cmd.destructive or cmd.risk == "high":
-                skipped_commands.append(CommandSpec(cmd.name, cmd.command, cmd.reason, cmd.category, cmd.risk, cmd.destructive))
+            if getattr(cmd, "destructive", False) or getattr(cmd, "risk", "low") == "high":
+                skipped_commands.append(CommandSpec(cmd.name, cmd.command, getattr(cmd, "reason", ""), getattr(cmd, "category", "other"), getattr(cmd, "risk", "high"), getattr(cmd, "destructive", True)))
                 reasons.append(f"Skipped {cmd.name} due to high risk or destructive nature.")
                 overall_risk = "high" # If any high risk command is discovered, overall risk is high
-            elif cmd.risk == "medium" and overall_risk == "low":
+            elif getattr(cmd, "risk", "low") == "medium" and overall_risk == "low":
                 overall_risk = "medium"
 
         # Remove duplicates and ensure order

@@ -18,6 +18,16 @@ class CommandSpec:
     def display(self) -> str:
         return " ".join(self.command)
 
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        d = dict(data)
+        if isinstance(d.get("command"), list):
+            d["command"] = tuple(d["command"])
+        return cls(**d)
+
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
@@ -326,13 +336,19 @@ class ProviderMetric:
     error_category: str = ""
     approximate_input_tokens: int = 0
     approximate_output_tokens: int = 0
+    # Actual token counts extracted from the API response (None when not reported).
+    actual_input_tokens: int | None = None
+    actual_output_tokens: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
-        return cls(**data)
+        # Accept pre-existing serialised metrics that pre-date the actual_* fields.
+        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        safe_data = {k: v for k, v in data.items() if k in known_fields}
+        return cls(**safe_data)
 
 # New for Phase 3.25
 @dataclass
@@ -386,6 +402,13 @@ class ValidationCommand:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        data = dict(data)
+        if isinstance(data.get("command"), list):
+            data["command"] = tuple(data["command"])
+        return cls(**data)
+
 @dataclass
 class ValidationPlan:
     commands: list[ValidationCommand]
@@ -397,6 +420,17 @@ class ValidationPlan:
 
     def to_dict(self) -> dict[str, Any]:
         return {"commands": [cmd.to_dict() for cmd in self.commands], "primary_commands": [cmd.to_dict() for cmd in self.primary_commands], "secondary_commands": [cmd.to_dict() for cmd in self.secondary_commands], "skipped_commands": [cmd.to_dict() for cmd in self.skipped_commands], "reasons": self.reasons, "risk_level": self.risk_level}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(
+            commands=[ValidationCommand.from_dict(c) if isinstance(c, dict) else c for c in data.get("commands", [])],
+            primary_commands=[CommandSpec.from_dict(c) if isinstance(c, dict) else c for c in data.get("primary_commands", [])],
+            secondary_commands=[CommandSpec.from_dict(c) if isinstance(c, dict) else c for c in data.get("secondary_commands", [])],
+            skipped_commands=[CommandSpec.from_dict(c) if isinstance(c, dict) else c for c in data.get("skipped_commands", [])],
+            reasons=list(data.get("reasons", [])),
+            risk_level=data.get("risk_level", "low"),
+        )
 
 @dataclass
 class Checkpoint:
@@ -732,3 +766,43 @@ class RunReport:
     proposed_diff: str = ""
     outcome: str = ""
     provider_metrics: list[ProviderMetric] = field(default_factory=list)
+    plan_proposal: PlanProposal | None = None
+
+
+class ProviderError(RuntimeError):
+    """Raised when an AI provider cannot complete a structured operation."""
+
+    category = "UNKNOWN_PROVIDER_ERROR"
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class AuthenticationError(ProviderError):
+    category = "AUTHENTICATION_ERROR"
+
+
+class RateLimitError(ProviderError):
+    category = "RATE_LIMIT"
+
+
+class QuotaExceededError(RateLimitError):
+    category = "QUOTA_EXCEEDED"
+
+
+class InvalidRequestError(ProviderError):
+    category = "INVALID_REQUEST"
+
+
+class ModelUnavailableError(ProviderError):
+    category = "MODEL_UNAVAILABLE"
+
+
+class NetworkError(ProviderError):
+    category = "NETWORK_ERROR"
+
+
+class UnknownProviderError(ProviderError):
+    category = "UNKNOWN_PROVIDER_ERROR"
+

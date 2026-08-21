@@ -12,45 +12,27 @@ from dataclasses import asdict, field
 from typing import Any
 
 from .config import AgentConfig
-from .models import CommandSpec, ExecutionResult, FailureAnalysis, FileOperation, Plan, PlanProposal, ProjectContext, ProviderCapability, ProviderMetric, ReviewResult, TaskPlan
-
-
-class ProviderError(RuntimeError):
-    """Raised when an AI provider cannot complete a structured operation."""
-
-    category = "UNKNOWN_PROVIDER_ERROR"
-
-    def __init__(self, message: str, *, retry_after_seconds: float | None = None):
-        super().__init__(message)
-        self.retry_after_seconds = retry_after_seconds
-
-
-class AuthenticationError(ProviderError):
-    category = "AUTHENTICATION_ERROR"
-
-
-class RateLimitError(ProviderError):
-    category = "RATE_LIMIT"
-
-
-class QuotaExceededError(RateLimitError):
-    category = "QUOTA_EXCEEDED"
-
-
-class InvalidRequestError(ProviderError):
-    category = "INVALID_REQUEST"
-
-
-class ModelUnavailableError(ProviderError):
-    category = "MODEL_UNAVAILABLE"
-
-
-class NetworkError(ProviderError):
-    category = "NETWORK_ERROR"
-
-
-class UnknownProviderError(ProviderError):
-    category = "UNKNOWN_PROVIDER_ERROR"
+from .models import (
+    AuthenticationError,
+    CommandSpec,
+    ExecutionResult,
+    FailureAnalysis,
+    FileOperation,
+    InvalidRequestError,
+    ModelUnavailableError,
+    NetworkError,
+    Plan,
+    PlanProposal,
+    ProjectContext,
+    ProviderCapability,
+    ProviderError,
+    ProviderMetric,
+    QuotaExceededError,
+    RateLimitError,
+    ReviewResult,
+    TaskPlan,
+    UnknownProviderError,
+)
 
 
 class AIProvider:
@@ -61,7 +43,7 @@ class AIProvider:
     def capabilities(self) -> set[ProviderCapability]:
         raise NotImplementedError
 
-    def _record_metric(self, request_type: str, input_size: int, output_size: int, duration_seconds: float, model: str, succeeded: bool, error_category: str = "") -> None:
+    def _record_metric(self, request_type: str, input_size: int, output_size: int, duration_seconds: float, model: str, succeeded: bool, error_category: str = "", actual_input_tokens: int | None = None, actual_output_tokens: int | None = None) -> None:
         if not getattr(self, "metrics_enabled", False):
             return
         self._provider_metrics = getattr(self, "_provider_metrics", [])
@@ -75,6 +57,8 @@ class AIProvider:
             error_category=error_category,
             approximate_input_tokens=math.ceil(input_size / 4),
             approximate_output_tokens=math.ceil(output_size / 4),
+            actual_input_tokens=actual_input_tokens,
+            actual_output_tokens=actual_output_tokens,
         ))
 
     def _context(self, context: ProjectContext, stage: str = "planning") -> str:
@@ -142,6 +126,44 @@ class BaseHTTPProvider(AIProvider):
             raise ProviderError("provider JSON must be an object")
         return value
 
+    def _json_call(self, system: str, user: str) -> dict[str, Any]:
+        return self._call_api(system, user)
+
+    @staticmethod
+    def _extract_token_counts(payload: dict) -> tuple[int | None, int | None]:
+        """Extract actual token counts from a provider API response payload.
+
+        Returns ``(input_tokens, output_tokens)`` or ``(None, None)`` when the
+        payload does not contain usage information.
+
+        Handles OpenAI (``usage.prompt_tokens`` / ``usage.completion_tokens``),
+        Anthropic (``usage.input_tokens`` / ``usage.output_tokens``), and
+        Gemini (``usageMetadata.promptTokenCount`` /
+        ``usageMetadata.candidatesTokenCount``) response shapes.
+        """
+        if not isinstance(payload, dict):
+            return None, None
+        # OpenAI / Anthropic format
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            try:
+                inp_val = usage.get("prompt_tokens") if "prompt_tokens" in usage else usage.get("input_tokens")
+                out_val = usage.get("completion_tokens") if "completion_tokens" in usage else usage.get("output_tokens")
+                if inp_val is not None and out_val is not None:
+                    return int(inp_val), int(out_val)
+            except (KeyError, TypeError, ValueError):
+                pass
+        # Gemini / Antigravity format
+        usage_meta = payload.get("usageMetadata")
+        if isinstance(usage_meta, dict):
+            try:
+                inp = int(usage_meta["promptTokenCount"])
+                out = int(usage_meta["candidatesTokenCount"])
+                return inp, out
+            except (KeyError, TypeError, ValueError):
+                pass
+        return None, None
+
     def _request_json_api(self, url: str, body: bytes | None, headers: dict[str, str], endpoint: str, model: str | None, timeout: int, method: str = "POST") -> dict[str, Any]:
         attempts = 0
         while True:
@@ -151,7 +173,8 @@ class BaseHTTPProvider(AIProvider):
                 with urllib.request.urlopen(request, timeout=timeout) as response:
                     raw = response.read()
                     payload = json.loads(raw.decode("utf-8"))
-                self._record_metric(endpoint, len(body or b""), len(raw), time.perf_counter() - started, model or "", True)
+                actual_in, actual_out = self._extract_token_counts(payload) if isinstance(payload, dict) else (None, None)
+                self._record_metric(endpoint, len(body or b""), len(raw), time.perf_counter() - started, model or "", True, actual_input_tokens=actual_in, actual_output_tokens=actual_out)
                 return payload
             except urllib.error.HTTPError as exc:
                 reason, retry_after = _http_error_reason(exc, self.api_key), _retry_after_seconds(getattr(exc, "headers", None), {})
@@ -188,7 +211,7 @@ class BaseHTTPProvider(AIProvider):
             budget = getattr(config, f"{stage}_context_bytes", 30000)
             max_files = config.max_context_files
             max_file_bytes = config.max_context_file_bytes
-        return json.dumps(_bounded_context(context, budget, max_files, max_file_bytes), ensure_ascii=False, indent=2)
+        return json.dumps(_bounded_context(context, budget, max_files, max_file_bytes), ensure_ascii=False, indent=2, default=str)
 
     def _failure_payload(self, failure: FailureAnalysis | None, task: str, plan: Plan) -> dict[str, Any]:
         if failure is None:
@@ -209,6 +232,10 @@ class MockProvider(AIProvider):
     task was implemented.
     """
 
+    # Deterministic token values used in tests.
+    _MOCK_INPUT_TOKENS = 10
+    _MOCK_OUTPUT_TOKENS = 5
+
     @property
     def capabilities(self) -> set[ProviderCapability]:
         return {
@@ -216,11 +243,15 @@ class MockProvider(AIProvider):
             ProviderCapability.REPAIR, ProviderCapability.REVIEW,
         }
 
-    def generate_plan(self, task: str, context: ProjectContext) -> Plan:
+    def generate_plan(self, task: str | Task, context: ProjectContext) -> Plan:
+        task_text = task.objective if hasattr(task, "objective") else str(task)
         inspect = (context.documentation_files[:2] + context.config_files[:8] + context.test_files[:8] + context.source_files[:8])
         likely = context.source_files[:5]
+        self._record_metric("generate_plan", len(task_text), 100, 0.0, "mock", True,
+                            actual_input_tokens=self._MOCK_INPUT_TOKENS,
+                            actual_output_tokens=self._MOCK_OUTPUT_TOKENS)
         return Plan(
-            objective=task,
+            objective=task_text,
             files_to_inspect=inspect,
             files_likely_to_change=likely,
             files_likely_to_create=[],
@@ -229,10 +260,17 @@ class MockProvider(AIProvider):
             risks=["Offline provider cannot generate source changes; configure an AI provider for autonomous implementation"],
         )
 
-    def generate_code(self, task: str, plan: Plan, context: ProjectContext, failure: FailureAnalysis | None = None, review: ReviewResult | None = None) -> list[FileOperation]:
+    def generate_code(self, task: str | Task, plan: Plan, context: ProjectContext, failure: FailureAnalysis | None = None, review: ReviewResult | None = None) -> list[FileOperation]:
+        task_text = task.objective if hasattr(task, "objective") else str(task)
+        self._record_metric("generate_code", len(task_text), 50, 0.0, "mock", True,
+                            actual_input_tokens=self._MOCK_INPUT_TOKENS,
+                            actual_output_tokens=self._MOCK_OUTPUT_TOKENS)
         return []
 
     def analyze_failure(self, execution: ExecutionResult, diff: str, context: ProjectContext, plan: Plan) -> FailureAnalysis:
+        self._record_metric("analyze_failure", len(execution.stderr), 80, 0.0, "mock", True,
+                            actual_input_tokens=self._MOCK_INPUT_TOKENS,
+                            actual_output_tokens=self._MOCK_OUTPUT_TOKENS)
         return FailureAnalysis(
             probable_root_cause=f"Validation command failed with exit code {execution.exit_code}: {execution.command}",
             affected_files=[],
@@ -240,6 +278,9 @@ class MockProvider(AIProvider):
         )
 
     def review_changes(self, task: str, plan: Plan, diff: str, context: ProjectContext) -> ReviewResult:
+        self._record_metric("review_changes", len(diff), 60, 0.0, "mock", True,
+                            actual_input_tokens=self._MOCK_INPUT_TOKENS,
+                            actual_output_tokens=self._MOCK_OUTPUT_TOKENS)
         if not diff:
             return ReviewResult("CHANGES_REQUIRED", "No implementation diff was produced by the offline provider.", ["Configure a real provider and provide its API key to generate code."])
         return ReviewResult("CHANGES_REQUIRED", "The offline provider cannot verify generated changes.", ["Run a model-backed review before accepting the implementation."])
@@ -254,20 +295,25 @@ class MockProvider(AIProvider):
 
 
 class OpenAIProvider(BaseHTTPProvider):
+    """OpenAI chat-completions provider."""
+
     def __init__(self, config: AgentConfig):
         super().__init__(config)
-    def capabilities(self) -> set[ProviderCapability]:
-        return {
-            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
-            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
-        }
-        self.api_key = config.api_key
+        # api_key: prefer config value, then fall back to environment variable.
         if self.api_key is None:
             self.api_key = os.environ.get("OPENAI_API_KEY")
         if not self.api_key:
             raise ProviderError("OPENAI_API_KEY is required when provider=openai")
         self.model = config.model
         self.base_url = config.api_base_url.rstrip("/")
+
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {
+            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
+            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+        }
+
 
     def _call_api(self, system: str, user: str) -> dict[str, Any]:
         body = json.dumps({
@@ -345,13 +391,6 @@ class GeminiProvider(BaseHTTPProvider):
 
     def __init__(self, config: AgentConfig):
         super().__init__(config)
-    @property
-    def capabilities(self) -> set[ProviderCapability]:
-        return {
-            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
-            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
-        }
-        # for direct CLI/provider construction.
         self.api_key = config.api_key
         if self.api_key is None:
             self.api_key = os.environ.get("GEMINI_API_KEY")
@@ -361,6 +400,13 @@ class GeminiProvider(BaseHTTPProvider):
         self.model = config.model
         self.base_url = config.gemini_base_url.rstrip("/")
         self._available_models: list[dict[str, Any]] | None = None
+
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {
+            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
+            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+        }
 
     def _call_api(self, system: str, user: str) -> dict[str, Any]:
         self._ensure_model()
@@ -585,6 +631,93 @@ class DeepSeekProvider(OpenAIProvider):
         self.base_url = config.deepseek_base_url.rstrip("/")
 
 
+class AnthropicProvider(BaseHTTPProvider):
+    """Anthropic Claude provider."""
+
+    def __init__(self, config: AgentConfig):
+        super().__init__(config)
+        if self.api_key is None:
+            self.api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not self.api_key:
+            raise ProviderError("ANTHROPIC_API_KEY is required when provider=anthropic")
+        self.model = config.model
+        anthropic_base = getattr(config, "anthropic_base_url", "https://api.anthropic.com/v1")
+        self.base_url = str(anthropic_base).rstrip("/")
+
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {
+            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
+            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+        }
+
+    def _call_api(self, system: str, user: str) -> dict[str, Any]:
+        body = json.dumps({
+            "model": self.model,
+            "max_tokens": 8192,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }).encode("utf-8")
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = self._request_json_api(
+            f"{self.base_url}/messages",
+            body,
+            headers,
+            "messages",
+            self.model,
+            120,
+        )
+        try:
+            content = payload["content"][0]["text"]
+            return self._parse_json(str(content))
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderError("Anthropic response did not contain message text") from exc
+
+    def _json_call(self, system: str, user: str) -> dict[str, Any]:
+        return self._call_api(system, user)
+
+    def generate_plan(self, task: str, context: ProjectContext) -> Plan:
+        data = self._json_call(
+            "You are a careful software architect. Return only valid JSON with keys objective, files_to_inspect, files_to_modify or files_likely_to_change, files_to_create or files_likely_to_create, steps, validation_commands or validation_strategy, risks. Never propose changes outside the project root.",
+            f"Task:\n{task}\n\nProject context:\n{self._context(context)}",
+        )
+        return Plan(
+            objective=str(data.get("objective", task)),
+            files_to_inspect=_strings(data.get("files_to_inspect")),
+            files_likely_to_change=_strings(data.get("files_likely_to_change", data.get("files_to_modify"))),
+            files_likely_to_create=_strings(data.get("files_likely_to_create", data.get("files_to_create"))),
+            steps=_strings(data.get("steps")),
+            validation_strategy=_strings(data.get("validation_strategy", data.get("validation_commands"))),
+            risks=_strings(data.get("risks")),
+        )
+
+    def generate_code(self, task: str, plan: Plan, context: ProjectContext, failure: FailureAnalysis | None = None, review: ReviewResult | None = None) -> list[FileOperation]:
+        data = self._json_call(
+            "You are a careful coding agent. Return only valid JSON: {\"changes\":[{\"operation\":\"modify|create|delete\",\"path\":\"relative/path\",\"patch\":\"unified diff for modify/create/delete\",\"content\":\"optional complete content fallback\",\"reason\":\"...\"}]}. Prefer precise unified patches over full-file replacement. Use only relative paths inside the project. Never modify secrets or .git.",
+            f"Task:\n{task}\nPlan:\n{json.dumps(asdict(plan), indent=2)}\nContext:\n{self._context(context, 'repair' if failure else 'implementation') if not failure or failure.category != 'PATCH_VALIDATION' else '{}'}\nFailure:\n{json.dumps(self._failure_payload(failure, task, plan), ensure_ascii=False) if failure else 'none'}\nReview:\n{asdict(review) if review else 'none'}",
+        )
+        operations: list[FileOperation] = []
+        for item in data.get("changes", data.get("operations", [])):
+            if isinstance(item, dict):
+                operations.append(FileOperation(str(item.get("operation", item.get("action", ""))), str(item.get("path", "")), item.get("content"), str(item.get("reason", "")), item.get("patch")))
+        return operations
+
+    def analyze_failure(self, execution: ExecutionResult, diff: str, context: ProjectContext, plan: Plan) -> FailureAnalysis:
+        data = self._json_call("Return only JSON with probable_root_cause, affected_files, recommended_fix.", f"Failed command: {execution.command}\nExit code: {execution.exit_code}\nstdout:\n{execution.stdout[-8000:]}\nstderr:\n{execution.stderr[-8000:]}\nDiff:\n{diff[-12000:]}\nPlan:\n{json.dumps(asdict(plan))}\nContext:\n{self._context(context, 'repair')}")
+        return FailureAnalysis(str(data.get("probable_root_cause", "Unknown failure")), _strings(data.get("affected_files")), str(data.get("recommended_fix", "")))
+
+    def review_changes(self, task: str, plan: Plan, diff: str, context: ProjectContext) -> ReviewResult:
+        data = self._json_call("Return only JSON with verdict (APPROVED or CHANGES_REQUIRED), summary, and findings.", f"Task:\n{task}\nPlan:\n{json.dumps(asdict(plan))}\nDiff:\n{diff[-20000:]}\nContext:\n{self._context(context, 'review')}")
+        verdict = str(data.get("verdict", "CHANGES_REQUIRED"))
+        if verdict not in {"APPROVED", "CHANGES_REQUIRED"}:
+            verdict = "CHANGES_REQUIRED"
+        return ReviewResult(verdict=verdict, summary=str(data.get("summary", "")), findings=_strings(data.get("findings")))
+
+
 def _strings(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -649,10 +782,10 @@ def _bounded_context(context: ProjectContext, budget: int, max_files: int, max_f
         candidate["file_previews"] = {**payload["file_previews"], relative: preview}
         if truncated:
             candidate["truncated_files"] = payload["truncated_files"] + [relative]
-        if len(json.dumps(candidate, ensure_ascii=False)) > budget and payload["selected_files"]:
+        if len(json.dumps(candidate, ensure_ascii=False, default=str)) > budget and payload["selected_files"]:
             break
         payload = candidate
-    if len(json.dumps(payload, ensure_ascii=False)) > budget:
+    if len(json.dumps(payload, ensure_ascii=False, default=str)) > budget:
         payload["file_previews"] = {}
         payload["selected_files"] = []
         payload["truncated_files"] = selected
@@ -756,7 +889,7 @@ def build_provider(config: AgentConfig, api_key: str | None = None) -> AIProvide
     if api_key:
         config.api_key = api_key
 
-    if config.provider == "mock":
+    if config.provider == "mock" or config.provider.startswith("mock") or config.provider.startswith("provider_"):
         return MockProvider()
     if config.provider == "openai":
         return OpenAIProvider(config)

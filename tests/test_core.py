@@ -60,9 +60,9 @@ class CoreTests(unittest.TestCase):
     def test_planner_and_mock_provider_are_real_structured_operations(self):
         with tempfile.TemporaryDirectory() as directory:
             context = RepositoryAnalyzer(directory).analyze()
-            plan = Planner(MockProvider()).create_plan("Add a feature", context)
-            self.assertEqual(plan.objective, "Add a feature")
-            self.assertEqual(MockProvider().generate_code("Add a feature", plan, context), [])
+            task_plan = Planner(MockProvider()).create_task_plan("Add a feature", context)
+            self.assertEqual(task_plan.objective, "Add a feature")
+            self.assertEqual(MockProvider().generate_code("Add a feature", task_plan, context), [])
 
     def test_failure_result_is_not_marked_success(self):
         result = ExecutionResult("python -c fail", 1, stderr="boom")

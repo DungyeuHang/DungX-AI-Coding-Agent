@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -58,12 +60,16 @@ class AutonomousTestProvider(AIProvider):
                 ]
 
         # Initial implementation
-        if self.initial_code_is_buggy:
-            return [FileOperation("modify", "app.py", content='def main():\n    print("buggy")')]
+        test_file_content = 'import unittest\nfrom unittest.mock import patch\nfrom io import StringIO\nfrom app import main\n\nclass TestApp(unittest.TestCase):\n    def test_main(self):\n        with patch("sys.stdout", new=StringIO()) as fake_out:\n            main()\n            self.assertEqual(fake_out.getvalue().strip(), "hello world")\n'
+        if self.initial_code_is_buggy or self.always_fail:
+            return [
+                FileOperation("modify", "app.py", content='def main():\n    print("buggy")'),
+                FileOperation("create", "test_app.py", content=test_file_content),
+            ]
         else:
             return [
                 FileOperation("modify", "app.py", content='def main():\n    print("hello world")'),
-                FileOperation("create", "test_app.py", content='import unittest\nfrom unittest.mock import patch\nfrom io import StringIO\nfrom app import main\n\nclass TestApp(unittest.TestCase):\n    def test_main(self):\n        with patch("sys.stdout", new=StringIO()) as fake_out:\n            main()\n            self.assertEqual(fake_out.getvalue().strip(), "hello world")\n'),
+                FileOperation("create", "test_app.py", content=test_file_content),
             ]
 
     def analyze_failure(self, execution, diff, context, plan):

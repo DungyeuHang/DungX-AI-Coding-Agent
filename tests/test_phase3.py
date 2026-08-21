@@ -63,6 +63,19 @@ class _PatchThenQuotaProvider(AIProvider):
         return ReviewResult("APPROVED", "ok")
 
 
+def _make_orchestrator(config, provider):
+    import threading
+    from local_agent.storage import JsonFileStorage
+    storage = JsonFileStorage(config.project / ".agent_data")
+    orch = Orchestrator(config, storage, None, threading.Lock(), threading.Lock())
+    orig_run = orch.run
+    def run_wrapped(*args, **kwargs):
+        with mock.patch("local_agent.orchestrator.build_provider", return_value=provider):
+            return orig_run(*args, **kwargs)
+    orch.run = run_wrapped
+    return orch
+
+
 class Phase3Tests(unittest.TestCase):
     def test_invalid_patch_then_quota_preserves_file_and_stops_repair(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -73,7 +86,7 @@ class Phase3Tests(unittest.TestCase):
             provider = _PatchThenQuotaProvider()
             config = AgentConfig.from_environment(root, provider_max_retries=0, max_iterations=5)
 
-            report = Orchestrator(config, provider).run("Keep addition correct")
+            report = _make_orchestrator(config, provider).run("Keep addition correct")
 
             self.assertEqual(target.read_text(encoding="utf-8"), original)
             self.assertEqual(provider.calls, 2)

@@ -28,15 +28,17 @@ from .models import (
     ProjectMemory,
     Memory,
     ProjectContext,
+    ProviderCapability,
     RunReport,
     Subtask,
     SubtaskStatus,
+    Task,
     TaskStatus,
     ValidationPlan,
 )
 from .models import MemoryCategory
 from .planner import GraphValidator, Planner
-from .providers import AIProvider, ProviderError, QuotaExceededError, RateLimitError
+from .providers import AIProvider, ProviderError, QuotaExceededError, RateLimitError, build_provider
 from .repository import RepositoryIntelligence
 from .reviewer import Reviewer
 from .validation import ValidationIntelligence
@@ -63,11 +65,14 @@ class Orchestrator:
     def analyze(self):
         return self.analyzer.analyze()
 
-    def run(self, task: Task, subtask_id: str, progress=None, approval_callback=None) -> RunReport: # Modified signature for Phase 3.11
+    def run(self, task: Task | str, subtask_id: str | None = None, progress=None, approval_callback=None) -> RunReport:
         def emit(message: str) -> None:
             LOGGER.info(message)
             if progress:
                 progress(message)
+
+        if isinstance(task, str):
+            task = self._create_new_task(task)
 
         emit("[1/7] Analyzing project...")
         context = self.analyzer.scan()
@@ -88,24 +93,58 @@ class Orchestrator:
         emit("[2.5/7] Analyzing change impact...")
         impact = self.impact_analyzer.analyze(task.objective, context)
         context.metadata["change_impact"] = impact.to_dict()
+        context.metadata["current_subtask_id"] = subtask_id
 
-        report = RunReport(project=context)
+        report = RunReport(project=context, task_id=task.task_id, subtask_id=subtask_id)
         report.impact = impact
         current_subtask = next((s for s in (task.plan.subtasks if task.plan else []) if s.subtask_id == subtask_id), None)
         task.current_subtask_id = subtask_id
 
+        discovered_commands = self.validation_intelligence.discover_commands(context.repository_map) if context.repository_map else []
+        for cmd in (getattr(context, "validation_commands", None) or []):
+            if cmd not in discovered_commands:
+                discovered_commands.append(cmd)
+        validation_plan = self.validation_intelligence.select_commands(
+            task.objective, impact, discovered_commands
+        )
+        report.validation_plan = validation_plan
+        context.metadata["validation_plan"] = validation_plan.to_dict()
+
         try:
             emit("[3/7] Creating implementation plan...")
-            plan = self._execute_with_specialist(
-                task,
-                ProviderCapability.PLANNING,
-                lambda provider: Planner(provider).create_subtask_plan(current_subtask, context),
-                "planning"
-            )
+            if current_subtask:
+                plan = self._execute_with_specialist(
+                    task,
+                    ProviderCapability.PLANNING,
+                    lambda provider: Planner(provider).create_subtask_plan(current_subtask, context),
+                    "planning"
+                )
+            else:
+                raw_plan = self._execute_with_specialist(
+                    task,
+                    ProviderCapability.PLANNING,
+                    lambda provider: provider.generate_plan(task.objective, context),
+                    "planning"
+                )
+                if isinstance(raw_plan, Plan):
+                    plan = raw_plan
+                elif isinstance(raw_plan, dict):
+                    plan = Plan.from_dict(raw_plan)
+                else:
+                    plan = Plan(summary=task.objective, steps=[str(task.objective)])
             if plan is None:
                 raise ProviderError("No available provider for planning")
+        except (RateLimitError, QuotaExceededError) as exc:
+            self._handle_temporary_provider_error(task, current_subtask, exc, "planning provider request failed", context)
+            emit(f"[3/7] Provider temporarily unavailable: {task.outcome}. Task paused.")
+            return self._build_run_report(task)
         except ProviderError as exc:
             self._record_provider_failure(task, current_subtask, exc, "planning provider request failed")
+            task.status = TaskStatus.FAILED
+            if current_subtask:
+                current_subtask.status = SubtaskStatus.FAILED
+                current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
+            report.outcome = task.outcome
             emit(f"[3/7] Provider stopped the run: {report.outcome}")
             return report
         except Exception as e:
@@ -128,44 +167,43 @@ class Orchestrator:
         if current_subtask and current_subtask.latest_checkpoint_id:
             try:
                 checkpoint = self.storage.load_checkpoint(current_subtask.latest_checkpoint_id)
-                current_diagnostic_evidence = [ExecutionResult.from_dict(d) for d in checkpoint.continuation_context.get("diagnostic_evidence", [])]
-                executed_diagnostic_names_this_iteration = list( # Ensure it's a list for mutability
-                    checkpoint.continuation_context.get("executed_diagnostic_names_this_iteration", [])
-                )
-                # Load the last failure from checkpoint to continue repair iterations
-                last_failures = checkpoint.continuation_context.get("validation_state", {}).get("last_failures", [])
-                if last_failures:
-                    failure = FailureAnalysis.from_dict(last_failures[0])
-                else:
-                    failure = None
+                if checkpoint is not None:
+                    current_diagnostic_evidence = [ExecutionResult.from_dict(d) for d in checkpoint.continuation_context.get("diagnostic_evidence", [])]
+                    executed_diagnostic_names_this_iteration = list( # Ensure it's a list for mutability
+                        checkpoint.continuation_context.get("executed_diagnostic_names_this_iteration", [])
+                    )
+                    # Load the last failure from checkpoint to continue repair iterations
+                    last_failures = checkpoint.continuation_context.get("validation_state", {}).get("last_failures", [])
+                    if last_failures:
+                        failure = FailureAnalysis.from_dict(last_failures[0])
+                    else:
+                        failure = None
             except FileNotFoundError:
                 pass  # Checkpoint may be missing if the task is new or corrupted
 
-        validation_plan = self.validation_intelligence.select_commands(
-            task.objective, impact, list(getattr(context, "validation_commands", None) or [])
-        )
-        
-        # Phase 3.23: Seed the first iteration with CI failure context if available
-        if iteration == 1 and task.initial_failure_context:
-            emit("[5/7] Seeding repair cycle with initial CI failure context.")
-            ci_context = task.initial_failure_context
-            initial_execution = ExecutionResult(
-                command=ci_context.failed_command,
-                exit_code=ci_context.exit_code,
-                stdout=ci_context.stdout,
-                stderr=ci_context.stderr
-            )
-            failure = FailureAnalysis(
-                probable_root_cause="Initial failure provided by CI environment.",
-                recommended_fix="Analyze the provided logs and fix the issue.",
-                diagnostic_evidence=[initial_execution]
-            )
-            task.initial_failure_context = None # Consume the context
-            self.storage.save_task(task)
 
         try:
             for iteration in range(1, self.config.max_iterations + 1):
                 report.iterations = iteration
+
+                # Phase 3.23: Seed the first iteration with CI failure context if available.
+                if iteration == 1 and task.initial_failure_context:
+                    emit("[5/7] Seeding repair cycle with initial CI failure context.")
+                    ci_context = task.initial_failure_context
+                    initial_execution = ExecutionResult(
+                        command=ci_context.failed_command,
+                        exit_code=ci_context.exit_code,
+                        stdout=ci_context.stdout,
+                        stderr=ci_context.stderr
+                    )
+                    failure = FailureAnalysis(
+                        probable_root_cause="Initial failure provided by CI environment.",
+                        recommended_fix="Analyze the provided logs and fix the issue.",
+                        diagnostic_evidence=[initial_execution]
+                    )
+                    task.initial_failure_context = None  # Consume the context
+                    self.storage.save_task(task)
+
                 emit("[4/7] Implementing changes..." if iteration == 1 else f"[5/7] Applying repair for iteration {iteration}...")
                 try:
                     operations = self._execute_with_specialist(
@@ -176,17 +214,32 @@ class Orchestrator:
                     )
                 except ProviderError as exc:
                     self._record_provider_failure(task, current_subtask, exc, "implementation provider request failed")
+                    report.outcome = task.outcome
+                    report.failures.append(
+                        FailureAnalysis(
+                            probable_root_cause="implementation provider request failed",
+                            recommended_fix=str(exc),
+                            category=getattr(exc, "category", "PROVIDER_ERROR"),
+                            details={"retry_after_seconds": getattr(exc, "retry_after_seconds", None)},
+                        )
+                    )
                     emit(f"[4/7] Provider stopped the run: {report.outcome}")
                     if isinstance(exc, (RateLimitError, QuotaExceededError)):
                         task.status = TaskStatus.PAUSED
-                        current_subtask.status = SubtaskStatus.PAUSED
-                        current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                        if current_subtask:
+                            current_subtask.status = SubtaskStatus.PAUSED
+                            current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
                         # Create a checkpoint to preserve failure state and diagnostic state for resumption
                         extra_context = {
                             'diagnostic_evidence': [e.to_dict() for e in current_diagnostic_evidence],
                             'executed_diagnostic_names_this_iteration': executed_diagnostic_names_this_iteration
                         }
-                        self._create_checkpoint(task, current_subtask, f"Paused due to provider error during repair", context, report, extra_context=extra_context)
+                        self._create_checkpoint(task, current_subtask, "After code generation (Paused due to provider error)", context, report, extra_context=extra_context)
+                    else:
+                        task.status = TaskStatus.FAILED
+                        if current_subtask:
+                            current_subtask.status = SubtaskStatus.FAILED
+                            current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     break
                 try:
                     prepared = coding_agent.prepare(operations, plan)
@@ -245,7 +298,8 @@ class Orchestrator:
                 emit("[5/7] Running validation...")
                 executions = self._validate(validation_plan)
                 report.executions.extend(executions)
-                task.execution_history.extend([{"type": "execution", "subtask_id": current_subtask.subtask_id, "execution": exec.to_dict()} for exec in executions]) # Record executions
+                sub_id = current_subtask.subtask_id if current_subtask else None
+                task.execution_history.extend([{"type": "execution", "subtask_id": sub_id, "execution": exec.to_dict()} for exec in executions]) # Record executions
                 self.storage.save_task(task)
                 failed = next((result for result in executions if not result.succeeded), None)
                 if failed is not None:
@@ -261,7 +315,8 @@ class Orchestrator:
                             if not available_diagnostics:
                                 break
 
-                            selected_cmd_spec = self.provider.select_diagnostic_command(current_subtask.goal, plan, context, failed, available_diagnostics)
+                            target_goal = current_subtask.goal if current_subtask else task.objective
+                            selected_cmd_spec = self.provider.select_diagnostic_command(target_goal, plan, context, failed, available_diagnostics)
 
                             if selected_cmd_spec is None or selected_cmd_spec not in available_diagnostics:
                                 emit("[5.2/7] Provider did not select a valid diagnostic command. Proceeding to repair.")
@@ -329,7 +384,7 @@ class Orchestrator:
                     report.review = self._execute_with_specialist(
                         task,
                         ProviderCapability.REVIEW,
-                        lambda provider: Reviewer(provider).review(current_subtask.goal, plan, coding_agent.diff() or self.git.diff(), context),
+                        lambda provider: Reviewer(provider).review(current_subtask.goal if current_subtask else task.objective, plan, coding_agent.diff() or self.git.diff(), context),
                         "review"
                     )
                 except (RateLimitError, QuotaExceededError) as exc: # Handle temporary provider errors
@@ -352,22 +407,30 @@ class Orchestrator:
             # Status setting logic moved outside the loop to ensure it always runs
             if not report.plan_proposal:
                 if report.completed:
-                    task.status = TaskStatus.COMPLETED
-                    current_subtask.status = SubtaskStatus.COMPLETED
+                    if current_subtask:
+                        current_subtask.status = SubtaskStatus.COMPLETED
+                        current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     # Phase 3.24: Persist changed files on successful completion
-                    task.changed_files = sorted(list(set(report.changed_files)))
-                    current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                    task.changed_files = sorted(list(set(task.changed_files + report.changed_files)))
+                    if task.plan and all(s.status == SubtaskStatus.COMPLETED for s in task.plan.subtasks):
+                        task.status = TaskStatus.COMPLETED
+                    elif not task.plan:
+                        task.status = TaskStatus.COMPLETED
+                    else:
+                        task.status = TaskStatus.PENDING
                 else:
                     if task.status != TaskStatus.PAUSED: # Only set FAILED if not already paused
                         task.status = TaskStatus.FAILED
-                        current_subtask.status = SubtaskStatus.FAILED
-                        current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                        if current_subtask:
+                            current_subtask.status = SubtaskStatus.FAILED
+                            current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
 
         except Exception as e:
             LOGGER.exception("Unhandled exception during task execution: %s", e)
             task.status = TaskStatus.FAILED
-            current_subtask.status = SubtaskStatus.FAILED
-            current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
+            if current_subtask:
+                current_subtask.status = SubtaskStatus.FAILED
+                current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
             report.outcome = "UNHANDLED_EXCEPTION"
             report.failures.append(FailureAnalysis(probable_root_cause="Unhandled exception", recommended_fix=str(e)))
         finally:
@@ -390,17 +453,14 @@ class Orchestrator:
                 
                 self._create_memories_from_run(task, report)
             all_metrics = []
-            # This is a simplification; a more robust implementation would track providers used per stage
-            # For now, we'll just grab metrics from all known providers in the registry.
-            for reg_provider in self.scheduler.registry.providers.values():
-                try:
-                    # This is not ideal as it re-builds providers, but it's a way to access metrics
-                    # without a major refactor of how providers are held.
-                    provider_instance = self.scheduler._build_provider_instance(reg_provider.provider_id)
-                    if provider_instance:
-                        all_metrics.extend(provider_instance.provider_metrics)
-                except Exception:
-                    pass # Ignore if a provider can't be built
+            if self.scheduler is not None and getattr(self.scheduler, "registry", None):
+                for reg_provider in self.scheduler.registry.providers.values():
+                    try:
+                        provider_instance = self.scheduler._build_provider_instance(reg_provider.provider_id)
+                        if provider_instance:
+                            all_metrics.extend(provider_instance.provider_metrics)
+                    except Exception:
+                        pass # Ignore if a provider can't be built
 
             task.updated_at = datetime.datetime.now(datetime.timezone.utc)
             self.storage.save_task(task)
@@ -408,18 +468,22 @@ class Orchestrator:
             task.provider_execution_history.extend(report.provider_metrics) # Add to task history
             self.storage.save_task(task) # Save task with updated metrics
 
-        return self._build_run_report(task)
+            report.task_id = task.task_id
+            report.subtask_id = current_subtask.subtask_id if current_subtask else None
+            if not report.outcome and task.outcome:
+                report.outcome = task.outcome
+
+        return report
 
     def _select_specialists(self, task: Task, capability: ProviderCapability):
-        provider_configs = self.scheduler._select_providers(task, {capability})
-        for provider_config in provider_configs:
-            try:
+        if self.scheduler is not None:
+            provider_configs = self.scheduler._select_providers(task, {capability})
+            for provider_config in provider_configs:
                 provider = self.scheduler._build_provider_instance(provider_config.provider)
                 if provider:
                     yield provider
-            except Exception as e:
-                LOGGER.error("Failed to build provider %s: %s", provider_config.provider, e)
-                continue
+            return
+        yield build_provider(self.config)
 
     def _execute_with_specialist(self, task: Task, capability: ProviderCapability, action, stage_name: str):
         for provider in self._select_specialists(task, capability):
@@ -488,6 +552,9 @@ class Orchestrator:
             LOGGER.exception(f"An unexpected error occurred during PR creation: {e}")
 
     def _create_memories_from_run(self, task: Task, report: RunReport):
+        if task.autonomous and self.config.git_commit_on_completion:
+            self._perform_git_commit(task)
+
         if not self.config.memory_enabled or not report.changed_files:
             return
 
@@ -523,7 +590,7 @@ class Orchestrator:
             updated_at=now,
         )
 
-    def _create_checkpoint(self, task: Task, subtask: Subtask, description: str, context: ProjectContext, report: RunReport, extra_context: dict[str, Any] | None = None) -> Checkpoint:
+    def _create_checkpoint(self, task: Task, subtask: Subtask | None, description: str, context: ProjectContext, report: RunReport, extra_context: dict[str, Any] | None = None) -> Checkpoint:
         checkpoint_id = str(uuid.uuid4())
         now = datetime.datetime.now(datetime.timezone.utc)
 
@@ -531,7 +598,7 @@ class Orchestrator:
         # Generate provider-agnostic continuation context
         continuation_context = {
             "task_objective": task.objective,
-            "current_subtask_goal": subtask.goal,
+            "current_subtask_goal": subtask.goal if subtask else None,
             "completed_subtasks_summary": [s.title for s in subtasks_in_plan if s.status == SubtaskStatus.COMPLETED],
             "current_progress_description": description,
             "modified_files_summary": sorted(list(set(report.changed_files))),
@@ -551,7 +618,7 @@ class Orchestrator:
         checkpoint = Checkpoint(
             checkpoint_id=checkpoint_id,
             task_id=task.task_id,
-            subtask_id=subtask.subtask_id,
+            subtask_id=subtask.subtask_id if subtask else "",
             timestamp=now,
             current_state_description=description,
             files_changed=sorted(list(set(report.changed_files))),
@@ -562,7 +629,9 @@ class Orchestrator:
             continuation_context=continuation_context,
         )
         self.storage.save_checkpoint(checkpoint)
-        subtask.latest_checkpoint_id = checkpoint_id # Save on subtask
+        task.latest_checkpoint_id = checkpoint_id
+        if subtask:
+            subtask.latest_checkpoint_id = checkpoint_id # Save on subtask
         self.storage.save_task(task)
         return checkpoint
 
@@ -576,16 +645,18 @@ class Orchestrator:
         self._create_checkpoint(task, subtask, f"Paused due to {error.category}", context, report)
         self.storage.save_task(task)
 
-    def _record_provider_failure(self, task: Task, subtask: Subtask, error: ProviderError, description: str) -> None:
+    def _record_provider_failure(self, task: Task, subtask: Subtask | None, error: ProviderError, description: str) -> None:
         failure = FailureAnalysis(
             probable_root_cause=description,
             recommended_fix=str(error),
-            category=error.category,
-            details={"retry_after_seconds": error.retry_after_seconds},
+            category=getattr(error, "category", "PROVIDER_ERROR"),
+            details={"retry_after_seconds": getattr(error, "retry_after_seconds", None)},
         )
-        task.execution_history.append({"type": "failure", "subtask_id": subtask.subtask_id, "failure": failure.to_dict()})
-        task.outcome = error.category # Update task outcome
-        subtask.provider_attempts.append({"outcome": error.category, "error": str(error)})
+        subtask_id = subtask.subtask_id if subtask else None
+        task.execution_history.append({"type": "failure", "subtask_id": subtask_id, "failure": failure.to_dict()})
+        task.outcome = getattr(error, "category", "PROVIDER_ERROR") # Update task outcome
+        if subtask:
+            subtask.provider_attempts.append({"outcome": getattr(error, "category", "PROVIDER_ERROR"), "error": str(error)})
         task.updated_at = datetime.datetime.now(datetime.timezone.utc)
         self.storage.save_task(task)
 
@@ -648,7 +719,7 @@ class Orchestrator:
                 checkpoint = self.storage.load_checkpoint(task.latest_checkpoint_id)
                 # Reconstruct some report fields from checkpoint
                 # This is a simplification; a full restoration would be more complex
-                if checkpoint.validation_state and checkpoint.validation_state.get("validation_plan"):
+                if checkpoint and checkpoint.validation_state and checkpoint.validation_state.get("validation_plan"):
                     dummy_validation_plan = ValidationPlan.from_dict(checkpoint.validation_state["validation_plan"])
                 # You might also reconstruct plan, impact from checkpoint.continuation_context
             except FileNotFoundError:
@@ -683,14 +754,3 @@ class Orchestrator:
             subtask_id=current_subtask.subtask_id if current_subtask else None,
         )
 
-    def _git_changed_paths(self) -> set[str]:
-        status = self.git.status()
-        paths: set[str] = set()
-        for line in status.splitlines():
-            if line.startswith("##") or len(line) < 4:
-                continue
-            value = line[3:].strip()
-            if " -> " in value:
-                value = value.rsplit(" -> ", 1)[-1]
-            paths.add(Path(value.strip('"')).as_posix())
-        return paths

@@ -29,7 +29,7 @@ class PlanningOnlyProvider(AIProvider):
         return {ProviderCapability.PLANNING}
 
     def generate_plan(self, task, context):
-        return json.loads('{"objective": "Planned by PlanningOnlyProvider", "steps": ["step1"]}')
+        return Plan(objective="Planned by PlanningOnlyProvider", steps=["step1"])
 
 
 class CoderOnlyProvider(AIProvider):
@@ -82,22 +82,17 @@ class Phase320_SpecialistTests(unittest.TestCase):
 
         mock_build_provider.side_effect = build_side_effect
 
+        import threading
         scheduler = Scheduler(self.base_config, self.storage, self.credential_store)
-        orchestrator = Orchestrator(self.base_config, self.storage, scheduler)
+        orchestrator = Orchestrator(self.base_config, self.storage, scheduler, threading.Lock(), threading.Lock())
 
         subtask = Subtask(subtask_id="sub1", title="Test", goal="Test Goal")
         task = self._create_task(plan=TaskPlan(objective="Test", subtasks=[subtask]))
 
-        # Mock parts of the orchestrator run that aren't under test
-        with mock.patch.object(orchestrator, "_validate", return_value=[]), \
-             mock.patch.object(orchestrator, "reviewer"), \
-             mock.patch.object(orchestrator, "impact_analyzer"), \
-             mock.patch.object(orchestrator, "analyzer"):
-
-            # Act
-            # We call the internal methods that use specialists directly
-            plan_result = orchestrator._execute_with_specialist(task, ProviderCapability.PLANNING, lambda p: p.generate_plan(None, None), "planning")
-            code_result = orchestrator._execute_with_specialist(task, ProviderCapability.IMPLEMENTATION, lambda p: p.generate_code(None, None, None), "implementation")
+        # Act
+        # We call the internal methods that use specialists directly
+        plan_result = orchestrator._execute_with_specialist(task, ProviderCapability.PLANNING, lambda p: p.generate_plan(None, None), "planning")
+        code_result = orchestrator._execute_with_specialist(task, ProviderCapability.IMPLEMENTATION, lambda p: p.generate_code(None, None, None), "implementation")
 
         # Assert
         self.assertIsNotNone(plan_result)
@@ -107,8 +102,9 @@ class Phase320_SpecialistTests(unittest.TestCase):
 
     def test_orchestrator_fails_if_no_specialist_is_found(self):
         # Arrange: No providers are configured
+        import threading
         scheduler = Scheduler(self.base_config, self.storage, self.credential_store)
-        orchestrator = Orchestrator(self.base_config, self.storage, scheduler)
+        orchestrator = Orchestrator(self.base_config, self.storage, scheduler, threading.Lock(), threading.Lock())
         task = self._create_task()
 
         # Act & Assert

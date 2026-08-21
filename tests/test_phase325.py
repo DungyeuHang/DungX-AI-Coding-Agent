@@ -51,7 +51,7 @@ class Phase325_PullRequestTests(unittest.TestCase):
     def tearDown(self):
         self.mock_urlopen_patcher.stop()
         import shutil
-        shutil.rmtree(self.root)
+        shutil.rmtree(self.root, ignore_errors=True)
 
     def _create_completed_task(self) -> Task:
         now = datetime.datetime.now(datetime.timezone.utc)

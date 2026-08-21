@@ -13,6 +13,7 @@ from .config import AgentConfig
 from .models import PreparedChange, RunReport
 from .orchestrator import Orchestrator
 from .providers import ProviderError, build_provider
+from .storage import JsonFileStorage
 
 
 PLACEHOLDER_RE = re.compile(r"^(\.\.\.|YOUR_|your_|CHANGEME|placeholder|<.*>)$", re.IGNORECASE)
@@ -186,7 +187,14 @@ class AgentUI:
     def _run_worker(self, config: AgentConfig, task: str) -> None:
         try:
             provider = build_provider(config)
-            orchestrator = Orchestrator(config, provider)
+            storage = JsonFileStorage(getattr(config, "data_dir", None) or (config.project / ".agent_data"))
+            orchestrator = Orchestrator(
+                config,
+                storage,
+                scheduler=None,
+                repo_lock=threading.Lock(),
+                memory_lock=threading.Lock(),
+            )
             report = orchestrator.run(task, progress=lambda message: self.events.put(("output", message)), approval_callback=self._approval_callback)
             self.events.put(("finished", report))
         except (ProviderError, ValueError, OSError) as exc:

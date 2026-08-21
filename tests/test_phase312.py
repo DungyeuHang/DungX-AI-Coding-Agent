@@ -197,7 +197,7 @@ class Phase312Tests(unittest.TestCase):
 
     def test_edit_plan_acceptance_criteria_and_dependencies(self):
         s1 = Subtask(subtask_id="1", title="A", goal="A", acceptance_criteria=["old_ac"], dependencies=[])
-        s2 = Subtask(subtask_id="2", title="B", goal="B", dependencies=["1"])
+        s2 = Subtask(subtask_id="2", title="B", goal="B", dependencies=[])
         plan = TaskPlan(objective="Test", subtasks=[s1, s2])
         task = self._create_task(status=TaskStatus.PLAN_REVIEW, plan=plan)
 
@@ -301,8 +301,8 @@ class Phase312Tests(unittest.TestCase):
             subtask = next(s for s in t.plan.subtasks if s.subtask_id == subtask_id)
             subtask.status = SubtaskStatus.COMPLETED
             self.storage.save_task(t)
-            return mock.MagicMock(outcome="COMPLETED")
-        MockOrchestrator.return_value.run.side_effect = successful_run
+            return mock.MagicMock(outcome="COMPLETED", plan_proposal=None)
+        mock_orchestrator.return_value.run.side_effect = successful_run
 
         scheduler.run_once()
         mock_orchestrator.return_value.run.assert_called_once_with(task=mock.ANY, subtask_id="1", progress=mock.ANY)

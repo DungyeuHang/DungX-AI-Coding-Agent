@@ -5,7 +5,7 @@ import uuid
 import datetime
 
 from .models import Plan, ProjectContext, TaskPlan, Subtask, SubtaskStatus, TaskStatus
-from .providers import AIProvider
+from .providers import AIProvider, build_provider
 
 
 class GraphValidator:
@@ -74,7 +74,18 @@ class Planner:
         """Creates a simple, single-step plan for executing one subtask."""
         # This is a simplified plan for the orchestrator's internal loop.
         # The AI gets the broader context from the continuation_context.
-        return self.provider.generate_plan(subtask.goal, context)
+        plan = self.provider.generate_plan(subtask.goal, context)
+        if isinstance(plan, Plan):
+            return plan
+        if isinstance(plan, dict):
+            return Plan(
+                objective=plan.get("objective", subtask.goal),
+                steps=plan.get("steps", [subtask.goal]),
+                files_likely_to_change=plan.get("files_likely_to_change", plan.get("files_to_modify", [])),
+                files_likely_to_create=plan.get("files_likely_to_create", plan.get("files_to_create", [])),
+                risks=plan.get("risks", []),
+            )
+        return Plan(objective=subtask.goal, steps=[subtask.goal])
 
     def create_task_plan(self, task: str, context: ProjectContext) -> TaskPlan:
         """Decomposes a high-level task into a TaskPlan with a subtask graph."""
@@ -86,9 +97,14 @@ class Planner:
         # scheduler executes: each Plan step becomes a Subtask in a dependency
         # chain, and the Plan risks become the TaskPlan risks.
         plan = self.provider.generate_plan(task, context)
+        if isinstance(plan, TaskPlan):
+            return plan
+        if isinstance(plan, dict) and "subtasks" in plan:
+            subtasks = [Subtask.from_dict(s) if isinstance(s, dict) else s for s in plan["subtasks"]]
+            return TaskPlan(objective=plan.get("objective", task), subtasks=subtasks, risks=plan.get("risks", []))
 
         now = datetime.datetime.now(datetime.timezone.utc)
-        steps = plan.steps if plan.steps else [task]
+        steps = getattr(plan, "steps", None) or [task]
         subtasks: list[Subtask] = []
         for step in steps:
             step_text = step.strip()

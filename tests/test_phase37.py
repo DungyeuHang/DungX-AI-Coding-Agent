@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from local_agent.config import AgentConfig
 from local_agent.context import ContextSelector # Keep this import
@@ -19,6 +20,14 @@ class CapturingProvider(AIProvider):
     def __init__(self):
         self.plan_context = None
         self.serialized_context = None
+
+    @property
+    def capabilities(self) -> set:
+        from local_agent.models import ProviderCapability
+        return {
+            ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
+            ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+        }
 
     def generate_plan(self, task: str, context: ProjectContext) -> Plan:
         self.plan_context = context
@@ -134,7 +143,11 @@ class Phase37Tests(unittest.TestCase):
         provider = CapturingProvider()
         config = AgentConfig.from_environment(root, max_iterations=1)
 
-        report = Orchestrator(config, provider, JsonFileStorage(root / ".agent_data")).run(task=mock.MagicMock(objective="Fix the student HomePage."), subtask_id="mock-subtask-id") # Added storage
+        import threading
+        storage = JsonFileStorage(root / ".agent_data")
+        orchestrator = Orchestrator(config, storage, None, threading.Lock(), threading.Lock())
+        with mock.patch("local_agent.orchestrator.build_provider", return_value=provider):
+            report = orchestrator.run(task=task, subtask_id="mock-subtask-id")
 
         self.assertTrue(report.completed)
         self.assertIs(report.project, provider.plan_context)

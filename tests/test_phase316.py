@@ -62,11 +62,14 @@ class MockTaskStorage(TaskStorage):
     def load_scheduler_state(self) -> SchedulerState:
         return self.scheduler_state
 
-    def load_semantic_index(self, project_root: Path) -> SemanticIndex | None:
-        return self._semantic_indexes.get(project_root)
+    def load_semantic_index(self) -> SemanticIndex:
+        return SemanticIndex()
 
-    def save_semantic_index(self, project_root: Path, semantic_index: SemanticIndex) -> None:
-        self._semantic_indexes[project_root] = semantic_index
+    def save_semantic_index(self, semantic_index: SemanticIndex) -> None:
+        pass
+
+    def save_project_memory(self, memory): pass
+    def load_project_memory(self): from local_agent.models import ProjectMemory; return ProjectMemory()
 
     provider_configs: dict[str, ProviderConfig] = {}
     scheduler_state: SchedulerState = SchedulerState()
@@ -75,7 +78,10 @@ class MockTaskStorage(TaskStorage):
 class FailingPlannerProvider(AIProvider):
     def __init__(self):
         self.generate_plan_calls = 0
-        self.capabilities = {ProviderCapability.PLANNING}
+
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {ProviderCapability.PLANNING}
 
     def generate_plan(self, task: str, context: ProjectContext) -> Plan:
         self.generate_plan_calls += 1
@@ -85,7 +91,10 @@ class FailingPlannerProvider(AIProvider):
 class SuccessfulPlannerProvider(AIProvider):
     def __init__(self):
         self.generate_plan_calls = 0
-        self.capabilities = {ProviderCapability.PLANNING}
+
+    @property
+    def capabilities(self) -> set[ProviderCapability]:
+        return {ProviderCapability.PLANNING}
 
     def generate_plan(self, task: str, context: ProjectContext) -> Plan:
         self.generate_plan_calls += 1
@@ -106,6 +115,9 @@ class MockCredentialStore:
     def set(self, namespace: str, key_id: str, value: str) -> None:
         self.keys[key_id] = value
 
+    def save(self, namespace: str, key_id: str, value: str) -> None:
+        self.keys[key_id] = value
+
     def delete(self, namespace: str, key_id: str) -> None:
         if key_id in self.keys:
             del self.keys[key_id]
@@ -114,9 +126,9 @@ class MockCredentialStore:
 # Import the REAL Scheduler
 from local_agent.scheduler import Scheduler
 
-# Mock the Orchestrator's analyze method to avoid actual project scanning in the test
-mock_orchestrator_analyze = mock.MagicMock(spec=Orchestrator.analyze)
-mock_orchestrator_analyze.return_value = ProjectContext(root="/mock/project")
+# Mock the RepositoryIntelligence scan method to avoid actual project scanning in the test
+mock_repo_scan = mock.MagicMock()
+mock_repo_scan.return_value = ProjectContext(root="/mock/project")
 
 
 class Phase316_SchedulerPlanningFallbackTest(unittest.TestCase):
@@ -153,7 +165,7 @@ class Phase316_SchedulerPlanningFallbackTest(unittest.TestCase):
         # This is crucial because Scheduler.build_provider will try to instantiate real providers.
         # We need to intercept this and return our mock instances.
         with mock.patch('local_agent.scheduler.build_provider') as mock_build_provider, \
-             mock.patch('local_agent.orchestrator.Orchestrator.analyze', new=mock_orchestrator_analyze):
+             mock.patch('local_agent.repository.RepositoryIntelligence.scan', new=mock_repo_scan):
             def side_effect_build_provider(agent_config, api_key=None):
                 if agent_config.provider == "failing_mock":
                     return failing_provider
