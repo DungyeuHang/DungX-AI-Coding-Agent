@@ -282,3 +282,4 @@ class Phase313Tests(unittest.TestCase):
             # We don't need to run the full loop, just verify the initial load
             orchestrator.run(task, "sub1")
         except Exception as e:
+            self.fail(f"Orchestrator crashed on resume with: {e}")
