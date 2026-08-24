@@ -14,7 +14,7 @@ from local_agent.impact import ChangeImpactAnalyzer
 from local_agent.models import (ChangeImpact, Checkpoint, CommandSpec,
                                 ExecutionResult, FailureAnalysis,
                                 FileOperation, Plan, ProjectContext,
-                                ProviderMetric, ReviewResult, Subtask,
+                                ProviderCapability, ProviderMetric, ReviewResult, Subtask,
                                 SubtaskStatus, Task, TaskPlan, TaskStatus,
                                 ValidationCommand, ValidationPlan)
 from local_agent.orchestrator import Orchestrator

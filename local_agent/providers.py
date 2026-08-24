@@ -31,6 +31,9 @@ from .models import (
     RateLimitError,
     ReviewResult,
     TaskPlan,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
     UnknownProviderError,
 )
 
@@ -84,6 +87,19 @@ class AIProvider:
 
     def generate_code(self, task: str, plan: Plan, context: ProjectContext, failure: FailureAnalysis | None = None, review: ReviewResult | None = None) -> list[FileOperation]:
         raise NotImplementedError
+
+    def generate_code_with_tools(
+        self,
+        task: str,
+        plan: Plan,
+        context: ProjectContext,
+        tools: list[ToolDefinition],
+        tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
+        failure: FailureAnalysis | None = None,
+        review: ReviewResult | None = None,
+    ) -> ToolCall | list[FileOperation]:
+        """Generate code using available tools, or fall back to 1-shot generate_code."""
+        return self.generate_code(task, plan, context, failure=failure, review=review)
 
     def analyze_failure(self, execution: ExecutionResult, diff: str, context: ProjectContext, plan: Plan) -> FailureAnalysis:
         raise NotImplementedError
@@ -312,6 +328,7 @@ class OpenAIProvider(BaseHTTPProvider):
         return {
             ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
             ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+            ProviderCapability.TOOL_USE,
         }
 
 
@@ -348,6 +365,99 @@ class OpenAIProvider(BaseHTTPProvider):
             if isinstance(item, dict):
                 operations.append(FileOperation(str(item.get("operation", item.get("action", ""))), str(item.get("path", "")), item.get("content"), str(item.get("reason", "")), item.get("patch")))
         return operations
+
+    def generate_code_with_tools(
+        self,
+        task: str,
+        plan: Plan,
+        context: ProjectContext,
+        tools: list[ToolDefinition],
+        tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
+        failure: FailureAnalysis | None = None,
+        review: ReviewResult | None = None,
+    ) -> ToolCall | list[FileOperation]:
+        system_msg = (
+            "You are a careful coding agent. You can use available tools to inspect the codebase before making changes. "
+            "When you are ready to apply changes, return only JSON with changes: "
+            '{"changes":[{"operation":"modify|create|delete","path":"relative/path","patch":"unified diff","content":"optional fallback","reason":"..."}]}. '
+            "Prefer precise unified patches over full-file replacement. Use only relative paths inside the project. Never modify secrets or .git."
+        )
+        user_msg = (
+            f"Task:\n{task}\nPlan:\n{json.dumps(asdict(plan), indent=2)}\n"
+            f"Context:\n{self._context(context, 'repair' if failure else 'implementation') if not failure or failure.category != 'PATCH_VALIDATION' else '{}'}\n"
+            f"Failure:\n{json.dumps(self._failure_payload(failure, task, plan), ensure_ascii=False) if failure else 'none'}\n"
+            f"Review:\n{asdict(review) if review else 'none'}"
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+        if tool_history:
+            for call, result in tool_history:
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": call.tool_name,
+                                "arguments": json.dumps(call.arguments),
+                            },
+                        }
+                    ],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.call_id,
+                    "content": result.output,
+                })
+
+        req_body: dict[str, Any] = {
+            "model": self.model,
+            "temperature": 0.1,
+            "messages": messages,
+        }
+        if tools:
+            req_body["tools"] = _format_openai_tools(tools)
+            req_body["tool_choice"] = "auto"
+
+        body = json.dumps(req_body).encode("utf-8")
+        payload = self._request_json_api(
+            f"{self.base_url}/chat/completions",
+            body,
+            {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            "chat.completions",
+            self.model,
+            120,
+        )
+
+        try:
+            choice_msg = payload["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderError("OpenAI response did not contain a message choice") from exc
+
+        tool_calls_raw = choice_msg.get("tool_calls")
+        if tool_calls_raw and isinstance(tool_calls_raw, list) and len(tool_calls_raw) > 0:
+            first_call = tool_calls_raw[0]
+            fn = first_call.get("function", {})
+            call_id = first_call.get("id") or f"call_{int(time.time() * 1000)}"
+            fn_name = fn.get("name", "")
+            raw_args = fn.get("arguments", "{}")
+            if not fn_name:
+                raise ProviderError("OpenAI tool call missing function name")
+            try:
+                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except json.JSONDecodeError as exc:
+                raise ProviderError(f"OpenAI tool call '{fn_name}' returned malformed JSON arguments: {raw_args}") from exc
+            return ToolCall(call_id=str(call_id), tool_name=str(fn_name), arguments=parsed_args if isinstance(parsed_args, dict) else {})
+
+        content = choice_msg.get("content", "")
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        data = self._parse_json(str(content))
+        return _operations(data)
 
     def analyze_failure(self, execution: ExecutionResult, diff: str, context: ProjectContext, plan: Plan) -> FailureAnalysis:
         data = self._json_call("Return only JSON with probable_root_cause, affected_files, recommended_fix.", f"Failed command: {execution.command}\nExit code: {execution.exit_code}\nstdout:\n{execution.stdout[-8000:]}\nstderr:\n{execution.stderr[-8000:]}\nDiff:\n{diff[-12000:]}\nPlan:\n{json.dumps(asdict(plan))}\nContext:\n{self._context(context, 'repair')}")
@@ -406,6 +516,7 @@ class GeminiProvider(BaseHTTPProvider):
         return {
             ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
             ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+            ProviderCapability.TOOL_USE,
         }
 
     def _call_api(self, system: str, user: str) -> dict[str, Any]:
@@ -532,6 +643,88 @@ class GeminiProvider(BaseHTTPProvider):
         )
         return _operations(data)
 
+    def generate_code_with_tools(
+        self,
+        task: str,
+        plan: Plan,
+        context: ProjectContext,
+        tools: list[ToolDefinition],
+        tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
+        failure: FailureAnalysis | None = None,
+        review: ReviewResult | None = None,
+    ) -> ToolCall | list[FileOperation]:
+        self._ensure_model()
+        system_msg = (
+            "You are a careful coding agent. You can use available tools to inspect the codebase before making changes. "
+            "When you are ready to apply changes, return only JSON with changes, each containing operation modify/create/delete, relative path, a precise unified patch, optional complete content fallback, and reason. Treat all paths as untrusted and never touch secrets or .git."
+        )
+        user_content = (
+            f"Task:\n{task}\nPlan:\n{json.dumps(asdict(plan), indent=2)}\n"
+            f"Context:\n{self._context(context, 'repair' if failure else 'implementation') if not failure or failure.category != 'PATCH_VALIDATION' else '{}'}\n"
+            f"Failure:\n{json.dumps(self._failure_payload(failure, task, plan), ensure_ascii=False) if failure else 'none'}\n"
+            f"Review:\n{asdict(review) if review else 'none'}"
+        )
+        contents: list[dict[str, Any]] = [
+            {"role": "user", "parts": [{"text": user_content}]},
+        ]
+        if tool_history:
+            for call, result in tool_history:
+                contents.append({
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": call.tool_name,
+                                "args": call.arguments,
+                            }
+                        }
+                    ],
+                })
+                contents.append({
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": call.tool_name,
+                                "response": {"output": result.output},
+                            }
+                        }
+                    ],
+                })
+
+        body_dict: dict[str, Any] = {
+            "systemInstruction": {"parts": [{"text": system_msg}]},
+            "contents": contents,
+            "generationConfig": {"temperature": 0.1},
+        }
+        if tools:
+            body_dict["tools"] = _format_gemini_tools(tools)
+        body = json.dumps(body_dict).encode("utf-8")
+        payload = self._request_json(self._generation_url(), body, "models.generateContent", self.model, 120)
+
+        try:
+            parts = payload["candidates"][0]["content"]["parts"]  # type: ignore[index]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderError("Gemini response did not contain candidate content") from exc
+
+        for part in parts:
+            if isinstance(part, dict) and "functionCall" in part:
+                fc = part["functionCall"]
+                fn_name = fc.get("name", "")
+                fn_args = fc.get("args", {})
+                if not fn_name:
+                    raise ProviderError("Gemini functionCall missing name")
+                if not isinstance(fn_args, dict):
+                    raise ProviderError("Gemini functionCall args must be a dict")
+                call_id = f"call_{int(time.time() * 1000)}"
+                return ToolCall(call_id=call_id, tool_name=str(fn_name), arguments=fn_args)
+
+        content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
+        if not content:
+            raise ProviderError("Gemini response contained neither functionCall nor text")
+        data = OpenAIProvider._parse_json(content)
+        return _operations(data)
+
     def analyze_failure(self, execution: ExecutionResult, diff: str, context: ProjectContext, plan: Plan) -> FailureAnalysis:
         data = self._json_call("Return only JSON with probable_root_cause, affected_files, and recommended_fix.", f"Failed command: {execution.command}\nExit code: {execution.exit_code}\nstdout:\n{execution.stdout[-8000:]}\nstderr:\n{execution.stderr[-8000:]}\nDiff:\n{diff[-12000:]}\nPlan:\n{json.dumps(asdict(plan))}\nContext:\n{self._context(context, 'repair')}")
         return FailureAnalysis(str(data.get("probable_root_cause", "Unknown failure")), _strings(data.get("affected_files")), str(data.get("recommended_fix", "")))
@@ -576,6 +769,7 @@ class AntigravityProvider(GeminiProvider):
         return {
             ProviderCapability.PLANNING, ProviderCapability.IMPLEMENTATION,
             ProviderCapability.REPAIR, ProviderCapability.REVIEW,
+            ProviderCapability.TOOL_USE,
         }
 
     def _json_call(self, system: str, user: str) -> dict[str, Any]:
@@ -730,6 +924,35 @@ def _operations(data: dict[str, Any]) -> list[FileOperation]:
         if isinstance(item, dict):
             operations.append(FileOperation(str(item.get("operation", item.get("action", ""))), str(item.get("path", "")), item.get("content"), str(item.get("reason", "")), item.get("patch")))
     return operations
+
+
+def _format_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": td.name,
+                "description": td.description,
+                "parameters": td.parameters,
+            },
+        }
+        for td in tools
+    ]
+
+
+def _format_gemini_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
+    return [
+        {
+            "functionDeclarations": [
+                {
+                    "name": td.name,
+                    "description": td.description,
+                    "parameters": td.parameters,
+                }
+                for td in tools
+            ]
+        }
+    ]
 
 
 def _bounded_text(value: str, limit: int) -> tuple[str, bool]:

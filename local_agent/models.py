@@ -46,6 +46,7 @@ class ProviderCapability(str, Enum):
     IMPLEMENTATION = "implementation"
     REPAIR = "repair"
     REVIEW = "review"
+    TOOL_USE = "tool_use"
 
 class ProviderAvailability(str, Enum):
     AVAILABLE = "available"
@@ -805,4 +806,74 @@ class NetworkError(ProviderError):
 
 class UnknownProviderError(ProviderError):
     category = "UNKNOWN_PROVIDER_ERROR"
+
+
+# Phase 4.0: Dynamic Agentic Tool Engine Models
+@dataclass(frozen=True)
+class ToolDefinition:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not self.name or not isinstance(self.name, str):
+            raise ValueError("ToolDefinition.name must be a non-empty string")
+        if not self.description or not isinstance(self.description, str):
+            raise ValueError("ToolDefinition.description must be a non-empty string")
+        if not isinstance(self.parameters, dict):
+            raise ValueError("ToolDefinition.parameters must be a dict")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(**data)
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not self.call_id or not isinstance(self.call_id, str):
+            raise ValueError("ToolCall.call_id must be a non-empty string")
+        if not self.tool_name or not isinstance(self.tool_name, str):
+            raise ValueError("ToolCall.tool_name must be a non-empty string")
+        if not isinstance(self.arguments, dict):
+            raise ValueError("ToolCall.arguments must be a dict")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(**data)
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    call_id: str
+    tool_name: str
+    output: str
+    is_error: bool = False
+    truncated: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.call_id or not isinstance(self.call_id, str):
+            raise ValueError("ToolResult.call_id must be a non-empty string")
+        if not self.tool_name or not isinstance(self.tool_name, str):
+            raise ValueError("ToolResult.tool_name must be a non-empty string")
+        if not isinstance(self.output, str):
+            raise ValueError("ToolResult.output must be a string")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(**data)
+
 

@@ -29,11 +29,14 @@ from .models import (
     Memory,
     ProjectContext,
     ProviderCapability,
+    ReviewResult,
     RunReport,
     Subtask,
     SubtaskStatus,
     Task,
     TaskStatus,
+    ToolCall,
+    ToolResult,
     ValidationPlan,
 )
 from .models import MemoryCategory
@@ -41,6 +44,8 @@ from .planner import GraphValidator, Planner
 from .providers import AIProvider, ProviderError, QuotaExceededError, RateLimitError, build_provider
 from .repository import RepositoryIntelligence
 from .reviewer import Reviewer
+from .tool_engine import ToolEngine, history_from_dict, history_to_dict
+from .tools import ToolRegistry
 from .validation import ValidationIntelligence
 
 LOGGER = logging.getLogger(__name__)
@@ -161,9 +166,10 @@ class Orchestrator:
             current_subtask.status = SubtaskStatus.PENDING
             current_subtask.completed_at = None
 
-        # Phase 3.14: Resume diagnostic / secondary-validation state from the latest checkpoint, if present.
+        # Phase 3.14: Resume diagnostic / secondary-validation state and Phase 4.0 tool history from the latest checkpoint, if present.
         current_diagnostic_evidence: list[ExecutionResult] = []
         executed_diagnostic_names_this_iteration: list[str] = []
+        current_tool_history: list[tuple[ToolCall, ToolResult]] = []
         if current_subtask and current_subtask.latest_checkpoint_id:
             try:
                 checkpoint = self.storage.load_checkpoint(current_subtask.latest_checkpoint_id)
@@ -172,6 +178,9 @@ class Orchestrator:
                     executed_diagnostic_names_this_iteration = list( # Ensure it's a list for mutability
                         checkpoint.continuation_context.get("executed_diagnostic_names_this_iteration", [])
                     )
+                    raw_tool_history = checkpoint.continuation_context.get("tool_history", [])
+                    if raw_tool_history:
+                        current_tool_history = history_from_dict(raw_tool_history)
                     # Load the last failure from checkpoint to continue repair iterations
                     last_failures = checkpoint.continuation_context.get("validation_state", {}).get("last_failures", [])
                     if last_failures:
@@ -204,20 +213,24 @@ class Orchestrator:
                     task.initial_failure_context = None  # Consume the context
                     self.storage.save_task(task)
 
-                emit("[4/7] Implementing changes..." if iteration == 1 else f"[5/7] Applying repair for iteration {iteration}...")
+                stage_name = "implementation" if iteration == 1 and not failure else "repair"
+                emit("[4/7] Implementing changes..." if iteration == 1 and not failure else f"[5/7] Applying repair for iteration {iteration}...")
                 try:
-                    operations = self._execute_with_specialist(
+                    operations, current_tool_history = self._execute_code_generation(
                         task,
-                        ProviderCapability.IMPLEMENTATION,
-                        lambda provider: provider.generate_code(task, plan, context, failure=failure, review=review),
-                        "implementation"
+                        plan,
+                        context,
+                        failure=failure,
+                        review=review,
+                        stage_name=stage_name,
+                        tool_history=current_tool_history,
                     )
                 except ProviderError as exc:
-                    self._record_provider_failure(task, current_subtask, exc, "implementation provider request failed")
+                    self._record_provider_failure(task, current_subtask, exc, f"{stage_name} provider request failed")
                     report.outcome = task.outcome
                     report.failures.append(
                         FailureAnalysis(
-                            probable_root_cause="implementation provider request failed",
+                            probable_root_cause=f"{stage_name} provider request failed",
                             recommended_fix=str(exc),
                             category=getattr(exc, "category", "PROVIDER_ERROR"),
                             details={"retry_after_seconds": getattr(exc, "retry_after_seconds", None)},
@@ -229,10 +242,11 @@ class Orchestrator:
                         if current_subtask:
                             current_subtask.status = SubtaskStatus.PAUSED
                             current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
-                        # Create a checkpoint to preserve failure state and diagnostic state for resumption
+                        # Create a checkpoint to preserve failure state, diagnostic state, and tool history for resumption
                         extra_context = {
                             'diagnostic_evidence': [e.to_dict() for e in current_diagnostic_evidence],
-                            'executed_diagnostic_names_this_iteration': executed_diagnostic_names_this_iteration
+                            'executed_diagnostic_names_this_iteration': executed_diagnostic_names_this_iteration,
+                            'tool_history': history_to_dict(current_tool_history),
                         }
                         self._create_checkpoint(task, current_subtask, "After code generation (Paused due to provider error)", context, report, extra_context=extra_context)
                     else:
@@ -487,6 +501,58 @@ class Orchestrator:
         for provider in self._select_specialists(task, capability):
             return action(provider)
         raise ProviderError(f"No available and capable provider found for stage: {stage_name}")
+
+    def _execute_code_generation(
+        self,
+        task: Task,
+        plan: Plan,
+        context: ProjectContext,
+        failure: FailureAnalysis | None,
+        review: ReviewResult | None,
+        stage_name: str,
+        tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
+    ) -> tuple[list[FileOperation], list[tuple[ToolCall, ToolResult]]]:
+        capability = ProviderCapability.REPAIR if failure else ProviderCapability.IMPLEMENTATION
+
+        def _action(provider: AIProvider) -> tuple[list[FileOperation], list[tuple[ToolCall, ToolResult]]]:
+            try:
+                provider_caps = getattr(provider, "capabilities", None)
+            except Exception:
+                provider_caps = None
+            task_obj = task.objective if hasattr(task, "objective") else str(task)
+
+            if isinstance(provider_caps, (set, frozenset)) and ProviderCapability.TOOL_USE in provider_caps:
+                registry = ToolRegistry(
+                    self.config.project,
+                    filesystem=self.filesystem,
+                    command_runner=self.runner,
+                    semantic_index=getattr(context, "semantic_index", None),
+                )
+                engine = ToolEngine(provider=provider, registry=registry)
+                result = engine.run(
+                    task=task_obj,
+                    plan=plan,
+                    context=context,
+                    initial_history=tool_history,
+                    failure=failure,
+                    review=review,
+                )
+                if not result.completed or result.file_operations is None:
+                    raise ProviderError(
+                        f"ToolEngine failed to generate code ({result.termination_reason}): {result.error_message or 'No file operations produced'}"
+                    )
+                return result.file_operations, result.tool_history
+
+            ops = provider.generate_code(
+                task_obj,
+                plan,
+                context,
+                failure=failure,
+                review=review,
+            )
+            return ops, (tool_history or [])
+
+        return self._execute_with_specialist(task, capability, _action, stage_name)
 
     def _perform_git_commit(self, task: Task, branch_name: str) -> bool:
         """Handles the logic for creating a local git commit for a completed task."""
