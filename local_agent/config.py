@@ -60,6 +60,24 @@ class AgentConfig:
     max_retry_wait_seconds: int = 60
     memory_enabled: bool = True # New for Phase 3.22
     metrics_enabled: bool = False
+    max_tool_steps: int = 8
+    max_tool_output_bytes: int = 4000
+    total_tool_budget_bytes: int = 32000
+    max_consecutive_repeats: int = 3
+    per_tool_limits: dict[str, int] = field(default_factory=dict)
+    disallowed_tools: list[str] = field(default_factory=list)
+
+    @property
+    def tool_policy(self) -> Any:
+        from .models import ToolExecutionPolicy
+        return ToolExecutionPolicy(
+            max_tool_steps=self.max_tool_steps,
+            max_tool_output_bytes=self.max_tool_output_bytes,
+            total_tool_budget_bytes=self.total_tool_budget_bytes,
+            max_consecutive_repeats=self.max_consecutive_repeats,
+            per_tool_limits=dict(self.per_tool_limits),
+            disallowed_tools=set(self.disallowed_tools),
+        )
 
     @classmethod
     def from_environment(cls, project: str | Path, **overrides: object) -> "AgentConfig":
@@ -98,6 +116,12 @@ class AgentConfig:
             "max_retry_wait_seconds": "AGENT_MAX_RETRY_WAIT_SECONDS",
             "memory_enabled": "AGENT_MEMORY_ENABLED",
             "metrics_enabled": "AGENT_METRICS",
+            "max_tool_steps": "AGENT_MAX_TOOL_STEPS",
+            "max_tool_output_bytes": "AGENT_MAX_TOOL_OUTPUT_BYTES",
+            "total_tool_budget_bytes": "AGENT_TOTAL_TOOL_BUDGET_BYTES",
+            "max_consecutive_repeats": "AGENT_MAX_CONSECUTIVE_REPEATS",
+            "per_tool_limits": "AGENT_PER_TOOL_LIMITS",
+            "disallowed_tools": "AGENT_DISALLOWED_TOOLS",
         }
 
         def value(name: str, default: object) -> object:
@@ -117,6 +141,35 @@ class AgentConfig:
                 raise ValueError("AGENT_APPROVAL_POLICIES must be a JSON list of objects")
         except (json.JSONDecodeError, ValueError) as e:
             raise ValueError(f"Invalid format for AGENT_APPROVAL_POLICIES: {e}") from e
+
+        per_tool_limits_val = value("per_tool_limits", {})
+        if isinstance(per_tool_limits_val, str) and per_tool_limits_val.strip():
+            try:
+                parsed_limits = json.loads(per_tool_limits_val)
+                if isinstance(parsed_limits, dict):
+                    per_tool_limits_val = {str(k): int(v) for k, v in parsed_limits.items()}
+                else:
+                    per_tool_limits_val = {}
+            except (json.JSONDecodeError, ValueError):
+                per_tool_limits_val = {}
+        elif not isinstance(per_tool_limits_val, dict):
+            per_tool_limits_val = {}
+
+        disallowed_tools_val = value("disallowed_tools", [])
+        if isinstance(disallowed_tools_val, str) and disallowed_tools_val.strip():
+            try:
+                parsed_disallowed = json.loads(disallowed_tools_val)
+                if isinstance(parsed_disallowed, list):
+                    disallowed_tools_val = [str(x).strip() for x in parsed_disallowed if str(x).strip()]
+                else:
+                    disallowed_tools_val = [t.strip() for t in disallowed_tools_val.split(",") if t.strip()]
+            except (json.JSONDecodeError, ValueError):
+                disallowed_tools_val = [t.strip() for t in disallowed_tools_val.split(",") if t.strip()]
+        elif isinstance(disallowed_tools_val, (set, list, tuple)):
+            disallowed_tools_val = [str(x) for x in disallowed_tools_val]
+        else:
+            disallowed_tools_val = []
+
         explicit_api_key = overrides.get("api_key")
         if explicit_api_key is None:
             credential_name = "DEEPSEEK_API_KEY" if provider_name == "deepseek" else \
@@ -170,6 +223,12 @@ class AgentConfig:
             memory_enabled=_bool(value("memory_enabled", True)),
             max_retry_wait_seconds=_positive_int(value("max_retry_wait_seconds", 60), "max_retry_wait_seconds"),
             metrics_enabled=_bool(value("metrics_enabled", False)),
+            max_tool_steps=_positive_int(value("max_tool_steps", 8), "max_tool_steps"),
+            max_tool_output_bytes=_positive_int(value("max_tool_output_bytes", 4000), "max_tool_output_bytes"),
+            total_tool_budget_bytes=_positive_int(value("total_tool_budget_bytes", 32000), "total_tool_budget_bytes"),
+            max_consecutive_repeats=_positive_int(value("max_consecutive_repeats", 3), "max_consecutive_repeats"),
+            per_tool_limits=per_tool_limits_val,
+            disallowed_tools=disallowed_tools_val,
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -188,14 +247,15 @@ class AgentConfig:
             raise ValueError("command_timeout_seconds must be positive")
         if self.max_parallel_subtasks < 1:
             raise ValueError("max_parallel_subtasks must be at least 1")
-        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes"):
+        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
         if self.provider_max_retries < 0:
             raise ValueError("provider_max_retries cannot be negative")
         if self.dependency_depth < 0:
             raise ValueError("dependency_depth cannot be negative")
-
+        # Validate tool policy creation
+        _ = self.tool_policy
 
 def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args: bool = False) -> None:
     parser.add_argument("--project", default=".", help="local project directory")

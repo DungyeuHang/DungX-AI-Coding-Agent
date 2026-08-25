@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
@@ -8,10 +9,14 @@ from .models import (
     FailureAnalysis,
     FileOperation,
     Plan,
+    PolicyAction,
+    PolicyDecision,
     ProjectContext,
     ReviewResult,
     ToolCall,
     ToolDefinition,
+    ToolExecutionMetrics,
+    ToolExecutionPolicy,
     ToolResult,
 )
 from .tools import DEFAULT_MAX_OUTPUT_BYTES, ToolRegistry
@@ -60,6 +65,7 @@ class ToolEngineResult:
     completed: bool = False
     termination_reason: str | None = None
     error_message: str | None = None
+    metrics: ToolExecutionMetrics = field(default_factory=ToolExecutionMetrics)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,12 +76,15 @@ class ToolEngineResult:
             "completed": self.completed,
             "termination_reason": self.termination_reason,
             "error_message": self.error_message,
+            "metrics": self.metrics.to_dict() if hasattr(self.metrics, "to_dict") else self.metrics,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ToolEngineResult:
         file_ops_data = data.get("file_operations")
         file_ops = [FileOperation(**op) if isinstance(op, dict) else op for op in file_ops_data] if file_ops_data is not None else None
+        metrics_data = data.get("metrics")
+        metrics = ToolExecutionMetrics.from_dict(metrics_data) if isinstance(metrics_data, dict) else ToolExecutionMetrics()
         return cls(
             file_operations=file_ops,
             tool_history=history_from_dict(data.get("tool_history", [])),
@@ -84,6 +93,7 @@ class ToolEngineResult:
             completed=data.get("completed", False),
             termination_reason=data.get("termination_reason"),
             error_message=data.get("error_message"),
+            metrics=metrics,
         )
 
 
@@ -94,20 +104,29 @@ class ToolEngine:
         self,
         provider: Any,
         registry: ToolRegistry,
-        max_tool_steps: int = DEFAULT_MAX_TOOL_STEPS,
-        max_tool_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
-        total_tool_budget_bytes: int = DEFAULT_TOTAL_TOOL_BUDGET_BYTES,
+        policy: ToolExecutionPolicy | None = None,
+        max_tool_steps: int | None = None,
+        max_tool_output_bytes: int | None = None,
+        total_tool_budget_bytes: int | None = None,
     ):
-        if max_tool_steps <= 0:
-            raise ValueError(f"max_tool_steps must be greater than 0, got {max_tool_steps}")
-        if total_tool_budget_bytes <= 0:
-            raise ValueError(f"total_tool_budget_bytes must be greater than 0, got {total_tool_budget_bytes}")
-
         self.provider = provider
         self.registry = registry
-        self.max_tool_steps = max_tool_steps
-        self.max_tool_output_bytes = max_tool_output_bytes
-        self.total_tool_budget_bytes = total_tool_budget_bytes
+
+        if policy is not None:
+            self.policy = policy
+        else:
+            steps = max_tool_steps if max_tool_steps is not None else DEFAULT_MAX_TOOL_STEPS
+            output_bytes = max_tool_output_bytes if max_tool_output_bytes is not None else DEFAULT_MAX_OUTPUT_BYTES
+            total_budget = total_tool_budget_bytes if total_tool_budget_bytes is not None else DEFAULT_TOTAL_TOOL_BUDGET_BYTES
+            self.policy = ToolExecutionPolicy(
+                max_tool_steps=steps,
+                max_tool_output_bytes=output_bytes,
+                total_tool_budget_bytes=total_budget,
+            )
+
+        self.max_tool_steps = self.policy.max_tool_steps
+        self.max_tool_output_bytes = self.policy.max_tool_output_bytes
+        self.total_tool_budget_bytes = self.policy.total_tool_budget_bytes
 
     def _call_provider_step(
         self,
@@ -148,14 +167,75 @@ class ToolEngine:
         review: ReviewResult | None = None,
     ) -> ToolEngineResult:
         """Run the bounded tool loop until code changes are generated or bounds are reached."""
+        start_time = time.perf_counter()
         history: list[tuple[ToolCall, ToolResult]] = initial_history if initial_history is not None else []
+        tools = self.registry.definitions()
 
-        # Calculate initial bytes and steps from restored history
+        # Telemetry tracking structures
+        seen_call_signatures: list[tuple[str, str]] = []
+        calls_by_tool: dict[str, int] = {}
+        output_bytes_by_tool: dict[str, int] = {}
+        truncated_results: int = 0
+        tool_errors: int = 0
+        circuit_breaker_events: int = 0
+
+        # Calculate initial bytes, steps, and telemetry from restored history
+        for call, result in history:
+            sig = (call.tool_name, canonicalize_arguments(call.arguments))
+            seen_call_signatures.append(sig)
+            calls_by_tool[call.tool_name] = calls_by_tool.get(call.tool_name, 0) + 1
+            byte_len = len(result.output.encode("utf-8"))
+            output_bytes_by_tool[call.tool_name] = output_bytes_by_tool.get(call.tool_name, 0) + byte_len
+            if result.truncated:
+                truncated_results += 1
+            if result.is_error:
+                tool_errors += 1
+            if "Circuit breaker triggered" in result.output:
+                circuit_breaker_events += 1
+
         total_output_bytes = sum(len(result.output.encode("utf-8")) for _, result in history)
         steps_used = len(history)
 
         last_call_key: tuple[str, str] | None = None
         consecutive_repeat_count = 0
+
+        def _build_result(
+            file_operations: list[FileOperation] | None,
+            completed: bool,
+            termination_reason: str,
+            error_message: str | None = None,
+        ) -> ToolEngineResult:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            total_calls = len(history)
+            unique_calls = len(set(seen_call_signatures))
+            repeated_calls = max(0, total_calls - unique_calls)
+
+            metrics = ToolExecutionMetrics(
+                total_calls=total_calls,
+                unique_calls=unique_calls,
+                repeated_calls=repeated_calls,
+                calls_by_tool=dict(calls_by_tool),
+                total_output_bytes=total_output_bytes,
+                output_bytes_by_tool=dict(output_bytes_by_tool),
+                truncated_results=truncated_results,
+                tool_errors=tool_errors,
+                circuit_breaker_events=circuit_breaker_events,
+                steps_used=steps_used,
+                history_entries=len(history),
+                termination_reason=termination_reason,
+                completed=completed,
+                elapsed_ms=elapsed_ms,
+            )
+            return ToolEngineResult(
+                file_operations=file_operations,
+                tool_history=history,
+                steps_used=steps_used,
+                total_tool_output_bytes=total_output_bytes,
+                completed=completed,
+                termination_reason=termination_reason,
+                error_message=error_message,
+                metrics=metrics,
+            )
 
         while True:
             # 1. Ask provider for next action
@@ -165,80 +245,94 @@ class ToolEngine:
 
             # 2. Check if provider returned final FileOperations list
             if isinstance(provider_response, list):
-                # Validate items are FileOperations or compatible
-                return ToolEngineResult(
+                return _build_result(
                     file_operations=provider_response,
-                    tool_history=history,
-                    steps_used=steps_used,
-                    total_tool_output_bytes=total_output_bytes,
                     completed=True,
                     termination_reason="completed",
                 )
 
             # 3. Check if provider returned a ToolCall
             if not isinstance(provider_response, ToolCall):
-                return ToolEngineResult(
+                return _build_result(
                     file_operations=None,
-                    tool_history=history,
-                    steps_used=steps_used,
-                    total_tool_output_bytes=total_output_bytes,
                     completed=False,
                     termination_reason="invalid_provider_response",
                     error_message=f"Provider returned invalid response type: {type(provider_response)}",
                 )
 
             tool_call = provider_response
+            sig = (tool_call.tool_name, canonicalize_arguments(tool_call.arguments))
+            seen_call_signatures.append(sig)
+            calls_by_tool[tool_call.tool_name] = calls_by_tool.get(tool_call.tool_name, 0) + 1
 
-            # 4. Check step limit before executing next tool
-            if steps_used >= self.max_tool_steps:
-                return ToolEngineResult(
-                    file_operations=None,
-                    tool_history=history,
-                    steps_used=steps_used,
-                    total_tool_output_bytes=total_output_bytes,
-                    completed=False,
-                    termination_reason="max_steps_exceeded",
-                    error_message=f"Reached maximum allowed tool steps ({self.max_tool_steps}).",
-                )
-
-            # 5. Check total byte budget before executing next tool
-            if total_output_bytes >= self.total_tool_budget_bytes:
-                return ToolEngineResult(
-                    file_operations=None,
-                    tool_history=history,
-                    steps_used=steps_used,
-                    total_tool_output_bytes=total_output_bytes,
-                    completed=False,
-                    termination_reason="budget_exhausted",
-                    error_message=f"Exceeded total tool output budget ({self.total_tool_budget_bytes} bytes).",
-                )
-
-            # 6. Check repeated call circuit breaker
-            call_key = (tool_call.tool_name, canonicalize_arguments(tool_call.arguments))
-            if call_key == last_call_key:
+            # Check repeated call key for consecutive repetition tracking
+            if sig == last_call_key:
                 consecutive_repeat_count += 1
             else:
-                last_call_key = call_key
+                last_call_key = sig
                 consecutive_repeat_count = 1
 
-            if consecutive_repeat_count >= CONSECUTIVE_REPEAT_LIMIT:
+            # 4. Evaluate policy pre-execution
+            decision = self.policy.evaluate_call(
+                tool_call=tool_call,
+                steps_used=steps_used,
+                total_output_bytes=total_output_bytes,
+                calls_by_tool=calls_by_tool,
+                consecutive_repeat_count=consecutive_repeat_count,
+            )
+
+            if decision.action == PolicyAction.TERMINATE:
+                return _build_result(
+                    file_operations=None,
+                    completed=False,
+                    termination_reason=decision.reason or "policy_terminated",
+                    error_message=decision.message or "Execution terminated by policy.",
+                )
+
+            if decision.action == PolicyAction.REJECT:
+                tool_errors += 1
+                reject_result = ToolResult(
+                    call_id=tool_call.call_id,
+                    tool_name=tool_call.tool_name,
+                    output=decision.message or f"Tool call '{tool_call.tool_name}' was rejected by execution policy.",
+                    is_error=True,
+                )
+                reject_bytes = len(reject_result.output.encode("utf-8"))
+                output_bytes_by_tool[tool_call.tool_name] = output_bytes_by_tool.get(tool_call.tool_name, 0) + reject_bytes
+                history.append((tool_call, reject_result))
+                steps_used += 1
+                total_output_bytes += reject_bytes
+                continue
+
+            if decision.action == PolicyAction.CIRCUIT_BREAKER:
+                circuit_breaker_events += 1
+                tool_errors += 1
                 breaker_result = ToolResult(
                     call_id=tool_call.call_id,
                     tool_name=tool_call.tool_name,
-                    output=f"Circuit breaker triggered: repeated identical tool call '{tool_call.tool_name}' detected {CONSECUTIVE_REPEAT_LIMIT} times consecutively. Please proceed to generate code changes or try a different action.",
+                    output=decision.message or f"Circuit breaker triggered: repeated identical tool call '{tool_call.tool_name}' detected.",
                     is_error=True,
                 )
+                breaker_bytes = len(breaker_result.output.encode("utf-8"))
+                output_bytes_by_tool[tool_call.tool_name] = output_bytes_by_tool.get(tool_call.tool_name, 0) + breaker_bytes
                 history.append((tool_call, breaker_result))
                 steps_used += 1
-                total_output_bytes += len(breaker_result.output.encode("utf-8"))
+                total_output_bytes += breaker_bytes
 
                 # Reset repeat counter so provider gets one chance to recover or terminate
                 consecutive_repeat_count = 0
                 continue
 
-            # 7. Execute tool securely via ToolRegistry
+            # 5. Execute tool securely via ToolRegistry
             tool_result = self.registry.execute(tool_call)
+            res_bytes = len(tool_result.output.encode("utf-8"))
+            output_bytes_by_tool[tool_call.tool_name] = output_bytes_by_tool.get(tool_call.tool_name, 0) + res_bytes
+            if tool_result.truncated:
+                truncated_results += 1
+            if tool_result.is_error:
+                tool_errors += 1
+
             history.append((tool_call, tool_result))
             steps_used += 1
-            total_output_bytes += len(tool_result.output.encode("utf-8"))
+            total_output_bytes += res_bytes
 

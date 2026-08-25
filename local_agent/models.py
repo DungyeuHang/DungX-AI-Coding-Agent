@@ -877,3 +877,251 @@ class ToolResult:
         return cls(**data)
 
 
+@dataclass
+class ToolExecutionMetrics:
+    """Detailed telemetry and observability metrics for a ToolEngine execution session."""
+    total_calls: int = 0
+    unique_calls: int = 0
+    repeated_calls: int = 0
+    calls_by_tool: dict[str, int] = field(default_factory=dict)
+    total_output_bytes: int = 0
+    output_bytes_by_tool: dict[str, int] = field(default_factory=dict)
+    truncated_results: int = 0
+    tool_errors: int = 0
+    circuit_breaker_events: int = 0
+    steps_used: int = 0
+    history_entries: int = 0
+    termination_reason: str | None = None
+    completed: bool = False
+    elapsed_ms: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_calls": self.total_calls,
+            "unique_calls": self.unique_calls,
+            "repeated_calls": self.repeated_calls,
+            "calls_by_tool": dict(self.calls_by_tool),
+            "total_output_bytes": self.total_output_bytes,
+            "output_bytes_by_tool": dict(self.output_bytes_by_tool),
+            "truncated_results": self.truncated_results,
+            "tool_errors": self.tool_errors,
+            "circuit_breaker_events": self.circuit_breaker_events,
+            "steps_used": self.steps_used,
+            "history_entries": self.history_entries,
+            "termination_reason": self.termination_reason,
+            "completed": self.completed,
+            "elapsed_ms": round(self.elapsed_ms, 3),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(
+            total_calls=data.get("total_calls", 0),
+            unique_calls=data.get("unique_calls", 0),
+            repeated_calls=data.get("repeated_calls", 0),
+            calls_by_tool=dict(data.get("calls_by_tool", {})),
+            total_output_bytes=data.get("total_output_bytes", 0),
+            output_bytes_by_tool=dict(data.get("output_bytes_by_tool", {})),
+            truncated_results=data.get("truncated_results", 0),
+            tool_errors=data.get("tool_errors", 0),
+            circuit_breaker_events=data.get("circuit_breaker_events", 0),
+            steps_used=data.get("steps_used", 0),
+            history_entries=data.get("history_entries", 0),
+            termination_reason=data.get("termination_reason"),
+            completed=data.get("completed", False),
+            elapsed_ms=float(data.get("elapsed_ms", 0.0)),
+        )
+
+
+class PolicyAction(str, Enum):
+    ALLOW = "allow"
+    REJECT = "reject"
+    TERMINATE = "terminate"
+    CIRCUIT_BREAKER = "circuit_breaker"
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    action: PolicyAction
+    reason: str | None = None
+    message: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, PolicyAction):
+            if isinstance(self.action, str):
+                object.__setattr__(self, "action", PolicyAction(self.action))
+            else:
+                raise ValueError(f"Invalid PolicyAction: {self.action}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action.value,
+            "reason": self.reason,
+            "message": self.message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(
+            action=PolicyAction(data["action"]),
+            reason=data.get("reason"),
+            message=data.get("message"),
+        )
+
+
+@dataclass(frozen=True)
+class ToolExecutionPolicy:
+    """Configurable execution policy governing tool usage, limits, and circuit breakers."""
+    max_tool_steps: int = 8
+    max_tool_output_bytes: int = 4000
+    total_tool_budget_bytes: int = 32000
+    max_consecutive_repeats: int = 3
+    per_tool_limits: dict[str, int] = field(default_factory=dict)
+    disallowed_tools: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_tool_steps, int) or self.max_tool_steps <= 0:
+            raise ValueError(f"max_tool_steps must be an integer > 0, got {self.max_tool_steps}")
+        if not isinstance(self.max_tool_output_bytes, int) or self.max_tool_output_bytes <= 0:
+            raise ValueError(f"max_tool_output_bytes must be an integer > 0, got {self.max_tool_output_bytes}")
+        if not isinstance(self.total_tool_budget_bytes, int) or self.total_tool_budget_bytes <= 0:
+            raise ValueError(f"total_tool_budget_bytes must be an integer > 0, got {self.total_tool_budget_bytes}")
+        if not isinstance(self.max_consecutive_repeats, int) or self.max_consecutive_repeats <= 0:
+            raise ValueError(f"max_consecutive_repeats must be an integer > 0, got {self.max_consecutive_repeats}")
+
+        if not isinstance(self.per_tool_limits, dict):
+            raise ValueError("per_tool_limits must be a dictionary")
+        for tool_name, limit in self.per_tool_limits.items():
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                raise ValueError(f"Tool name in per_tool_limits must be a non-empty string, got {tool_name!r}")
+            if not isinstance(limit, int) or limit < 0:
+                raise ValueError(f"Limit for tool '{tool_name}' in per_tool_limits must be a non-negative integer, got {limit}")
+
+        if not isinstance(self.disallowed_tools, (set, frozenset, list, tuple)):
+            raise ValueError("disallowed_tools must be a set or list of strings")
+        for tool_name in self.disallowed_tools:
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                raise ValueError(f"Tool name in disallowed_tools must be a non-empty string, got {tool_name!r}")
+        if isinstance(self.disallowed_tools, (list, tuple)):
+            object.__setattr__(self, "disallowed_tools", set(self.disallowed_tools))
+
+    def evaluate_call(
+        self,
+        tool_call: ToolCall,
+        steps_used: int,
+        total_output_bytes: int,
+        calls_by_tool: dict[str, int],
+        consecutive_repeat_count: int,
+    ) -> PolicyDecision:
+        """Evaluate whether a candidate tool call should be allowed, rejected, circuit-broken, or terminated."""
+        # 1. Step budget check
+        if steps_used >= self.max_tool_steps:
+            return PolicyDecision(
+                action=PolicyAction.TERMINATE,
+                reason="max_steps_exceeded",
+                message=f"Reached maximum allowed tool steps ({self.max_tool_steps}).",
+            )
+
+        # 2. Total byte budget check
+        if total_output_bytes >= self.total_tool_budget_bytes:
+            return PolicyDecision(
+                action=PolicyAction.TERMINATE,
+                reason="budget_exhausted",
+                message=f"Exceeded total tool output budget ({self.total_tool_budget_bytes} bytes).",
+            )
+
+        # 3. Disallowed tool check
+        if tool_call.tool_name in self.disallowed_tools:
+            return PolicyDecision(
+                action=PolicyAction.REJECT,
+                reason="disallowed_tool",
+                message=f"Tool '{tool_call.tool_name}' is disallowed by execution policy.",
+            )
+
+        # 4. Per-tool invocation limit check
+        tool_call_count = calls_by_tool.get(tool_call.tool_name, 0)
+        tool_limit = self.per_tool_limits.get(tool_call.tool_name)
+        if tool_limit is not None and tool_call_count > tool_limit:
+            return PolicyDecision(
+                action=PolicyAction.REJECT,
+                reason="tool_limit_exceeded",
+                message=f"Tool '{tool_call.tool_name}' exceeded its per-tool invocation limit of {tool_limit}.",
+            )
+
+        # 5. Consecutive repeat circuit breaker
+        if consecutive_repeat_count >= self.max_consecutive_repeats:
+            return PolicyDecision(
+                action=PolicyAction.CIRCUIT_BREAKER,
+                reason="consecutive_repeats_exceeded",
+                message=(
+                    f"Circuit breaker triggered: repeated identical tool call '{tool_call.tool_name}' "
+                    f"detected {self.max_consecutive_repeats} times consecutively. Please proceed to generate code changes or try a different action."
+                ),
+            )
+
+        return PolicyDecision(action=PolicyAction.ALLOW)
+
+    def evaluate_result(
+        self,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        steps_used: int,
+        total_output_bytes: int,
+    ) -> PolicyDecision:
+        """Evaluate session policy after a tool result has been added."""
+        if total_output_bytes >= self.total_tool_budget_bytes:
+            return PolicyDecision(
+                action=PolicyAction.TERMINATE,
+                reason="budget_exhausted",
+                message=f"Exceeded total tool output budget ({self.total_tool_budget_bytes} bytes).",
+            )
+        if steps_used >= self.max_tool_steps:
+            return PolicyDecision(
+                action=PolicyAction.TERMINATE,
+                reason="max_steps_exceeded",
+                message=f"Reached maximum allowed tool steps ({self.max_tool_steps}).",
+            )
+        return PolicyDecision(action=PolicyAction.ALLOW)
+
+    def evaluate_continuation(
+        self,
+        steps_used: int,
+        total_output_bytes: int,
+    ) -> PolicyDecision:
+        """Evaluate whether another exploration turn is allowed under policy constraints."""
+        if steps_used >= self.max_tool_steps:
+            return PolicyDecision(
+                action=PolicyAction.TERMINATE,
+                reason="max_steps_exceeded",
+                message=f"Reached maximum allowed tool steps ({self.max_tool_steps}).",
+            )
+        if total_output_bytes >= self.total_tool_budget_bytes:
+            return PolicyDecision(
+                action=PolicyAction.TERMINATE,
+                reason="budget_exhausted",
+                message=f"Exceeded total tool output budget ({self.total_tool_budget_bytes} bytes).",
+            )
+        return PolicyDecision(action=PolicyAction.ALLOW)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_tool_steps": self.max_tool_steps,
+            "max_tool_output_bytes": self.max_tool_output_bytes,
+            "total_tool_budget_bytes": self.total_tool_budget_bytes,
+            "max_consecutive_repeats": self.max_consecutive_repeats,
+            "per_tool_limits": dict(self.per_tool_limits),
+            "disallowed_tools": sorted(list(self.disallowed_tools)),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(
+            max_tool_steps=data.get("max_tool_steps", 8),
+            max_tool_output_bytes=data.get("max_tool_output_bytes", 4000),
+            total_tool_budget_bytes=data.get("total_tool_budget_bytes", 32000),
+            max_consecutive_repeats=data.get("max_consecutive_repeats", 3),
+            per_tool_limits=dict(data.get("per_tool_limits", {})),
+            disallowed_tools=set(data.get("disallowed_tools", [])),
+        )
+
+

@@ -36,6 +36,7 @@ from .models import (
     Task,
     TaskStatus,
     ToolCall,
+    ToolExecutionMetrics,
     ToolResult,
     ValidationPlan,
 )
@@ -161,18 +162,20 @@ class Orchestrator:
         review = None
 
         # If resuming from a paused state, reset status to allow completion
-        if task.status == TaskStatus.PAUSED and current_subtask is not None and current_subtask.latest_checkpoint_id:
+        if task.status == TaskStatus.PAUSED:
             task.status = TaskStatus.PENDING
-            current_subtask.status = SubtaskStatus.PENDING
-            current_subtask.completed_at = None
+            if current_subtask is not None:
+                current_subtask.status = SubtaskStatus.PENDING
+                current_subtask.completed_at = None
 
         # Phase 3.14: Resume diagnostic / secondary-validation state and Phase 4.0 tool history from the latest checkpoint, if present.
         current_diagnostic_evidence: list[ExecutionResult] = []
         executed_diagnostic_names_this_iteration: list[str] = []
         current_tool_history: list[tuple[ToolCall, ToolResult]] = []
-        if current_subtask and current_subtask.latest_checkpoint_id:
+        latest_checkpoint_id = (current_subtask.latest_checkpoint_id if current_subtask else None) or task.latest_checkpoint_id
+        if latest_checkpoint_id:
             try:
-                checkpoint = self.storage.load_checkpoint(current_subtask.latest_checkpoint_id)
+                checkpoint = self.storage.load_checkpoint(latest_checkpoint_id)
                 if checkpoint is not None:
                     current_diagnostic_evidence = [ExecutionResult.from_dict(d) for d in checkpoint.continuation_context.get("diagnostic_evidence", [])]
                     executed_diagnostic_names_this_iteration = list( # Ensure it's a list for mutability
@@ -181,6 +184,10 @@ class Orchestrator:
                     raw_tool_history = checkpoint.continuation_context.get("tool_history", [])
                     if raw_tool_history:
                         current_tool_history = history_from_dict(raw_tool_history)
+                        report.tool_history = list(current_tool_history)
+                    raw_tool_metrics = checkpoint.continuation_context.get("tool_metrics", [])
+                    if raw_tool_metrics:
+                        report.tool_metrics = [ToolExecutionMetrics.from_dict(m) if isinstance(m, dict) else m for m in raw_tool_metrics]
                     # Load the last failure from checkpoint to continue repair iterations
                     last_failures = checkpoint.continuation_context.get("validation_state", {}).get("last_failures", [])
                     if last_failures:
@@ -224,6 +231,7 @@ class Orchestrator:
                         review=review,
                         stage_name=stage_name,
                         tool_history=current_tool_history,
+                        report=report,
                     )
                 except ProviderError as exc:
                     self._record_provider_failure(task, current_subtask, exc, f"{stage_name} provider request failed")
@@ -247,6 +255,7 @@ class Orchestrator:
                             'diagnostic_evidence': [e.to_dict() for e in current_diagnostic_evidence],
                             'executed_diagnostic_names_this_iteration': executed_diagnostic_names_this_iteration,
                             'tool_history': history_to_dict(current_tool_history),
+                            'tool_metrics': [m.to_dict() if hasattr(m, "to_dict") else m for m in report.tool_metrics],
                         }
                         self._create_checkpoint(task, current_subtask, "After code generation (Paused due to provider error)", context, report, extra_context=extra_context)
                     else:
@@ -511,6 +520,7 @@ class Orchestrator:
         review: ReviewResult | None,
         stage_name: str,
         tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
+        report: RunReport | None = None,
     ) -> tuple[list[FileOperation], list[tuple[ToolCall, ToolResult]]]:
         capability = ProviderCapability.REPAIR if failure else ProviderCapability.IMPLEMENTATION
 
@@ -528,7 +538,8 @@ class Orchestrator:
                     command_runner=self.runner,
                     semantic_index=getattr(context, "semantic_index", None),
                 )
-                engine = ToolEngine(provider=provider, registry=registry)
+                policy = getattr(self.config, "tool_policy", None)
+                engine = ToolEngine(provider=provider, registry=registry, policy=policy)
                 result = engine.run(
                     task=task_obj,
                     plan=plan,
@@ -537,6 +548,10 @@ class Orchestrator:
                     failure=failure,
                     review=review,
                 )
+                if report is not None:
+                    report.tool_metrics.append(result.metrics)
+                    report.tool_history = list(result.tool_history)
+
                 if not result.completed or result.file_operations is None:
                     raise ProviderError(
                         f"ToolEngine failed to generate code ({result.termination_reason}): {result.error_message or 'No file operations produced'}"
@@ -679,6 +694,13 @@ class Orchestrator:
         if extra_context:
             continuation_context.update(extra_context)
 
+        # Merge tool exploration state if present in report
+        if report:
+            if report.tool_history and "tool_history" not in continuation_context:
+                continuation_context["tool_history"] = history_to_dict(report.tool_history)
+            if report.tool_metrics and "tool_metrics" not in continuation_context:
+                continuation_context["tool_metrics"] = [m.to_dict() if hasattr(m, "to_dict") else m for m in report.tool_metrics]
+
         checkpoint = Checkpoint(
             checkpoint_id=checkpoint_id,
             task_id=task.task_id,
@@ -776,6 +798,8 @@ class Orchestrator:
         dummy_plan = Plan(objective=task.objective)
         dummy_validation_plan = ValidationPlan(commands=[], primary_commands=[], secondary_commands=[], skipped_commands=[], reasons=[], risk_level="low")
         dummy_impact = ChangeImpact(summary="No impact analysis available in report snapshot", targets=[])
+        tool_metrics: list[ToolExecutionMetrics] = []
+        tool_history: list[tuple[ToolCall, ToolResult]] = []
 
         # Attempt to load from latest checkpoint if available
         if task.latest_checkpoint_id:
@@ -785,7 +809,13 @@ class Orchestrator:
                 # This is a simplification; a full restoration would be more complex
                 if checkpoint and checkpoint.validation_state and checkpoint.validation_state.get("validation_plan"):
                     dummy_validation_plan = ValidationPlan.from_dict(checkpoint.validation_state["validation_plan"])
-                # You might also reconstruct plan, impact from checkpoint.continuation_context
+                if checkpoint and checkpoint.continuation_context:
+                    raw_metrics = checkpoint.continuation_context.get("tool_metrics", [])
+                    if raw_metrics:
+                        tool_metrics = [ToolExecutionMetrics.from_dict(m) if isinstance(m, dict) else m for m in raw_metrics]
+                    raw_history = checkpoint.continuation_context.get("tool_history", [])
+                    if raw_history:
+                        tool_history = history_from_dict(raw_history)
             except FileNotFoundError:
                 pass # Checkpoint might be missing if task is new or corrupted
 
@@ -816,5 +846,7 @@ class Orchestrator:
             provider_metrics=task.provider_execution_history,
             task_id=task.task_id,
             subtask_id=current_subtask.subtask_id if current_subtask else None,
+            tool_metrics=tool_metrics,
+            tool_history=tool_history,
         )
 
