@@ -768,6 +768,8 @@ class RunReport:
     outcome: str = ""
     provider_metrics: list[ProviderMetric] = field(default_factory=list)
     plan_proposal: PlanProposal | None = None
+    tool_metrics: list[ToolExecutionMetrics] = field(default_factory=list)
+    tool_history: list[tuple[ToolCall, ToolResult]] = field(default_factory=list)
 
 
 class ProviderError(RuntimeError):
@@ -894,6 +896,8 @@ class ToolExecutionMetrics:
     termination_reason: str | None = None
     completed: bool = False
     elapsed_ms: float = 0.0
+    compacted_entries: int = 0
+    model_context_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -911,6 +915,8 @@ class ToolExecutionMetrics:
             "termination_reason": self.termination_reason,
             "completed": self.completed,
             "elapsed_ms": round(self.elapsed_ms, 3),
+            "compacted_entries": self.compacted_entries,
+            "model_context_bytes": self.model_context_bytes,
         }
 
     @classmethod
@@ -930,6 +936,8 @@ class ToolExecutionMetrics:
             termination_reason=data.get("termination_reason"),
             completed=data.get("completed", False),
             elapsed_ms=float(data.get("elapsed_ms", 0.0)),
+            compacted_entries=data.get("compacted_entries", 0),
+            model_context_bytes=data.get("model_context_bytes", 0),
         )
 
 
@@ -978,6 +986,8 @@ class ToolExecutionPolicy:
     max_consecutive_repeats: int = 3
     per_tool_limits: dict[str, int] = field(default_factory=dict)
     disallowed_tools: set[str] = field(default_factory=set)
+    compaction_window: int = 2
+    max_context_bytes: int = 8000
 
     def __post_init__(self) -> None:
         if not isinstance(self.max_tool_steps, int) or self.max_tool_steps <= 0:
@@ -988,6 +998,10 @@ class ToolExecutionPolicy:
             raise ValueError(f"total_tool_budget_bytes must be an integer > 0, got {self.total_tool_budget_bytes}")
         if not isinstance(self.max_consecutive_repeats, int) or self.max_consecutive_repeats <= 0:
             raise ValueError(f"max_consecutive_repeats must be an integer > 0, got {self.max_consecutive_repeats}")
+        if not isinstance(self.compaction_window, int) or self.compaction_window <= 0:
+            raise ValueError(f"compaction_window must be an integer > 0, got {self.compaction_window}")
+        if not isinstance(self.max_context_bytes, int) or self.max_context_bytes <= 0:
+            raise ValueError(f"max_context_bytes must be an integer > 0, got {self.max_context_bytes}")
 
         if not isinstance(self.per_tool_limits, dict):
             raise ValueError("per_tool_limits must be a dictionary")
@@ -1111,6 +1125,8 @@ class ToolExecutionPolicy:
             "max_consecutive_repeats": self.max_consecutive_repeats,
             "per_tool_limits": dict(self.per_tool_limits),
             "disallowed_tools": sorted(list(self.disallowed_tools)),
+            "compaction_window": self.compaction_window,
+            "max_context_bytes": self.max_context_bytes,
         }
 
     @classmethod
@@ -1122,6 +1138,8 @@ class ToolExecutionPolicy:
             max_consecutive_repeats=data.get("max_consecutive_repeats", 3),
             per_tool_limits=dict(data.get("per_tool_limits", {})),
             disallowed_tools=set(data.get("disallowed_tools", [])),
+            compaction_window=data.get("compaction_window", 2),
+            max_context_bytes=data.get("max_context_bytes", 8000),
         )
 
 

@@ -97,6 +97,128 @@ class ToolEngineResult:
         )
 
 
+class ToolContextCompactor:
+    """Deterministic, provider-agnostic compactor for model-facing exploration context."""
+
+    def __init__(self, window: int = 2, max_context_bytes: int = 8000):
+        self.window = max(1, window)
+        self.max_context_bytes = max(500, max_context_bytes)
+
+    def compact(
+        self,
+        history: list[tuple[ToolCall, ToolResult]],
+    ) -> tuple[list[tuple[ToolCall, ToolResult]], int, int]:
+        """Produce a separate, compacted model-facing exploration history from canonical history.
+
+        Returns:
+            (model_facing_history, compacted_entries_count, model_context_bytes)
+        """
+        if not history:
+            return [], 0, 0
+
+        model_history: list[tuple[ToolCall, ToolResult]] = []
+        compacted_count = 0
+        total_len = len(history)
+
+        for idx, (call, result) in enumerate(history):
+            # 1. Highest priority: Errors and circuit-breaker information are ALWAYS full fidelity
+            if result.is_error or "Circuit breaker" in result.output:
+                model_history.append((call, result))
+                continue
+
+            # 2. Recent window turns (last self.window items) are ALWAYS full fidelity
+            if idx >= total_len - self.window:
+                model_history.append((call, result))
+                continue
+
+            # 3. Older successful turns: apply deterministic structural reduction
+            compacted_res = self._compact_result(call, result)
+            if compacted_res.output != result.output:
+                compacted_count += 1
+            model_history.append((call, compacted_res))
+
+        model_bytes = sum(len(res.output.encode("utf-8")) for _, res in model_history)
+        return model_history, compacted_count, model_bytes
+
+    def _compact_result(self, call: ToolCall, result: ToolResult) -> ToolResult:
+        """Deterministically compact older tool output preserving useful semantic information."""
+        output = result.output
+        if len(output) <= 250:
+            return result
+
+        tool_name = call.tool_name
+        if tool_name == "read_file_range":
+            lines = output.splitlines()
+            if len(lines) > 8:
+                head = lines[:3]
+                tail = lines[-3:]
+
+                def _is_def(l: str) -> bool:
+                    stripped = l.lstrip()
+                    if ":" in stripped:
+                        prefix, rest = stripped.split(":", 1)
+                        if prefix.isdigit():
+                            stripped = rest.lstrip()
+                    return stripped.startswith(("def ", "class ", "async def "))
+
+                defs = [l for l in lines[3:-3] if _is_def(l)]
+                omitted_count = max(0, len(lines) - len(head) - len(tail) - len(defs))
+                mid_parts = []
+                if defs:
+                    mid_parts.extend(defs)
+                if omitted_count > 0:
+                    mid_parts.append(f"... [{omitted_count} body lines omitted for compaction] ...")
+                compacted_lines = head + mid_parts + tail
+                compacted_output = "\n".join(compacted_lines)
+                return ToolResult(
+                    call_id=result.call_id,
+                    tool_name=result.tool_name,
+                    output=compacted_output,
+                    is_error=result.is_error,
+                    truncated=result.truncated,
+                )
+
+        elif tool_name in {"find_files", "grep_code", "search_symbols"}:
+            lines = output.splitlines()
+            if len(lines) > 10:
+                head = lines[:10]
+                compacted_lines = head + [f"... [{len(lines) - 10} additional matches omitted for compaction]"]
+                return ToolResult(
+                    call_id=result.call_id,
+                    tool_name=result.tool_name,
+                    output="\n".join(compacted_lines),
+                    is_error=result.is_error,
+                    truncated=result.truncated,
+                )
+
+        elif tool_name == "run_command_sandbox":
+            lines = output.splitlines()
+            if len(lines) > 10:
+                head = lines[:5]
+                tail = lines[-5:]
+                compacted_lines = head + [f"... [{len(lines) - 10} stdout lines omitted]"] + tail
+                return ToolResult(
+                    call_id=result.call_id,
+                    tool_name=result.tool_name,
+                    output="\n".join(compacted_lines),
+                    is_error=result.is_error,
+                    truncated=result.truncated,
+                )
+
+        # Fallback for generic long text
+        if len(output) > 500:
+            compacted_output = output[:250] + "\n... [omitted for context efficiency] ...\n" + output[-200:]
+            return ToolResult(
+                call_id=result.call_id,
+                tool_name=result.tool_name,
+                output=compacted_output,
+                is_error=result.is_error,
+                truncated=result.truncated,
+            )
+
+        return result
+
+
 class ToolEngine:
     """Coordinates a bounded, interactive tool-use loop with a provider and ToolRegistry."""
 
@@ -171,6 +293,11 @@ class ToolEngine:
         history: list[tuple[ToolCall, ToolResult]] = initial_history if initial_history is not None else []
         tools = self.registry.definitions()
 
+        compactor = ToolContextCompactor(
+            window=self.policy.compaction_window,
+            max_context_bytes=self.policy.max_context_bytes,
+        )
+
         # Telemetry tracking structures
         seen_call_signatures: list[tuple[str, str]] = []
         calls_by_tool: dict[str, int] = {}
@@ -199,6 +326,9 @@ class ToolEngine:
         last_call_key: tuple[str, str] | None = None
         consecutive_repeat_count = 0
 
+        compacted_entries = 0
+        model_context_bytes = total_output_bytes
+
         def _build_result(
             file_operations: list[FileOperation] | None,
             completed: bool,
@@ -225,6 +355,8 @@ class ToolEngine:
                 termination_reason=termination_reason,
                 completed=completed,
                 elapsed_ms=elapsed_ms,
+                compacted_entries=compacted_entries,
+                model_context_bytes=model_context_bytes,
             )
             return ToolEngineResult(
                 file_operations=file_operations,
@@ -238,9 +370,12 @@ class ToolEngine:
             )
 
         while True:
-            # 1. Ask provider for next action
+            # Derive model-facing context from canonical history
+            model_history, compacted_entries, model_context_bytes = compactor.compact(history)
+
+            # 1. Ask provider for next action with model-facing history
             provider_response = self._call_provider_step(
-                task, plan, context, tools, history, failure=failure, review=review
+                task, plan, context, tools, model_history, failure=failure, review=review
             )
 
             # 2. Check if provider returned final FileOperations list

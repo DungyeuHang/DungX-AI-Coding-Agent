@@ -66,6 +66,8 @@ class AgentConfig:
     max_consecutive_repeats: int = 3
     per_tool_limits: dict[str, int] = field(default_factory=dict)
     disallowed_tools: list[str] = field(default_factory=list)
+    tool_history_compaction_window: int = 2
+    max_tool_history_context_bytes: int = 8000
 
     @property
     def tool_policy(self) -> Any:
@@ -77,6 +79,8 @@ class AgentConfig:
             max_consecutive_repeats=self.max_consecutive_repeats,
             per_tool_limits=dict(self.per_tool_limits),
             disallowed_tools=set(self.disallowed_tools),
+            compaction_window=self.tool_history_compaction_window,
+            max_context_bytes=self.max_tool_history_context_bytes,
         )
 
     @classmethod
@@ -122,6 +126,8 @@ class AgentConfig:
             "max_consecutive_repeats": "AGENT_MAX_CONSECUTIVE_REPEATS",
             "per_tool_limits": "AGENT_PER_TOOL_LIMITS",
             "disallowed_tools": "AGENT_DISALLOWED_TOOLS",
+            "tool_history_compaction_window": "AGENT_TOOL_COMPACTION_WINDOW",
+            "max_tool_history_context_bytes": "AGENT_MAX_TOOL_HISTORY_CONTEXT_BYTES",
         }
 
         def value(name: str, default: object) -> object:
@@ -229,6 +235,8 @@ class AgentConfig:
             max_consecutive_repeats=_positive_int(value("max_consecutive_repeats", 3), "max_consecutive_repeats"),
             per_tool_limits=per_tool_limits_val,
             disallowed_tools=disallowed_tools_val,
+            tool_history_compaction_window=_positive_int(value("tool_history_compaction_window", 2), "tool_history_compaction_window"),
+            max_tool_history_context_bytes=_positive_int(value("max_tool_history_context_bytes", 8000), "max_tool_history_context_bytes"),
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -247,7 +255,7 @@ class AgentConfig:
             raise ValueError("command_timeout_seconds must be positive")
         if self.max_parallel_subtasks < 1:
             raise ValueError("max_parallel_subtasks must be at least 1")
-        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats"):
+        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats", "tool_history_compaction_window", "max_tool_history_context_bytes"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
         if self.provider_max_retries < 0:
