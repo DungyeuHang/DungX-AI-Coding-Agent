@@ -515,10 +515,13 @@ class Orchestrator:
         capability = ProviderCapability.REPAIR if failure else ProviderCapability.IMPLEMENTATION
 
         def _action(provider: AIProvider) -> tuple[list[FileOperation], list[tuple[ToolCall, ToolResult]]]:
-            provider_caps = getattr(provider, "capabilities", set())
+            try:
+                provider_caps = getattr(provider, "capabilities", None)
+            except Exception:
+                provider_caps = None
             task_obj = task.objective if hasattr(task, "objective") else str(task)
 
-            if ProviderCapability.TOOL_USE in provider_caps:
+            if isinstance(provider_caps, (set, frozenset)) and ProviderCapability.TOOL_USE in provider_caps:
                 registry = ToolRegistry(
                     self.config.project,
                     filesystem=self.filesystem,

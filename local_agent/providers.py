@@ -44,7 +44,12 @@ class AIProvider:
         return getattr(self, "_provider_metrics", [])
     @property
     def capabilities(self) -> set[ProviderCapability]:
-        raise NotImplementedError
+        return {
+            ProviderCapability.PLANNING,
+            ProviderCapability.IMPLEMENTATION,
+            ProviderCapability.REPAIR,
+            ProviderCapability.REVIEW,
+        }
 
     def _record_metric(self, request_type: str, input_size: int, output_size: int, duration_seconds: float, model: str, succeeded: bool, error_category: str = "", actual_input_tokens: int | None = None, actual_output_tokens: int | None = None) -> None:
         if not getattr(self, "metrics_enabled", False):
