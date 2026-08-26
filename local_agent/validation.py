@@ -1,11 +1,32 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
-import re
 from pathlib import Path
-from typing import Literal
+import re
+from typing import Any, Literal
 
-from .models import ChangeImpact, CommandSpec, ProjectContext, RepositoryMap, ValidationCommand, ValidationPlan
+from .models import (
+    ChangeImpact,
+    CommandSpec,
+    FailureAnalysis,
+    Plan,
+    ProjectContext,
+    ProviderCapability,
+    ProviderError,
+    RepositoryMap,
+    ReviewResult,
+    RunReport,
+    ToolCall,
+    ToolDefinition,
+    ToolExecutionPolicy,
+    ToolResult,
+    ValidationCommand,
+    ValidationPlan,
+)
+from .providers import AIProvider
+from .tool_engine import ToolEngine
+from .tools import ToolRegistry
 
 _INTENT_KEYWORDS = {
     "add": re.compile(r"\b(add|create|implement|introduce|build)\b", re.I),
@@ -309,3 +330,187 @@ class ValidationIntelligence:
             reasons=list(set(reasons)), # Deduplicate reasons
             risk_level=overall_risk,
         )
+
+    def discover_targeted_commands(
+        self,
+        changed_files: list[str],
+        repo_map: RepositoryMap | None = None,
+    ) -> list[CommandSpec]:
+        """Discover targeted test commands for the specific files modified during implementation."""
+        if not changed_files:
+            return []
+
+        targeted: list[CommandSpec] = []
+        seen_cmds: set[tuple[str, ...]] = set()
+
+        for changed in changed_files:
+            p = Path(changed)
+            posix_path = p.as_posix()
+            stem = p.stem
+            ext = p.suffix.lower()
+
+            is_test_file = (
+                "test" in posix_path.lower()
+                or stem.startswith("test_")
+                or stem.endswith("_test")
+                or stem.endswith(".test")
+                or stem.endswith(".spec")
+            )
+            candidate_test_paths: list[str] = []
+            if is_test_file:
+                candidate_test_paths.append(posix_path)
+            else:
+                if ext == ".py":
+                    candidate_test_paths.extend([
+                        f"tests/test_{stem}.py",
+                        f"test/test_{stem}.py",
+                        f"tests/{stem}_test.py",
+                        f"tests/unit/test_{stem}.py",
+                        f"test_{stem}.py",
+                        f"{p.parent.as_posix()}/test_{stem}.py" if p.parent.as_posix() != "." else f"test_{stem}.py",
+                    ])
+                elif ext in {".ts", ".tsx", ".js", ".jsx"}:
+                    candidate_test_paths.extend([
+                        f"{p.parent.as_posix()}/{stem}.test{ext}" if p.parent.as_posix() != "." else f"{stem}.test{ext}",
+                        f"{p.parent.as_posix()}/{stem}.spec{ext}" if p.parent.as_posix() != "." else f"{stem}.spec{ext}",
+                        f"tests/{stem}.test{ext}",
+                        f"tests/{stem}.test.ts",
+                        f"tests/{stem}.test.js",
+                        f"test/{stem}.test.ts",
+                        f"test/{stem}.test.js",
+                    ])
+
+            for candidate in candidate_test_paths:
+                candidate_path = self.root / candidate
+                if candidate_path.exists() and candidate_path.is_file():
+                    try:
+                        rel_candidate = candidate_path.relative_to(self.root).as_posix()
+                    except ValueError:
+                        rel_candidate = Path(candidate).as_posix()
+
+                    clean_stem = Path(rel_candidate).stem
+                    if clean_stem.endswith(".test") or clean_stem.endswith(".spec"):
+                        clean_stem = Path(clean_stem).stem
+
+                    if ext == ".py" or rel_candidate.endswith(".py"):
+                        cmd_tuple = ("pytest", rel_candidate)
+                        if cmd_tuple not in seen_cmds:
+                            seen_cmds.add(cmd_tuple)
+                            targeted.append(
+                                CommandSpec(
+                                    name=f"targeted_pytest_{clean_stem}",
+                                    command=cmd_tuple,
+                                    reason=f"Targeted test for {changed}",
+                                    category="unit_test",
+                                    risk="low",
+                                    destructive=False,
+                                )
+                            )
+                    elif ext in {".ts", ".tsx", ".js", ".jsx"} or any(rel_candidate.endswith(x) for x in [".ts", ".tsx", ".js", ".jsx"]):
+                        cmd_tuple = ("npm", "test", "--", rel_candidate)
+                        if cmd_tuple not in seen_cmds:
+                            seen_cmds.add(cmd_tuple)
+                            targeted.append(
+                                CommandSpec(
+                                    name=f"targeted_test_{clean_stem}",
+                                    command=cmd_tuple,
+                                    reason=f"Targeted test for {changed}",
+                                    category="unit_test",
+                                    risk="low",
+                                    destructive=False,
+                                )
+                            )
+
+        return targeted
+
+
+@dataclass
+class VerificationResult:
+    verified: bool = True
+    notes: str = ""
+    targeted_commands: list[str] = field(default_factory=list)
+
+
+class VerificationIntelligence:
+    """Coordinates tool-assisted verification and assertion inspection prior to full validation."""
+
+    def __init__(
+        self,
+        provider: AIProvider,
+        registry: ToolRegistry | None = None,
+        policy: ToolExecutionPolicy | None = None,
+    ):
+        self.provider = provider
+        self.registry = registry
+        self.policy = policy
+
+    def verify(
+        self,
+        task: str,
+        plan: Plan,
+        context: ProjectContext,
+        diff: str,
+        changed_files: list[str],
+        initial_history: list[tuple[ToolCall, ToolResult]] | None = None,
+        report: RunReport | None = None,
+    ) -> VerificationResult:
+        provider_caps = getattr(self.provider, "capabilities", None)
+        if (
+            isinstance(provider_caps, (set, frozenset))
+            and ProviderCapability.TOOL_USE in provider_caps
+            and self.registry is not None
+            and hasattr(self.provider, "verify_changes_with_tools")
+        ):
+            captured_result: list[VerificationResult] = []
+
+            def _verify_step(
+                task: str,
+                plan: Plan,
+                context: ProjectContext,
+                tools: list[ToolDefinition],
+                tool_history: list[tuple[ToolCall, ToolResult]],
+                failure: FailureAnalysis | None = None,
+                review: ReviewResult | None = None,
+            ) -> Any:
+                resp = self.provider.verify_changes_with_tools(
+                    task=task,
+                    plan=plan,
+                    context=context,
+                    diff=diff,
+                    changed_files=changed_files,
+                    tools=tools,
+                    tool_history=tool_history,
+                )
+                if isinstance(resp, ToolCall):
+                    return resp
+                if isinstance(resp, (dict, VerificationResult)):
+                    if isinstance(resp, dict):
+                        res = VerificationResult(
+                            verified=bool(resp.get("verified", True)),
+                            notes=str(resp.get("notes", "")),
+                            targeted_commands=[str(c) for c in resp.get("targeted_commands", []) if isinstance(c, str)],
+                        )
+                    else:
+                        res = resp
+                    captured_result.append(res)
+                    return [res]  # Signal completion to ToolEngine
+                raise ProviderError(f"Unexpected response from verify_changes_with_tools: {type(resp)}")
+
+            engine = ToolEngine(provider=_verify_step, registry=self.registry, policy=self.policy)
+            result = engine.run(
+                task=f"Verify changes for: {task}",
+                plan=plan,
+                context=context,
+                initial_history=initial_history,
+            )
+
+            if report is not None and result.metrics.total_calls > 0:
+                report.tool_metrics.append(result.metrics)
+                report.tool_history = list(result.tool_history)
+
+            if captured_result:
+                return captured_result[0]
+
+            return VerificationResult(verified=True, notes="Tool verification concluded")
+
+        return VerificationResult(verified=True, notes="Standard verification")

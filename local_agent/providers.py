@@ -118,6 +118,19 @@ class AIProvider:
         """Analyze failure using available tools, or fall back to 1-shot analyze_failure."""
         return self.analyze_failure(execution, diff, context, plan)
 
+    def verify_changes_with_tools(
+        self,
+        task: str,
+        plan: Plan,
+        context: ProjectContext,
+        diff: str,
+        changed_files: list[str],
+        tools: list[ToolDefinition],
+        tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
+    ) -> ToolCall | dict[str, Any]:
+        """Verify changes using available tools, or fall back to default verification."""
+        return {"verified": True, "notes": "One-shot verification fallback"}
+
     def analyze_failure(self, execution: ExecutionResult, diff: str, context: ProjectContext, plan: Plan) -> FailureAnalysis:
         raise NotImplementedError
 
@@ -574,6 +587,97 @@ class OpenAIProvider(BaseHTTPProvider):
             recommended_fix=str(data.get("recommended_fix", "")),
         )
 
+    def verify_changes_with_tools(
+        self,
+        task: str,
+        plan: Plan,
+        context: ProjectContext,
+        diff: str,
+        changed_files: list[str],
+        tools: list[ToolDefinition],
+        tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
+    ) -> ToolCall | dict[str, Any]:
+        system_msg = (
+            "You are a verification expert. Inspect modified files and related test assertions using available tools. "
+            "When verification is complete, return only JSON: {\"verified\": true/false, \"notes\": \"...\", \"targeted_commands\": [\"...\"]}."
+        )
+        user_msg = (
+            f"Task: {task}\n"
+            f"Changed files: {json.dumps(changed_files)}\n"
+            f"Diff:\n{diff[-12000:]}\n"
+            f"Plan:\n{json.dumps(asdict(plan))}\n"
+            f"Context:\n{self._context(context, 'repair')}"
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+        if tool_history:
+            for call, result in tool_history:
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": call.tool_name,
+                                "arguments": json.dumps(call.arguments),
+                            },
+                        }
+                    ],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.call_id,
+                    "content": result.output,
+                })
+
+        req_body: dict[str, Any] = {
+            "model": self.model,
+            "temperature": 0.1,
+            "messages": messages,
+        }
+        if tools:
+            req_body["tools"] = _format_openai_tools(tools)
+            req_body["tool_choice"] = "auto"
+
+        body = json.dumps(req_body).encode("utf-8")
+        payload = self._request_json_api(
+            f"{self.base_url}/chat/completions",
+            body,
+            {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            "chat.completions",
+            self.model,
+            120,
+        )
+
+        try:
+            choice_msg = payload["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderError("OpenAI response did not contain a message choice") from exc
+
+        tool_calls_raw = choice_msg.get("tool_calls")
+        if tool_calls_raw and isinstance(tool_calls_raw, list) and len(tool_calls_raw) > 0:
+            first_call = tool_calls_raw[0]
+            fn = first_call.get("function", {})
+            call_id = first_call.get("id") or f"call_{int(time.time() * 1000)}"
+            fn_name = fn.get("name", "")
+            raw_args = fn.get("arguments", "{}")
+            if not fn_name:
+                raise ProviderError("OpenAI tool call missing function name")
+            try:
+                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except json.JSONDecodeError as exc:
+                raise ProviderError(f"OpenAI tool call '{fn_name}' returned malformed JSON arguments: {raw_args}") from exc
+            return ToolCall(call_id=str(call_id), tool_name=str(fn_name), arguments=parsed_args if isinstance(parsed_args, dict) else {})
+
+        content = choice_msg.get("content", "")
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        return self._parse_json(str(content))
+
     def analyze_failure(self, execution: ExecutionResult, diff: str, context: ProjectContext, plan: Plan) -> FailureAnalysis:
         data = self._json_call("Return only JSON with probable_root_cause, affected_files, recommended_fix.", f"Failed command: {execution.command}\nExit code: {execution.exit_code}\nstdout:\n{execution.stdout[-8000:]}\nstderr:\n{execution.stderr[-8000:]}\nDiff:\n{diff[-12000:]}\nPlan:\n{json.dumps(asdict(plan))}\nContext:\n{self._context(context, 'repair')}")
         return FailureAnalysis(str(data.get("probable_root_cause", "Unknown failure")), _strings(data.get("affected_files")), str(data.get("recommended_fix", "")))
@@ -928,6 +1032,88 @@ class GeminiProvider(BaseHTTPProvider):
             affected_files=_strings(data.get("affected_files")),
             recommended_fix=str(data.get("recommended_fix", "")),
         )
+
+    def verify_changes_with_tools(
+        self,
+        task: str,
+        plan: Plan,
+        context: ProjectContext,
+        diff: str,
+        changed_files: list[str],
+        tools: list[ToolDefinition],
+        tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
+    ) -> ToolCall | dict[str, Any]:
+        self._ensure_model()
+        system_msg = (
+            "You are a verification expert. Inspect modified files and related test assertions using available tools. "
+            "When verification is complete, return only JSON: {\"verified\": true/false, \"notes\": \"...\", \"targeted_commands\": [\"...\"]}."
+        )
+        user_content = (
+            f"Task: {task}\n"
+            f"Changed files: {json.dumps(changed_files)}\n"
+            f"Diff:\n{diff[-12000:]}\n"
+            f"Plan:\n{json.dumps(asdict(plan))}\n"
+            f"Context:\n{self._context(context, 'repair')}"
+        )
+        contents: list[dict[str, Any]] = [
+            {"role": "user", "parts": [{"text": user_content}]},
+        ]
+        if tool_history:
+            for call, result in tool_history:
+                contents.append({
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": call.tool_name,
+                                "args": call.arguments,
+                            }
+                        }
+                    ],
+                })
+                contents.append({
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": call.tool_name,
+                                "response": {"output": result.output},
+                            }
+                        }
+                    ],
+                })
+
+        body_dict: dict[str, Any] = {
+            "systemInstruction": {"parts": [{"text": system_msg}]},
+            "contents": contents,
+            "generationConfig": {"temperature": 0.1},
+        }
+        if tools:
+            body_dict["tools"] = _format_gemini_tools(tools)
+        body = json.dumps(body_dict).encode("utf-8")
+        payload = self._request_json(self._generation_url(), body, "models.generateContent", self.model, 120)
+
+        try:
+            parts = payload["candidates"][0]["content"]["parts"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderError("Gemini response did not contain candidate content") from exc
+
+        for part in parts:
+            if isinstance(part, dict) and "functionCall" in part:
+                fc = part["functionCall"]
+                fn_name = fc.get("name", "")
+                fn_args = fc.get("args", {})
+                if not fn_name:
+                    raise ProviderError("Gemini functionCall missing name")
+                if not isinstance(fn_args, dict):
+                    raise ProviderError("Gemini functionCall args must be a dict")
+                call_id = f"call_{int(time.time() * 1000)}"
+                return ToolCall(call_id=call_id, tool_name=str(fn_name), arguments=fn_args)
+
+        content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
+        if not content:
+            raise ProviderError("Gemini response contained neither functionCall nor text")
+        return OpenAIProvider._parse_json(content)
 
     def analyze_failure(self, execution: ExecutionResult, diff: str, context: ProjectContext, plan: Plan) -> FailureAnalysis:
         data = self._json_call("Return only JSON with probable_root_cause, affected_files, and recommended_fix.", f"Failed command: {execution.command}\nExit code: {execution.exit_code}\nstdout:\n{execution.stdout[-8000:]}\nstderr:\n{execution.stderr[-8000:]}\nDiff:\n{diff[-12000:]}\nPlan:\n{json.dumps(asdict(plan))}\nContext:\n{self._context(context, 'repair')}")
@@ -1333,6 +1519,114 @@ class AnthropicProvider(BaseHTTPProvider):
             affected_files=_strings(data.get("affected_files")),
             recommended_fix=str(data.get("recommended_fix", "")),
         )
+
+    def verify_changes_with_tools(
+        self,
+        task: str,
+        plan: Plan,
+        context: ProjectContext,
+        diff: str,
+        changed_files: list[str],
+        tools: list[ToolDefinition],
+        tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
+    ) -> ToolCall | dict[str, Any]:
+        system_msg = (
+            "You are a verification expert. Inspect modified files and related test assertions using available tools. "
+            "When verification is complete, return only JSON: {\"verified\": true/false, \"notes\": \"...\", \"targeted_commands\": [\"...\"]}."
+        )
+        user_content = (
+            f"Task: {task}\n"
+            f"Changed files: {json.dumps(changed_files)}\n"
+            f"Diff:\n{diff[-12000:]}\n"
+            f"Plan:\n{json.dumps(asdict(plan))}\n"
+            f"Context:\n{self._context(context, 'repair')}"
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": user_content},
+        ]
+        if tool_history:
+            for call, result in tool_history:
+                messages.append({
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": call.call_id,
+                            "name": call.tool_name,
+                            "input": call.arguments,
+                        }
+                    ],
+                })
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": call.call_id,
+                            "content": result.output,
+                            "is_error": result.is_error,
+                        }
+                    ],
+                })
+
+        req_body: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": 8192,
+            "temperature": 0.1,
+            "system": system_msg,
+            "messages": messages,
+        }
+        if tools:
+            req_body["tools"] = _format_anthropic_tools(tools)
+
+        body = json.dumps(req_body).encode("utf-8")
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = self._request_json_api(
+            f"{self.base_url}/messages",
+            body,
+            headers,
+            "messages",
+            self.model,
+            120,
+        )
+
+        try:
+            content_blocks = payload.get("content", [])
+            if not isinstance(content_blocks, list):
+                raise ProviderError("Anthropic response content must be a list")
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderError("Anthropic response did not contain content blocks") from exc
+
+        for block in content_blocks:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                call_id = block.get("id") or f"call_{int(time.time() * 1000)}"
+                fn_name = block.get("name", "")
+                raw_input = block.get("input", {})
+                if not fn_name:
+                    raise ProviderError("Anthropic tool_use block missing name")
+                if isinstance(raw_input, str):
+                    try:
+                        raw_input = json.loads(raw_input)
+                    except json.JSONDecodeError as exc:
+                        raise ProviderError(f"Anthropic tool '{fn_name}' returned malformed JSON input: {raw_input}") from exc
+                if not isinstance(raw_input, dict):
+                    raise ProviderError(f"Anthropic tool '{fn_name}' input must be a dictionary, got {type(raw_input).__name__}")
+                return ToolCall(call_id=str(call_id), tool_name=str(fn_name), arguments=raw_input)
+
+        text_parts = [
+            str(block.get("text", ""))
+            for block in content_blocks
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        combined_text = "".join(text_parts).strip()
+        if not combined_text:
+            raise ProviderError("Anthropic response contained neither tool_use nor text content")
+
+        return self._parse_json(combined_text)
 
     def analyze_failure(self, execution: ExecutionResult, diff: str, context: ProjectContext, plan: Plan) -> FailureAnalysis:
         data = self._json_call("Return only JSON with probable_root_cause, affected_files, recommended_fix.", f"Failed command: {execution.command}\nExit code: {execution.exit_code}\nstdout:\n{execution.stdout[-8000:]}\nstderr:\n{execution.stderr[-8000:]}\nDiff:\n{diff[-12000:]}\nPlan:\n{json.dumps(asdict(plan))}\nContext:\n{self._context(context, 'repair')}")

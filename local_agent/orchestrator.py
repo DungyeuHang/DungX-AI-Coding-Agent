@@ -319,19 +319,46 @@ class Orchestrator:
                 self._create_checkpoint(task, current_subtask, "After code generation, before validation", context, report) # Checkpoint
 
                 emit("[5/7] Running validation...")
-                executions = self._validate(validation_plan)
-                report.executions.extend(executions)
-                sub_id = current_subtask.subtask_id if current_subtask else None
-                task.execution_history.extend([{"type": "execution", "subtask_id": sub_id, "execution": exec.to_dict()} for exec in executions]) # Record executions
-                self.storage.save_task(task)
-                failed = next((result for result in executions if not result.succeeded), None)
+                executions = []
+                failed = None
+
+                # Phase 4.4: Targeted Validation Intelligence
+                targeted_commands = self.validation_intelligence.discover_targeted_commands(report.changed_files, context.repository_map)
+                if targeted_commands:
+                    emit(f"[5/7] Running targeted validation ({len(targeted_commands)} command(s))...")
+                    targeted_plan = ValidationPlan(
+                        commands=targeted_commands,
+                        primary_commands=targeted_commands,
+                        secondary_commands=[],
+                        skipped_commands=[],
+                        reasons=["Targeted verification for modified files"],
+                        risk_level="low",
+                    )
+                    targeted_executions = self._validate(targeted_plan)
+                    executions.extend(targeted_executions)
+                    report.executions.extend(targeted_executions)
+                    sub_id = current_subtask.subtask_id if current_subtask else None
+                    task.execution_history.extend([{"type": "execution", "subtask_id": sub_id, "execution": exec.to_dict()} for exec in targeted_executions])
+                    self.storage.save_task(task)
+                    failed = next((result for result in targeted_executions if not result.succeeded), None)
+
+                # Final full-suite validation (mandatory authority if targeted passed or none found)
+                if failed is None:
+                    full_executions = self._validate(validation_plan)
+                    executions.extend(full_executions)
+                    report.executions.extend(full_executions)
+                    sub_id = current_subtask.subtask_id if current_subtask else None
+                    task.execution_history.extend([{"type": "execution", "subtask_id": sub_id, "execution": exec.to_dict()} for exec in full_executions])
+                    self.storage.save_task(task)
+                    failed = next((result for result in full_executions if not result.succeeded), None)
+
                 if failed is not None:
                     emit("[5/7] Validation failed")
 
                     # Phase 3.13: Dynamic Secondary Validation Execution
                     if self.config.max_secondary_validations_per_iteration > 0 and validation_plan.secondary_commands:
                         emit("[5.1/7] Considering secondary validation...")
-                    
+
                         # Diagnostic sub-loop
                         for _ in range(self.config.max_secondary_validations_per_iteration - len(executed_diagnostic_names_this_iteration)):
                             available_diagnostics = [cmd for cmd in validation_plan.secondary_commands if cmd.name not in executed_diagnostic_names_this_iteration]
@@ -351,7 +378,7 @@ class Orchestrator:
                             emit(f"[5.3/7] Executing selected diagnostic command: {selected_cmd_spec.display()}")
                             diagnostic_result = self.runner.run(selected_cmd_spec)
                             truncated_result = self._truncate_execution_result(diagnostic_result)
-                        
+
                             current_diagnostic_evidence.append(truncated_result)
                             executed_diagnostic_names_this_iteration.append(selected_cmd_spec.name)
 
@@ -488,7 +515,7 @@ class Orchestrator:
                     if pushed and self.config.git_pr_on_completion:
                         emit("[7/7] Autonomous PR creation enabled, attempting to create PR...")
                         self._perform_pr_creation(task, branch_name)
-                
+
                 self._create_memories_from_run(task, report)
             all_metrics = []
             if self.scheduler is not None and getattr(self.scheduler, "registry", None):
@@ -608,7 +635,7 @@ class Orchestrator:
         if not self.git.commit(commit_message):
             LOGGER.error("Failed to create commit.")
             return False
-        
+
         LOGGER.info(f"Successfully committed changes to branch '{branch_name}'.")
         return True
 
@@ -656,7 +683,7 @@ class Orchestrator:
 
         with self.memory_lock:
             memory = self.storage.load_project_memory()
-            
+
             # Create a memory about the changed files' roles
             for file_path in report.changed_files:
                 # Avoid creating duplicate memories for the same file from the same task
@@ -673,7 +700,7 @@ class Orchestrator:
                     confidence=0.8
                 )
                 memory.memories.append(new_memory)
-            
+
             self.storage.save_project_memory(memory)
 
     def _create_new_task(self, objective: str) -> Task:
@@ -794,20 +821,20 @@ class Orchestrator:
     def _truncate_execution_result(self, result: ExecutionResult) -> ExecutionResult:
         """Truncates stdout/stderr of an ExecutionResult to a configured limit."""
         limit = self.config.max_diagnostic_output_bytes
-        
+
         def truncate(text: str) -> str:
             if len(text.encode('utf-8')) > limit:
                 # A simple byte-based truncation might cut mid-character. This is a safer approach.
                 return text[:limit] + "\n...[truncated]..."
             return text
-            
+
         return ExecutionResult(command=result.command, exit_code=result.exit_code, stdout=truncate(result.stdout), stderr=truncate(result.stderr), duration_seconds=result.duration_seconds, timed_out=result.timed_out)
 
     def _build_run_report(self, task: Task) -> RunReport:
         # This function constructs a RunReport from the current Task state for CLI display.
         # It's a snapshot, not the persistent state.
         current_subtask = next((s for s in (task.plan.subtasks if task.plan else []) if s.subtask_id == task.current_subtask_id), None)
-        
+
         # Placeholder for project context, plan, etc.
         # In a real scenario, these would be loaded from the checkpoint or derived.
         # For now, we'll use dummy values or assume they are available in the Orchestrator's state.
