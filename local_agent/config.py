@@ -255,7 +255,7 @@ class AgentConfig:
             raise ValueError("command_timeout_seconds must be positive")
         if self.max_parallel_subtasks < 1:
             raise ValueError("max_parallel_subtasks must be at least 1")
-        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats", "tool_history_compaction_window", "max_tool_history_context_bytes"):
+        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
         if self.provider_max_retries < 0:
