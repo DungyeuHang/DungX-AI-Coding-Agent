@@ -363,11 +363,28 @@ class Orchestrator:
                             self._create_checkpoint(task, current_subtask, f"After running diagnostic: {selected_cmd_spec.name}", context, report, extra_context=extra_context)
 
                     try:
+                        failure_registry = ToolRegistry(
+                            self.config.project,
+                            filesystem=self.filesystem,
+                            command_runner=self.runner,
+                            semantic_index=getattr(context, "semantic_index", None),
+                        )
+                        failure_policy = getattr(self.config, "tool_policy", None)
                         failure = self._execute_with_specialist(
                             task,
                             ProviderCapability.REPAIR,
-                            lambda provider: FailureAnalyzer(provider).analyze(failed, coding_agent.diff() or self.git.diff(), context, plan),
-                            "failure analysis"
+                            lambda provider: FailureAnalyzer(
+                                provider,
+                                registry=failure_registry,
+                                policy=failure_policy,
+                            ).analyze(
+                                failed,
+                                coding_agent.diff() or self.git.diff(),
+                                context,
+                                plan,
+                                report=report,
+                            ),
+                            "failure analysis",
                         )
                     except ProviderError as exc:
                         self._record_provider_failure(task, current_subtask, exc, "failure-analysis provider request failed")
