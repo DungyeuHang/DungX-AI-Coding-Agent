@@ -219,6 +219,59 @@ class FailureAnalysis:
         data["diagnostic_evidence"] = [ExecutionResult.from_dict(e) for e in data.get("diagnostic_evidence", [])]
         return cls(**data)
 
+
+@dataclass
+class RepairSignature:
+    """Fingerprint of a repair attempt for anti-repeat detection."""
+    iteration: int
+    failure_category: str
+    root_cause_hash: str  # truncated hash of probable_root_cause
+    patch_hash: str       # truncated hash of proposed_diff at that iteration
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(**data)
+
+
+@dataclass
+class RecoveryState:
+    """Tracks recovery progress across iterations within a single task run."""
+    completed_iterations: int = 0
+    repair_signatures: list[RepairSignature] = field(default_factory=list)
+    failure_history: list[FailureAnalysis] = field(default_factory=list)
+    review_history: list[ReviewResult] = field(default_factory=list)
+    abort_reason: str = ""
+
+    def has_duplicate_signature(self, sig: RepairSignature) -> bool:
+        """Check if this exact failure+patch combination was already tried."""
+        return any(
+            s.root_cause_hash == sig.root_cause_hash and s.patch_hash == sig.patch_hash
+            for s in self.repair_signatures
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "completed_iterations": self.completed_iterations,
+            "repair_signatures": [s.to_dict() for s in self.repair_signatures],
+            "failure_history": [f.to_dict() for f in self.failure_history],
+            "review_history": [asdict(r) for r in self.review_history],
+            "abort_reason": self.abort_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(
+            completed_iterations=data.get("completed_iterations", 0),
+            repair_signatures=[RepairSignature.from_dict(s) for s in data.get("repair_signatures", [])],
+            failure_history=[FailureAnalysis.from_dict(f) for f in data.get("failure_history", [])],
+            review_history=[ReviewResult(**r) for r in data.get("review_history", [])],
+            abort_reason=data.get("abort_reason", ""),
+        )
+
+
 @dataclass
 class SymbolLocation:
     start_line: int
