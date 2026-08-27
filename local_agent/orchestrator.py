@@ -29,6 +29,8 @@ from .models import (
     Memory,
     ProjectContext,
     ProviderCapability,
+    RecoveryState,
+    RepairSignature,
     ReviewResult,
     RunReport,
     Subtask,
@@ -39,6 +41,7 @@ from .models import (
     ToolExecutionMetrics,
     ToolResult,
     ValidationPlan,
+    normalize_diff_for_signature,
 )
 from .models import MemoryCategory
 from .planner import GraphValidator, Planner
@@ -168,7 +171,8 @@ class Orchestrator:
                 current_subtask.status = SubtaskStatus.PENDING
                 current_subtask.completed_at = None
 
-        # Phase 3.14: Resume diagnostic / secondary-validation state and Phase 4.0 tool history from the latest checkpoint, if present.
+        # Phase 4.5: Autonomous Recovery State
+        recovery_state = RecoveryState()
         current_diagnostic_evidence: list[ExecutionResult] = []
         executed_diagnostic_names_this_iteration: list[str] = []
         current_tool_history: list[tuple[ToolCall, ToolResult]] = []
@@ -177,6 +181,9 @@ class Orchestrator:
             try:
                 checkpoint = self.storage.load_checkpoint(latest_checkpoint_id)
                 if checkpoint is not None:
+                    raw_recovery = checkpoint.continuation_context.get("recovery_state")
+                    if raw_recovery and isinstance(raw_recovery, dict):
+                        recovery_state = RecoveryState.from_dict(raw_recovery)
                     current_diagnostic_evidence = [ExecutionResult.from_dict(d) for d in checkpoint.continuation_context.get("diagnostic_evidence", [])]
                     executed_diagnostic_names_this_iteration = list( # Ensure it's a list for mutability
                         checkpoint.continuation_context.get("executed_diagnostic_names_this_iteration", [])
@@ -197,9 +204,11 @@ class Orchestrator:
             except FileNotFoundError:
                 pass  # Checkpoint may be missing if the task is new or corrupted
 
+        report.recovery_state = recovery_state
 
+        start_iteration = recovery_state.completed_iterations + 1
         try:
-            for iteration in range(1, self.config.max_iterations + 1):
+            for iteration in range(start_iteration, self.config.max_iterations + 1):
                 report.iterations = iteration
 
                 # Phase 3.23: Seed the first iteration with CI failure context if available.
@@ -232,6 +241,7 @@ class Orchestrator:
                         stage_name=stage_name,
                         tool_history=current_tool_history,
                         report=report,
+                        recovery_state=recovery_state,
                     )
                 except ProviderError as exc:
                     self._record_provider_failure(task, current_subtask, exc, f"{stage_name} provider request failed")
@@ -279,19 +289,46 @@ class Orchestrator:
                             "validation_error": exc.reason,
                         },
                     )
+                    recovery_state.record_failure(failure)
                     report.failures.append(failure)
                     emit(f"[4/7] Rejected generated changes: {exc}")
+                    recovery_state.completed_iterations = iteration
                     if iteration < self.config.max_iterations:
                         continue
                     break
                 except UnsafeModificationError as exc:
-                    failure = FailureAnalysis("AI-generated change was rejected by the safety/patch validator", [], str(exc))
+                    failure = FailureAnalysis("AI-generated change was rejected by the safety/patch validator", [], str(exc), category="UNSAFE_MODIFICATION")
+                    recovery_state.record_failure(failure)
                     report.failures.append(failure)
                     emit(f"[4/7] Rejected generated changes: {exc}")
+                    recovery_state.completed_iterations = iteration
                     if iteration < self.config.max_iterations:
                         continue
                     break
                 proposed_diff = "".join(change.diff for change in prepared)
+
+                # Phase 4.5: Anti-Repeat Detection for identical ineffective patches
+                patch_hash = normalize_diff_for_signature(proposed_diff)
+                if iteration > 1 and stage_name == "repair" and recovery_state.is_duplicate_patch(patch_hash):
+                    emit(f"[5/7] Repeated identical repair patch detected (hash {patch_hash}); rejecting to prevent loop")
+                    failure = FailureAnalysis(
+                        "Repeated identical repair patch generated without progress.",
+                        [c.path for c in prepared],
+                        "Do not regenerate the same patch. Explore an alternative repair strategy.",
+                        category="REPEATED_REPAIR",
+                        details={"patch_hash": patch_hash},
+                    )
+                    recovery_state.record_failure(failure)
+                    report.failures.append(failure)
+                    recovery_state.completed_iterations = iteration
+                    recovery_state.abort_reason = "REPEATED_REPAIR_DETECTED"
+                    task.outcome = "REPEATED_REPAIR_DETECTED"
+                    report.outcome = "REPEATED_REPAIR_DETECTED"
+                    break
+
+                affected_paths = [c.path for c in prepared]
+                recovery_state.record_attempt(iteration, failure, proposed_diff, affected_paths)
+
                 if self.config.dry_run:
                     report.dry_run = True
                     report.proposed_diff = proposed_diff
@@ -437,7 +474,18 @@ class Orchestrator:
                             break # Exit the repair loop
 
                     failure.category = failure.category or "VALIDATION_FAILURE"
+                    recovery_state.record_failure(failure)
                     report.failures.append(failure)
+                    recovery_state.completed_iterations = iteration
+
+                    # Phase 4.5: Check for stagnation across consecutive failures
+                    if recovery_state.consecutive_same_failure_count >= 3:
+                        emit("[5/7] Stagnation detected: same failure encountered across 3 consecutive iterations.")
+                        recovery_state.abort_reason = "STAGNATION_DETECTED"
+                        task.outcome = "STAGNATION_DETECTED"
+                        report.outcome = "STAGNATION_DETECTED"
+                        break
+
                     emit("[5/7] Analyzing failure...")
                     if iteration < self.config.max_iterations:
                         continue
@@ -461,9 +509,18 @@ class Orchestrator:
                     emit(f"[6/7] Provider stopped the run: {task.outcome}")
                     break
                 review = report.review
+                recovery_state.completed_iterations = iteration
                 if review.verdict == "APPROVED":
                     report.completed = True
                     break
+                else:
+                    recovery_state.record_review(review)
+                    if len(recovery_state.review_history) >= 3 and all(r.verdict != "APPROVED" for r in recovery_state.review_history[-3:]):
+                        emit("[6/7] Repeated review rejections detected across 3 iterations; aborting.")
+                        recovery_state.abort_reason = "REPEATED_REVIEW_REJECTION"
+                        task.outcome = "REPEATED_REVIEW_REJECTION"
+                        report.outcome = "REPEATED_REVIEW_REJECTION"
+                        break
                 if iteration >= self.config.max_iterations:
                     break
                 emit("[6/7] Review requested changes; continuing...")
@@ -489,6 +546,12 @@ class Orchestrator:
                         if current_subtask:
                             current_subtask.status = SubtaskStatus.FAILED
                             current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                        if recovery_state.abort_reason:
+                            task.outcome = recovery_state.abort_reason
+                            report.outcome = recovery_state.abort_reason
+                        elif recovery_state.completed_iterations >= self.config.max_iterations:
+                            task.outcome = "MAX_ITERATIONS_EXCEEDED"
+                            report.outcome = "MAX_ITERATIONS_EXCEEDED"
 
         except Exception as e:
             LOGGER.exception("Unhandled exception during task execution: %s", e)
@@ -565,7 +628,15 @@ class Orchestrator:
         stage_name: str,
         tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
         report: RunReport | None = None,
+        recovery_state: RecoveryState | None = None,
     ) -> tuple[list[FileOperation], list[tuple[ToolCall, ToolResult]]]:
+        if failure and recovery_state:
+            recovery_summary = recovery_state.build_recovery_summary()
+            if recovery_summary:
+                if failure.details is None:
+                    failure.details = {}
+                failure.details["recovery_summary"] = recovery_summary
+
         capability = ProviderCapability.REPAIR if failure else ProviderCapability.IMPLEMENTATION
 
         def _action(provider: AIProvider) -> tuple[list[FileOperation], list[tuple[ToolCall, ToolResult]]]:
@@ -744,6 +815,8 @@ class Orchestrator:
                 continuation_context["tool_history"] = history_to_dict(report.tool_history)
             if report.tool_metrics and "tool_metrics" not in continuation_context:
                 continuation_context["tool_metrics"] = [m.to_dict() if hasattr(m, "to_dict") else m for m in report.tool_metrics]
+            if report.recovery_state and "recovery_state" not in continuation_context:
+                continuation_context["recovery_state"] = report.recovery_state.to_dict()
 
         checkpoint = Checkpoint(
             checkpoint_id=checkpoint_id,
@@ -844,6 +917,7 @@ class Orchestrator:
         dummy_impact = ChangeImpact(summary="No impact analysis available in report snapshot", targets=[])
         tool_metrics: list[ToolExecutionMetrics] = []
         tool_history: list[tuple[ToolCall, ToolResult]] = []
+        recovery_state: RecoveryState | None = None
 
         # Attempt to load from latest checkpoint if available
         if task.latest_checkpoint_id:
@@ -860,6 +934,9 @@ class Orchestrator:
                     raw_history = checkpoint.continuation_context.get("tool_history", [])
                     if raw_history:
                         tool_history = history_from_dict(raw_history)
+                    raw_rec = checkpoint.continuation_context.get("recovery_state")
+                    if raw_rec and isinstance(raw_rec, dict):
+                        recovery_state = RecoveryState.from_dict(raw_rec)
             except FileNotFoundError:
                 pass # Checkpoint might be missing if task is new or corrupted
 
@@ -892,5 +969,6 @@ class Orchestrator:
             subtask_id=current_subtask.subtask_id if current_subtask else None,
             tool_metrics=tool_metrics,
             tool_history=tool_history,
+            recovery_state=recovery_state,
         )
 

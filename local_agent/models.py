@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import datetime
 from dataclasses import asdict, dataclass, field
+import datetime
 from enum import Enum
+import hashlib
 from typing import Any, Dict, Literal, Self
 
 
@@ -220,20 +221,52 @@ class FailureAnalysis:
         return cls(**data)
 
 
+def normalize_diff_for_signature(diff: str) -> str:
+    """Normalize unified diff content to create a stable hash invariant to trivial whitespace and timestamps."""
+    if not diff:
+        return ""
+    lines = []
+    for line in diff.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("---", "+++")):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                lines.append(parts[0] + " " + parts[1])
+            else:
+                lines.append(parts[0])
+        elif stripped.startswith(("+", "-")) and not stripped.startswith(("+++", "---")):
+            lines.append(stripped[0] + " " + stripped[1:].strip())
+        elif stripped.startswith("@@"):
+            lines.append("@@")
+    normalized = "\n".join(lines)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass
 class RepairSignature:
     """Fingerprint of a repair attempt for anti-repeat detection."""
     iteration: int
     failure_category: str
-    root_cause_hash: str  # truncated hash of probable_root_cause
-    patch_hash: str       # truncated hash of proposed_diff at that iteration
+    root_cause_hash: str  # truncated hash of normalized failure cause / target
+    patch_hash: str       # truncated hash of normalized proposed_diff
+    affected_files: list[str] = field(default_factory=list)
+    failed_target: str = ""
+    strategy_note: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
-        return cls(**data)
+        return cls(
+            iteration=data.get("iteration", 0),
+            failure_category=data.get("failure_category", ""),
+            root_cause_hash=data.get("root_cause_hash", ""),
+            patch_hash=data.get("patch_hash", ""),
+            affected_files=list(data.get("affected_files", [])),
+            failed_target=data.get("failed_target", ""),
+            strategy_note=data.get("strategy_note", ""),
+        )
 
 
 @dataclass
@@ -243,6 +276,7 @@ class RecoveryState:
     repair_signatures: list[RepairSignature] = field(default_factory=list)
     failure_history: list[FailureAnalysis] = field(default_factory=list)
     review_history: list[ReviewResult] = field(default_factory=list)
+    consecutive_same_failure_count: int = 0
     abort_reason: str = ""
 
     def has_duplicate_signature(self, sig: RepairSignature) -> bool:
@@ -252,22 +286,113 @@ class RecoveryState:
             for s in self.repair_signatures
         )
 
+    def is_duplicate_patch(self, patch_hash: str) -> bool:
+        """Check if this exact patch hash was already attempted in previous iterations."""
+        if not patch_hash:
+            return False
+        return any(s.patch_hash == patch_hash for s in self.repair_signatures)
+
+    def record_attempt(
+        self,
+        iteration: int,
+        failure: FailureAnalysis | None,
+        diff: str,
+        affected_files: list[str],
+        strategy_note: str = "",
+    ) -> RepairSignature:
+        category = failure.category if failure else "INITIAL_IMPLEMENTATION"
+        root_cause_str = (failure.probable_root_cause if failure else "").strip().lower()
+        root_cause_hash = hashlib.sha256(root_cause_str.encode("utf-8")).hexdigest()[:16] if root_cause_str else ""
+        patch_hash = normalize_diff_for_signature(diff)
+        failed_target = ""
+        if failure:
+            if failure.diagnostic_evidence:
+                failed_target = failure.diagnostic_evidence[0].command
+            elif failure.details and "path" in failure.details:
+                failed_target = str(failure.details["path"])
+
+        sig = RepairSignature(
+            iteration=iteration,
+            failure_category=category,
+            root_cause_hash=root_cause_hash,
+            patch_hash=patch_hash,
+            affected_files=list(affected_files),
+            failed_target=failed_target,
+            strategy_note=strategy_note,
+        )
+        self.repair_signatures.append(sig)
+        return sig
+
+    def record_failure(self, failure: FailureAnalysis) -> None:
+        if self.failure_history:
+            prev = self.failure_history[-1]
+            if prev.probable_root_cause.strip().lower() == failure.probable_root_cause.strip().lower() or (
+                prev.category and prev.category == failure.category and prev.category in {"PATCH_VALIDATION", "UNSAFE_MODIFICATION"}
+            ):
+                self.consecutive_same_failure_count += 1
+            else:
+                self.consecutive_same_failure_count = 1
+        else:
+            self.consecutive_same_failure_count = 1
+        self.failure_history.append(failure)
+
+    def record_review(self, review: ReviewResult) -> None:
+        self.review_history.append(review)
+
+    def build_recovery_summary(self, max_chars: int = 1500) -> str:
+        """Produce a concise summary of previous attempts to guide model repair without token explosion."""
+        if not self.failure_history and not self.review_history and not self.repair_signatures:
+            return ""
+
+        lines = ["--- Recovery Context & History ---"]
+        if self.repair_signatures:
+            lines.append("Previous Attempts:")
+            for sig in self.repair_signatures[-3:]:
+                files_str = ", ".join(sig.affected_files) if sig.affected_files else "none"
+                lines.append(f"  - Iteration {sig.iteration}: Modified [{files_str}] for {sig.failure_category}")
+
+        if self.failure_history:
+            last_f = self.failure_history[-1]
+            lines.append(f"Latest Failure: {last_f.probable_root_cause[:200]}")
+            if last_f.recommended_fix:
+                lines.append(f"Recommended Fix Direction: {last_f.recommended_fix[:200]}")
+
+        if self.review_history:
+            last_r = self.review_history[-1]
+            if last_r.verdict != "APPROVED":
+                findings_str = "; ".join(last_r.findings[:3])
+                lines.append(f"Latest Review Feedback: {last_r.summary[:150]} (Findings: {findings_str[:150]})")
+
+        lines.append("Guidance: Do NOT repeat identical failed modifications. Explore alternative implementations.")
+        text = "\n".join(lines)
+        if len(text) > max_chars:
+            suffix = "\n...[truncated]"
+            if max_chars >= len(suffix):
+                text = text[: max_chars - len(suffix)] + suffix
+            else:
+                text = text[:max_chars]
+        return text
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "completed_iterations": self.completed_iterations,
             "repair_signatures": [s.to_dict() for s in self.repair_signatures],
             "failure_history": [f.to_dict() for f in self.failure_history],
             "review_history": [asdict(r) for r in self.review_history],
+            "consecutive_same_failure_count": self.consecutive_same_failure_count,
             "abort_reason": self.abort_reason,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
+        if not data or not isinstance(data, dict):
+            return cls()
         return cls(
             completed_iterations=data.get("completed_iterations", 0),
-            repair_signatures=[RepairSignature.from_dict(s) for s in data.get("repair_signatures", [])],
-            failure_history=[FailureAnalysis.from_dict(f) for f in data.get("failure_history", [])],
-            review_history=[ReviewResult(**r) for r in data.get("review_history", [])],
+            repair_signatures=[RepairSignature.from_dict(s) for s in data.get("repair_signatures", []) if isinstance(s, dict)],
+            failure_history=[FailureAnalysis.from_dict(f) for f in data.get("failure_history", []) if isinstance(f, dict)],
+            review_history=[ReviewResult(**r) for r in data.get("review_history", []) if isinstance(r, dict)],
+            consecutive_same_failure_count=data.get("consecutive_same_failure_count", 0),
             abort_reason=data.get("abort_reason", ""),
         )
 
@@ -823,6 +948,7 @@ class RunReport:
     plan_proposal: PlanProposal | None = None
     tool_metrics: list[ToolExecutionMetrics] = field(default_factory=list)
     tool_history: list[tuple[ToolCall, ToolResult]] = field(default_factory=list)
+    recovery_state: RecoveryState | None = None
 
 
 class ProviderError(RuntimeError):
