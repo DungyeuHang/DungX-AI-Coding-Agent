@@ -494,10 +494,27 @@ class Orchestrator:
 
                 emit("[6/7] Reviewing changes...")
                 try:
+                    review_registry = ToolRegistry(
+                        self.config.project,
+                        filesystem=self.filesystem,
+                        command_runner=self.runner,
+                        semantic_index=getattr(context, "semantic_index", None),
+                    )
+                    review_policy = getattr(self.config, "tool_policy", None)
                     report.review = self._execute_with_specialist(
                         task,
                         ProviderCapability.REVIEW,
-                        lambda provider: Reviewer(provider).review(current_subtask.goal if current_subtask else task.objective, plan, coding_agent.diff() or self.git.diff(), context),
+                        lambda provider: Reviewer(
+                            provider,
+                            registry=review_registry,
+                            policy=review_policy,
+                        ).review(
+                            current_subtask.goal if current_subtask else task.objective,
+                            plan,
+                            coding_agent.diff() or self.git.diff(),
+                            context,
+                            report=report,
+                        ),
                         "review"
                     )
                 except (RateLimitError, QuotaExceededError) as exc: # Handle temporary provider errors

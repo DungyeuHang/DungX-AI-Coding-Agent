@@ -367,6 +367,11 @@ class RecoveryState:
         text = "\n".join(lines)
         if len(text) > max_chars:
             suffix = "\n...[truncated]"
+            if max_chars >= len(suffix):
+                text = text[: max_chars - len(suffix)] + suffix
+            else:
+                text = text[:max_chars]
+        return text
 
     def to_dict(self) -> dict[str, Any]:
         return {
