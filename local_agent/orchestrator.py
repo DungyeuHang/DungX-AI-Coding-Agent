@@ -8,7 +8,7 @@ from pathlib import Path
 
 import threading
 from .approval import ApprovalPolicyEngine, RISK_LEVEL_MAP
-from .coding_agent import CodingAgent, PatchValidationError, UnsafeModificationError
+from .coding_agent import CodingAgent, PatchValidationError, ScopeAmendmentGuard, UnsafeModificationError
 from .commands import CommandRunner
 from .config import AgentConfig
 from .context import ContextSelector
@@ -24,6 +24,7 @@ from .models import (
     ExecutionResult,
     FailureAnalysis,
     Plan,
+    PlanAmendment,
     PlanProposal,
     ProjectMemory,
     Memory,
@@ -33,6 +34,7 @@ from .models import (
     RepairSignature,
     ReviewResult,
     RunReport,
+    ScopeExpansionProposal,
     Subtask,
     SubtaskStatus,
     Task,
@@ -48,7 +50,7 @@ from .planner import GraphValidator, Planner
 from .providers import AIProvider, ProviderError, QuotaExceededError, RateLimitError, build_provider
 from .repository import RepositoryIntelligence
 from .reviewer import Reviewer
-from .tool_engine import ToolEngine, history_from_dict, history_to_dict
+from .tool_engine import IterationHistoryCompactor, ToolEngine, history_from_dict, history_to_dict
 from .tools import ToolRegistry
 from .validation import ValidationIntelligence
 
@@ -190,6 +192,11 @@ class Orchestrator:
             try:
                 checkpoint = self.storage.load_checkpoint(latest_checkpoint_id)
                 if checkpoint is not None:
+                    raw_plan = checkpoint.continuation_context.get("plan")
+                    if raw_plan and isinstance(raw_plan, dict):
+                        plan = Plan.from_dict(raw_plan)
+                        report.plan = plan
+                        report.amendments = list(plan.amendments)
                     raw_recovery = checkpoint.continuation_context.get("recovery_state")
                     if raw_recovery and isinstance(raw_recovery, dict):
                         recovery_state = RecoveryState.from_dict(raw_recovery)
@@ -214,6 +221,13 @@ class Orchestrator:
                 pass  # Checkpoint may be missing if the task is new or corrupted
 
         report.recovery_state = recovery_state
+
+        initial_scope_count = len(plan.allowed_paths) if hasattr(plan, "allowed_paths") else len(getattr(plan, "files_likely_to_change", []) + getattr(plan, "files_likely_to_create", []))
+        scope_guard = ScopeAmendmentGuard(
+            self.filesystem,
+            max_total_amendments=getattr(self.config, "max_plan_amendments", 5),
+            max_scope_growth_factor=getattr(self.config, "max_scope_growth_factor", 2.0),
+        )
 
         start_iteration = recovery_state.completed_iterations + 1
         try:
@@ -283,6 +297,28 @@ class Orchestrator:
                             current_subtask.status = SubtaskStatus.FAILED
                             current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     break
+
+                # Phase 4.8: Dynamic Scope Amendment for discovered required files
+                unlisted_ops = coding_agent.find_unlisted_operations(operations, plan)
+                if unlisted_ops:
+                    for unlisted_op in unlisted_ops:
+                        is_create = unlisted_op.action.lower().strip() == "create" or not self.filesystem.file_exists(unlisted_op.path)
+                        proposal = ScopeExpansionProposal(
+                            path=unlisted_op.path,
+                            reason=unlisted_op.reason or "Implementation discovered required file",
+                            relationship="implementation_dependency",
+                            evidence=unlisted_op.patch or (unlisted_op.content[:200] if unlisted_op.content else ""),
+                            originating_stage=stage_name,
+                            is_create=is_create,
+                        )
+                        is_valid, guard_reason = scope_guard.evaluate(proposal, plan, initial_scope_count)
+                        if is_valid:
+                            amendment = plan.apply_amendment(proposal, approved_by="deterministic_policy")
+                            report.amendments.append(amendment)
+                            emit(f"[{ '4' if stage_name == 'implementation' else '5' }/7] Plan amended to v{plan.version}: added '{proposal.path}' to approved scope ({guard_reason})")
+                        else:
+                            emit(f"[{ '4' if stage_name == 'implementation' else '5' }/7] Scope expansion for '{proposal.path}' rejected: {guard_reason}")
+
                 try:
                     prepared = coding_agent.prepare(operations, plan)
                 except PatchValidationError as exc:
@@ -466,6 +502,26 @@ class Orchestrator:
 
                     # Attach diagnostic evidence to the failure analysis
                     failure.diagnostic_evidence = current_diagnostic_evidence
+
+                    # Phase 4.8: Dynamic Scope Amendment for diagnosed affected files
+                    unlisted_diagnosed = [f for f in failure.affected_files if f and f not in (plan.allowed_paths if hasattr(plan, "allowed_paths") else set())]
+                    if unlisted_diagnosed:
+                        for unlisted_file in unlisted_diagnosed:
+                            proposal = ScopeExpansionProposal(
+                                path=unlisted_file,
+                                reason=failure.recommended_fix or failure.probable_root_cause or "Diagnosed dependency",
+                                relationship="diagnosed_dependency",
+                                evidence=failure.probable_root_cause,
+                                originating_stage="repair",
+                                is_create=not self.filesystem.file_exists(unlisted_file),
+                            )
+                            is_valid, guard_reason = scope_guard.evaluate(proposal, plan, initial_scope_count)
+                            if is_valid:
+                                amendment = plan.apply_amendment(proposal, approved_by="deterministic_policy")
+                                report.amendments.append(amendment)
+                                emit(f"[5.4/7] Plan amended to v{plan.version}: added '{unlisted_file}' to approved scope ({guard_reason})")
+                            else:
+                                emit(f"[5.4/7] Diagnosed scope expansion for '{unlisted_file}' rejected: {guard_reason}")
 
                     # Phase 3.14: Propose a plan modification if the failure seems architectural
                     if failure.category in {"MISSING_DEPENDENCY", "ARCHITECTURAL_FLAW"}: # Example categories
@@ -657,7 +713,7 @@ class Orchestrator:
         recovery_state: RecoveryState | None = None,
     ) -> tuple[list[FileOperation], list[tuple[ToolCall, ToolResult]]]:
         if failure and recovery_state:
-            recovery_summary = recovery_state.build_recovery_summary()
+            recovery_summary = IterationHistoryCompactor.build_cross_iteration_context(recovery_state, plan, report=report)
             if recovery_summary:
                 if failure.details is None:
                     failure.details = {}
@@ -837,6 +893,10 @@ class Orchestrator:
 
         # Merge tool exploration state if present in report
         if report:
+            if report.plan and "plan" not in continuation_context:
+                continuation_context["plan"] = report.plan.to_dict()
+                continuation_context["plan_version"] = report.plan.version
+                continuation_context["amendments"] = [a.to_dict() for a in report.plan.amendments]
             if report.tool_history and "tool_history" not in continuation_context:
                 continuation_context["tool_history"] = history_to_dict(report.tool_history)
             if report.tool_metrics and "tool_metrics" not in continuation_context:

@@ -5,6 +5,7 @@ import datetime
 from enum import Enum
 import hashlib
 from typing import Any, Dict, Literal, Self
+import uuid
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,83 @@ class PreparedChange:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class ScopeExpansionProposal:
+    """Structured proposal generated when implementation or planning discovers a missing file."""
+    path: str
+    reason: str
+    relationship: str = "dependency"
+    evidence: str = ""
+    originating_stage: str = "implementation"
+    is_create: bool = False
+    confidence: float = 1.0
+    subtask_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        if not isinstance(data, dict):
+            return cls(path="", reason="")
+        return cls(
+            path=str(data.get("path", "")),
+            reason=str(data.get("reason", "")),
+            relationship=str(data.get("relationship", "dependency")),
+            evidence=str(data.get("evidence", "")),
+            originating_stage=str(data.get("originating_stage", "implementation")),
+            is_create=bool(data.get("is_create", False)),
+            confidence=float(data.get("confidence", 1.0)),
+            subtask_id=data.get("subtask_id"),
+        )
+
+
+@dataclass(frozen=True)
+class PlanAmendment:
+    """Record of an accepted scope amendment to a Plan."""
+    amendment_id: str
+    version: int
+    timestamp: datetime.datetime
+    proposal: ScopeExpansionProposal
+    approved_by: Literal["deterministic_policy", "user_approval"] = "deterministic_policy"
+    previous_allowed_paths: list[str] = field(default_factory=list)
+    new_allowed_paths: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "amendment_id": self.amendment_id,
+            "version": self.version,
+            "timestamp": self.timestamp.isoformat(),
+            "proposal": self.proposal.to_dict(),
+            "approved_by": self.approved_by,
+            "previous_allowed_paths": sorted(list(self.previous_allowed_paths)),
+            "new_allowed_paths": sorted(list(self.new_allowed_paths)),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        raw_ts = data.get("timestamp")
+        if isinstance(raw_ts, str):
+            ts = datetime.datetime.fromisoformat(raw_ts)
+        elif isinstance(raw_ts, datetime.datetime):
+            ts = raw_ts
+        else:
+            ts = datetime.datetime.now(datetime.timezone.utc)
+
+        raw_prop = data.get("proposal", {})
+        prop = ScopeExpansionProposal.from_dict(raw_prop) if isinstance(raw_prop, dict) else raw_prop
+
+        return cls(
+            amendment_id=str(data.get("amendment_id", "")),
+            version=int(data.get("version", 1)),
+            timestamp=ts,
+            proposal=prop,
+            approved_by=data.get("approved_by", "deterministic_policy"),
+            previous_allowed_paths=list(data.get("previous_allowed_paths", [])),
+            new_allowed_paths=list(data.get("new_allowed_paths", [])),
+        )
+
+
 @dataclass
 class Plan:
     objective: str
@@ -196,6 +274,72 @@ class Plan:
     steps: list[str] = field(default_factory=list)
     validation_strategy: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
+    version: int = 1
+    amendments: list[PlanAmendment] = field(default_factory=list)
+
+    @property
+    def allowed_paths(self) -> set[str]:
+        return set(self.files_likely_to_change + self.files_likely_to_create)
+
+    def apply_amendment(
+        self,
+        proposal: ScopeExpansionProposal,
+        approved_by: Literal["deterministic_policy", "user_approval"] = "deterministic_policy",
+    ) -> PlanAmendment:
+        if proposal.path in self.allowed_paths:
+            raise ValueError(f"Cannot amend plan: path '{proposal.path}' is already in allowed scope")
+
+        prev = sorted(list(self.allowed_paths))
+        if proposal.is_create:
+            if proposal.path not in self.files_likely_to_create:
+                self.files_likely_to_create.append(proposal.path)
+        else:
+            if proposal.path not in self.files_likely_to_change:
+                self.files_likely_to_change.append(proposal.path)
+
+        self.version += 1
+        amendment = PlanAmendment(
+            amendment_id=str(uuid.uuid4()),
+            version=self.version,
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+            proposal=proposal,
+            approved_by=approved_by,
+            previous_allowed_paths=prev,
+            new_allowed_paths=sorted(list(self.allowed_paths)),
+        )
+        self.amendments.append(amendment)
+        return amendment
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "objective": self.objective,
+            "files_to_inspect": list(self.files_to_inspect),
+            "files_likely_to_change": list(self.files_likely_to_change),
+            "files_likely_to_create": list(self.files_likely_to_create),
+            "steps": list(self.steps),
+            "validation_strategy": list(self.validation_strategy),
+            "risks": list(self.risks),
+            "version": self.version,
+            "amendments": [a.to_dict() for a in self.amendments],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        if not isinstance(data, dict):
+            return cls(objective="")
+        raw_amendments = data.get("amendments", [])
+        amendments = [PlanAmendment.from_dict(a) if isinstance(a, dict) else a for a in raw_amendments] if isinstance(raw_amendments, list) else []
+        return cls(
+            objective=str(data.get("objective", "")),
+            files_to_inspect=list(data.get("files_to_inspect", [])),
+            files_likely_to_change=list(data.get("files_likely_to_change", []) or data.get("files_to_modify", [])),
+            files_likely_to_create=list(data.get("files_likely_to_create", []) or data.get("files_to_create", [])),
+            steps=list(data.get("steps", [])),
+            validation_strategy=list(data.get("validation_strategy", []) or data.get("validation_commands", [])),
+            risks=list(data.get("risks", [])),
+            version=int(data.get("version", 1)),
+            amendments=amendments,
+        )
 
 
 @dataclass
@@ -949,6 +1093,7 @@ class RunReport:
     tool_metrics: list[ToolExecutionMetrics] = field(default_factory=list)
     tool_history: list[tuple[ToolCall, ToolResult]] = field(default_factory=list)
     recovery_state: RecoveryState | None = None
+    amendments: list[PlanAmendment] = field(default_factory=list)
 
 
 class ProviderError(RuntimeError):

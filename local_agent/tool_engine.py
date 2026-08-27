@@ -12,7 +12,9 @@ from .models import (
     PolicyAction,
     PolicyDecision,
     ProjectContext,
+    RecoveryState,
     ReviewResult,
+    RunReport,
     ToolCall,
     ToolDefinition,
     ToolExecutionMetrics,
@@ -470,4 +472,68 @@ class ToolEngine:
             history.append((tool_call, tool_result))
             steps_used += 1
             total_output_bytes += res_bytes
+
+
+class IterationHistoryCompactor:
+    """Summarizes prior iterations for subsequent repair attempts with strict byte limits."""
+
+    @staticmethod
+    def build_cross_iteration_context(
+        recovery_state: RecoveryState | None,
+        plan: Plan | None,
+        report: RunReport | None = None,
+        max_bytes: int = 4000,
+    ) -> str:
+        """Construct a bounded summary of previous iterations, active plan version, amendments, and failure telemetry."""
+        lines: list[str] = []
+
+        if plan is not None:
+            lines.append("=== Active Plan State ===")
+            lines.append(f"Plan Version: v{getattr(plan, 'version', 1)}")
+            lines.append(f"Allowed Modify Paths: {getattr(plan, 'files_likely_to_change', [])}")
+            lines.append(f"Allowed Create Paths: {getattr(plan, 'files_likely_to_create', [])}")
+            amendments = getattr(plan, "amendments", [])
+            if amendments:
+                lines.append("Plan Amendments:")
+                for a in amendments:
+                    prop = getattr(a, "proposal", None)
+                    path = getattr(prop, "path", "") if prop else ""
+                    reason = getattr(prop, "reason", "") if prop else ""
+                    lines.append(f"  - v{a.version}: Added '{path}' ({reason[:80]})")
+
+        if recovery_state is not None:
+            lines.append("\n=== Prior Iteration Telemetry ===")
+            if recovery_state.repair_signatures:
+                lines.append("Previous Attempts:")
+                for sig in recovery_state.repair_signatures[-3:]:
+                    files = ", ".join(sig.affected_files) if sig.affected_files else "none"
+                    lines.append(f"  - Iteration {sig.iteration}: Modified [{files}] -> Status: Failed ({sig.failure_category})")
+
+            if recovery_state.failure_history:
+                last_f = recovery_state.failure_history[-1]
+                lines.append(f"\nLatest Root Cause: {last_f.probable_root_cause[:250]}")
+                if last_f.recommended_fix:
+                    lines.append(f"Recommended Fix: {last_f.recommended_fix[:250]}")
+                if last_f.diagnostic_evidence:
+                    first_ev = last_f.diagnostic_evidence[0]
+                    lines.append(f"Diagnostic Evidence: {first_ev.command} (exit {first_ev.exit_code})")
+
+            if recovery_state.review_history:
+                last_r = recovery_state.review_history[-1]
+                if last_r.verdict != "APPROVED":
+                    findings = "; ".join(last_r.findings[:3])
+                    lines.append(f"Latest Review Feedback: {last_r.summary[:150]} (Findings: {findings[:150]})")
+
+        summary = "\n".join(lines).strip()
+        encoded = summary.encode("utf-8")
+        if len(encoded) > max_bytes:
+            suffix = "\n...[cross-iteration context truncated]"
+            suffix_bytes = suffix.encode("utf-8")
+            if max_bytes >= len(suffix_bytes):
+                target_bytes = max_bytes - len(suffix_bytes)
+                truncated_text = encoded[:target_bytes].decode("utf-8", errors="ignore")
+                summary = truncated_text + suffix
+            else:
+                summary = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        return summary
 

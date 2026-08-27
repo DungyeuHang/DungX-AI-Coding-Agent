@@ -297,3 +297,47 @@ class Planner:
             risks=risks,
             assumptions=[],
         )
+
+    def replan_with_context(
+        self,
+        task: str | Task,
+        current_plan: Plan,
+        context: ProjectContext,
+        failure: FailureAnalysis | None = None,
+        discovery_evidence: list[str] | None = None,
+        initial_history: list[tuple[ToolCall, ToolResult]] | None = None,
+        report: RunReport | None = None,
+    ) -> Plan:
+        """
+        Produce a revised plan incorporating failure feedback or newly discovered scope,
+        while preserving plan version history and active amendments.
+        """
+        task_text = task.objective if hasattr(task, "objective") else str(task)
+        new_plan = self._run_tool_assisted_planning(
+            task=task_text,
+            context=context,
+            initial_history=initial_history,
+            report=report,
+        )
+        if new_plan is None:
+            new_plan = self.provider.generate_plan(task_text, context)
+
+        if not isinstance(new_plan, Plan):
+            if isinstance(new_plan, dict):
+                new_plan = self._normalize_plan_dict(new_plan, task_text)
+            else:
+                new_plan = current_plan
+
+        # Preserve version and historical amendments
+        new_plan.version = getattr(current_plan, "version", 1)
+        new_plan.amendments = list(getattr(current_plan, "amendments", []))
+
+        # Merge allowed paths so historical amendments are not dropped
+        for p in current_plan.files_likely_to_change:
+            if p not in new_plan.files_likely_to_change:
+                new_plan.files_likely_to_change.append(p)
+        for p in current_plan.files_likely_to_create:
+            if p not in new_plan.files_likely_to_create:
+                new_plan.files_likely_to_create.append(p)
+
+        return new_plan

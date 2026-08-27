@@ -58,6 +58,8 @@ class AgentConfig:
     max_secondary_validations_per_iteration: int = 1 # Added for Phase 3.13
     max_diagnostic_output_bytes: int = 4000 # Added for Phase 3.13
     max_retry_wait_seconds: int = 60
+    max_plan_amendments: int = 5
+    max_scope_growth_factor: float = 2.0
     memory_enabled: bool = True # New for Phase 3.22
     metrics_enabled: bool = False
     max_tool_steps: int = 8
@@ -128,6 +130,8 @@ class AgentConfig:
             "disallowed_tools": "AGENT_DISALLOWED_TOOLS",
             "tool_history_compaction_window": "AGENT_TOOL_COMPACTION_WINDOW",
             "max_tool_history_context_bytes": "AGENT_MAX_TOOL_HISTORY_CONTEXT_BYTES",
+            "max_plan_amendments": "AGENT_MAX_PLAN_AMENDMENTS",
+            "max_scope_growth_factor": "AGENT_MAX_SCOPE_GROWTH_FACTOR",
         }
 
         def value(name: str, default: object) -> object:
@@ -237,6 +241,8 @@ class AgentConfig:
             disallowed_tools=disallowed_tools_val,
             tool_history_compaction_window=_positive_int(value("tool_history_compaction_window", 2), "tool_history_compaction_window"),
             max_tool_history_context_bytes=_positive_int(value("max_tool_history_context_bytes", 8000), "max_tool_history_context_bytes"),
+            max_plan_amendments=_positive_int(value("max_plan_amendments", 5), "max_plan_amendments"),
+            max_scope_growth_factor=float(value("max_scope_growth_factor", 2.0)),
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -262,6 +268,10 @@ class AgentConfig:
             raise ValueError("provider_max_retries cannot be negative")
         if self.dependency_depth < 0:
             raise ValueError("dependency_depth cannot be negative")
+        if self.max_plan_amendments < 0:
+            raise ValueError("max_plan_amendments cannot be negative")
+        if self.max_scope_growth_factor < 1.0:
+            raise ValueError("max_scope_growth_factor must be at least 1.0")
         # Validate tool policy creation
         _ = self.tool_policy
 
