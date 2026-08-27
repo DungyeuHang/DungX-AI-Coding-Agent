@@ -121,26 +121,35 @@ class Orchestrator:
 
         try:
             emit("[3/7] Creating implementation plan...")
+            planning_registry = ToolRegistry(
+                self.config.project,
+                filesystem=self.filesystem,
+                command_runner=self.runner,
+                semantic_index=getattr(context, "semantic_index", None),
+            )
+            planning_policy = getattr(self.config, "tool_policy", None)
             if current_subtask:
                 plan = self._execute_with_specialist(
                     task,
                     ProviderCapability.PLANNING,
-                    lambda provider: Planner(provider).create_subtask_plan(current_subtask, context),
+                    lambda provider: Planner(
+                        provider,
+                        registry=planning_registry,
+                        policy=planning_policy,
+                    ).create_subtask_plan(current_subtask, context, report=report),
                     "planning"
                 )
             else:
-                raw_plan = self._execute_with_specialist(
+                plan = self._execute_with_specialist(
                     task,
                     ProviderCapability.PLANNING,
-                    lambda provider: provider.generate_plan(task.objective, context),
+                    lambda provider: Planner(
+                        provider,
+                        registry=planning_registry,
+                        policy=planning_policy,
+                    ).create_plan_for_task(task.objective, context, report=report),
                     "planning"
                 )
-                if isinstance(raw_plan, Plan):
-                    plan = raw_plan
-                elif isinstance(raw_plan, dict):
-                    plan = Plan.from_dict(raw_plan)
-                else:
-                    plan = Plan(summary=task.objective, steps=[str(task.objective)])
             if plan is None:
                 raise ProviderError("No available provider for planning")
         except (RateLimitError, QuotaExceededError) as exc:

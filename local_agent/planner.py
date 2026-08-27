@@ -1,11 +1,28 @@
 from __future__ import annotations
 
-import json
-import uuid
 import datetime
+import json
+from typing import Any
+import uuid
 
-from .models import Plan, ProjectContext, TaskPlan, Subtask, SubtaskStatus, TaskStatus
+from .models import (
+    Plan,
+    ProjectContext,
+    ProviderCapability,
+    ProviderError,
+    RunReport,
+    Subtask,
+    SubtaskStatus,
+    TaskPlan,
+    TaskStatus,
+    ToolCall,
+    ToolDefinition,
+    ToolExecutionPolicy,
+    ToolResult,
+)
 from .providers import AIProvider, build_provider
+from .tool_engine import ToolEngine
+from .tools import ToolRegistry
 
 
 class GraphValidator:
@@ -67,47 +84,192 @@ class GraphValidator:
 
 
 class Planner:
-    def __init__(self, provider: AIProvider):
+    def __init__(
+        self,
+        provider: AIProvider,
+        registry: ToolRegistry | None = None,
+        policy: ToolExecutionPolicy | None = None,
+    ):
         self.provider = provider
+        self.registry = registry
+        self.policy = policy
 
-    def create_subtask_plan(self, subtask: Subtask, context: ProjectContext) -> Plan:
-        """Creates a simple, single-step plan for executing one subtask."""
-        # This is a simplified plan for the orchestrator's internal loop.
-        # The AI gets the broader context from the continuation_context.
-        plan = self.provider.generate_plan(subtask.goal, context)
+    @staticmethod
+    def _normalize_plan_dict(data: dict[str, Any], default_objective: str) -> Plan:
+        return Plan(
+            objective=str(data.get("objective", default_objective)),
+            files_to_inspect=[str(f) for f in data.get("files_to_inspect", [])] if isinstance(data.get("files_to_inspect"), list) else [],
+            files_likely_to_change=[str(f) for f in (data.get("files_likely_to_change") or data.get("files_to_modify") or [])] if isinstance(data.get("files_likely_to_change") or data.get("files_to_modify"), list) else [],
+            files_likely_to_create=[str(f) for f in (data.get("files_likely_to_create") or data.get("files_to_create") or [])] if isinstance(data.get("files_likely_to_create") or data.get("files_to_create"), list) else [],
+            steps=[str(s) for s in data.get("steps", [default_objective])] if isinstance(data.get("steps"), list) else [default_objective],
+            validation_strategy=[str(v) for v in (data.get("validation_strategy") or data.get("validation_commands") or [])] if isinstance(data.get("validation_strategy") or data.get("validation_commands"), list) else [],
+            risks=[str(r) for r in data.get("risks", [])] if isinstance(data.get("risks"), list) else [],
+        )
+
+    def _run_tool_assisted_planning(
+        self,
+        task: str,
+        context: ProjectContext,
+        initial_history: list[tuple[ToolCall, ToolResult]] | None = None,
+        report: RunReport | None = None,
+    ) -> Plan | TaskPlan | None:
+        provider_caps = getattr(self.provider, "capabilities", None)
+        if not (
+            isinstance(provider_caps, (set, frozenset))
+            and ProviderCapability.TOOL_USE in provider_caps
+            and self.registry is not None
+            and hasattr(self.provider, "generate_plan_with_tools")
+        ):
+            return None
+
+        captured_plan: list[Plan | TaskPlan] = []
+
+        def _planning_step(
+            task: str,
+            plan: Plan | None,
+            context: ProjectContext,
+            tools: list[ToolDefinition],
+            tool_history: list[tuple[ToolCall, ToolResult]],
+            failure: Any = None,
+            review: Any = None,
+        ) -> Any:
+            resp = self.provider.generate_plan_with_tools(
+                task=task,
+                context=context,
+                tools=tools,
+                tool_history=tool_history,
+            )
+            if isinstance(resp, ToolCall):
+                return resp
+            if isinstance(resp, (Plan, TaskPlan)):
+                captured_plan.append(resp)
+                return [resp]
+            if isinstance(resp, dict):
+                if "subtasks" in resp:
+                    subtasks = [Subtask.from_dict(s) if isinstance(s, dict) else s for s in resp["subtasks"]]
+                    tp = TaskPlan(
+                        objective=resp.get("objective", task),
+                        subtasks=subtasks,
+                        risks=resp.get("risks", []),
+                    )
+                    captured_plan.append(tp)
+                    return [tp]
+                p = self._normalize_plan_dict(resp, task)
+                captured_plan.append(p)
+                return [p]
+            raise ProviderError(f"Unexpected response from generate_plan_with_tools: {type(resp)}")
+
+        dummy_plan = Plan(objective=task, steps=[task])
+        engine = ToolEngine(provider=_planning_step, registry=self.registry, policy=self.policy)
+        result = engine.run(
+            task=f"Plan architecture for: {task}",
+            plan=dummy_plan,
+            context=context,
+            initial_history=initial_history,
+        )
+
+        if report is not None and result.metrics.total_calls > 0:
+            report.tool_metrics.append(result.metrics)
+            report.tool_history = list(result.tool_history)
+
+        if captured_plan:
+            return captured_plan[0]
+        return None
+
+    def create_subtask_plan(
+        self,
+        subtask: Subtask,
+        context: ProjectContext,
+        initial_history: list[tuple[ToolCall, ToolResult]] | None = None,
+        report: RunReport | None = None,
+    ) -> Plan:
+        """Creates a simple, single-step plan for executing one subtask, using tools if available."""
+        plan = self._run_tool_assisted_planning(
+            task=subtask.goal,
+            context=context,
+            initial_history=initial_history,
+            report=report,
+        )
         if isinstance(plan, Plan):
             return plan
-        if isinstance(plan, dict):
+        if isinstance(plan, TaskPlan):
             return Plan(
-                objective=plan.get("objective", subtask.goal),
-                steps=plan.get("steps", [subtask.goal]),
-                files_likely_to_change=plan.get("files_likely_to_change", plan.get("files_to_modify", [])),
-                files_likely_to_create=plan.get("files_likely_to_create", plan.get("files_to_create", [])),
-                risks=plan.get("risks", []),
+                objective=plan.objective or subtask.goal,
+                steps=[s.goal or s.title for s in plan.subtasks] if plan.subtasks else [subtask.goal],
+                risks=plan.risks,
             )
+
+        # Single-shot fallback
+        raw_plan = self.provider.generate_plan(subtask.goal, context)
+        if isinstance(raw_plan, Plan):
+            return raw_plan
+        if isinstance(raw_plan, dict):
+            return self._normalize_plan_dict(raw_plan, subtask.goal)
         return Plan(objective=subtask.goal, steps=[subtask.goal])
 
-    def create_task_plan(self, task: str, context: ProjectContext) -> TaskPlan:
-        """Decomposes a high-level task into a TaskPlan with a subtask graph."""
+    def create_plan_for_task(
+        self,
+        task: str,
+        context: ProjectContext,
+        initial_history: list[tuple[ToolCall, ToolResult]] | None = None,
+        report: RunReport | None = None,
+    ) -> Plan:
+        """Creates a Plan for a direct single-task objective, using tools if available."""
+        plan = self._run_tool_assisted_planning(
+            task=task,
+            context=context,
+            initial_history=initial_history,
+            report=report,
+        )
+        if isinstance(plan, Plan):
+            return plan
+        if isinstance(plan, TaskPlan):
+            return Plan(
+                objective=plan.objective or task,
+                steps=[s.goal or s.title for s in plan.subtasks] if plan.subtasks else [task],
+                risks=plan.risks,
+            )
+
+        # Single-shot fallback
+        raw_plan = self.provider.generate_plan(task, context)
+        if isinstance(raw_plan, Plan):
+            return raw_plan
+        if isinstance(raw_plan, dict):
+            return self._normalize_plan_dict(raw_plan, task)
+        return Plan(objective=task, steps=[task])
+
+    def create_task_plan(
+        self,
+        task: str,
+        context: ProjectContext,
+        initial_history: list[tuple[ToolCall, ToolResult]] | None = None,
+        report: RunReport | None = None,
+    ) -> TaskPlan:
+        """Decomposes a high-level task into a TaskPlan with a subtask graph, using tools if available."""
         if not task.strip():
             raise ValueError("task cannot be empty")
 
-        # The public AIProvider contract is `generate_plan(...) -> Plan`. We
-        # normalize that provider-level Plan into the structured TaskPlan the
-        # scheduler executes: each Plan step becomes a Subtask in a dependency
-        # chain, and the Plan risks become the TaskPlan risks.
-        plan = self.provider.generate_plan(task, context)
+        plan = self._run_tool_assisted_planning(
+            task=task,
+            context=context,
+            initial_history=initial_history,
+            report=report,
+        )
         if isinstance(plan, TaskPlan):
             return plan
-        if isinstance(plan, dict) and "subtasks" in plan:
-            subtasks = [Subtask.from_dict(s) if isinstance(s, dict) else s for s in plan["subtasks"]]
-            return TaskPlan(objective=plan.get("objective", task), subtasks=subtasks, risks=plan.get("risks", []))
+        if plan is None:
+            plan = self.provider.generate_plan(task, context)
+            if isinstance(plan, TaskPlan):
+                return plan
+            if isinstance(plan, dict) and "subtasks" in plan:
+                subtasks = [Subtask.from_dict(s) if isinstance(s, dict) else s for s in plan["subtasks"]]
+                return TaskPlan(objective=plan.get("objective", task), subtasks=subtasks, risks=plan.get("risks", []))
 
         now = datetime.datetime.now(datetime.timezone.utc)
-        steps = getattr(plan, "steps", None) or [task]
+        steps = getattr(plan, "steps", None) or (plan.get("steps") if isinstance(plan, dict) else None) or [task]
         subtasks: list[Subtask] = []
         for step in steps:
-            step_text = step.strip()
+            step_text = step.strip() if isinstance(step, str) else str(step)
             if not step_text:
                 continue
             subtasks.append(
@@ -128,9 +290,10 @@ class Planner:
         if errors:
             raise ValueError(f"AI-generated task plan is invalid: {'; '.join(errors)}")
 
+        risks = getattr(plan, "risks", None) or (plan.get("risks", []) if isinstance(plan, dict) else [])
         return TaskPlan(
             objective=task,
             subtasks=subtasks,
-            risks=plan.risks,
+            risks=risks,
             assumptions=[],
         )
