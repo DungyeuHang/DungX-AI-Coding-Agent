@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .filesystem import ProjectFilesystem, ProtectedPathError, SandboxViolation
-from .models import ProjectContext, ProjectMemory, SemanticIndex, SubtaskContract
+from .models import ProjectContext, ProjectMemory, RepositoryKnowledgeGraph, SemanticIndex, SubtaskContract
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
@@ -35,7 +35,18 @@ _SYNONYM_MAP = {
 class ContextSelector:
     """Deterministically selects task-relevant files before provider calls."""
 
-    def __init__(self, root: str | Path, max_files: int = 24, max_chars: int = 30000, max_file_chars: int = 5000, max_tokens: int = 7500, dependency_depth: int = 1, project_memory: ProjectMemory | None = None):
+    def __init__(
+        self,
+        root: str | Path,
+        max_files: int = 24,
+        max_chars: int = 30000,
+        max_file_chars: int = 5000,
+        max_tokens: int = 7500,
+        dependency_depth: int = 1,
+        project_memory: ProjectMemory | None = None,
+        knowledge_graph: RepositoryKnowledgeGraph | None = None,
+        knowledge_manager: Any = None,
+    ):
         self.filesystem = ProjectFilesystem(root)
         self.max_files = max_files
         self.max_chars = max_chars
@@ -43,6 +54,8 @@ class ContextSelector:
         self.max_tokens = max_tokens
         self.dependency_depth = dependency_depth
         self.project_memory = project_memory or ProjectMemory()
+        self.knowledge_graph = knowledge_graph
+        self.knowledge_manager = knowledge_manager
 
     def select(
         self,
@@ -171,6 +184,27 @@ class ContextSelector:
                     if sym.file_path and (sym.file_path not in contract_boosts or contract_boosts[sym.file_path][0] < 0.40):
                         contract_boosts[sym.file_path] = (0.40, f"upstream exported symbol '{sym.name}'")
 
+        # Phase 4.13: Add boosts from Persistent Knowledge Graph
+        knowledge_boosts: dict[str, tuple[float, str]] = {}  # path -> (boost, reason)
+        active_kg = self.knowledge_graph or (self.knowledge_manager.get_graph() if self.knowledge_manager and hasattr(self.knowledge_manager, "get_graph") else None)
+        if active_kg:
+            candidate_symbols = self._extract_candidate_symbols(query_text)
+            for sym in active_kg.symbols.values():
+                if sym.file_path and (sym.name in candidate_symbols or any(kw in sym.name.lower() for kw in keywords)):
+                    is_verified = bool(sym.verified_behaviors)
+                    boost = (0.35 if is_verified else 0.20) * sym.confidence
+                    reason = f"persistent verified symbol '{sym.name}'" if is_verified else f"persistent symbol '{sym.name}'"
+                    if sym.file_path not in knowledge_boosts or knowledge_boosts[sym.file_path][0] < boost:
+                        knowledge_boosts[sym.file_path] = (boost, reason)
+
+            for inv in active_kg.invariants:
+                if inv.target_path and inv.target_path != "*":
+                    if any(kw in inv.rule_text.lower() for kw in keywords):
+                        boost = 0.20 * inv.confidence
+                        reason = f"persistent invariant: {inv.enforcement_type}"
+                        if inv.target_path not in knowledge_boosts or knowledge_boosts[inv.target_path][0] < boost:
+                            knowledge_boosts[inv.target_path] = (boost, reason)
+
         for relative in candidates:
             try:
                 with self.filesystem.resolve(relative).open("r", encoding="utf-8") as handle:
@@ -201,6 +235,11 @@ class ContextSelector:
 
             if relative in contract_boosts:
                 boost, reason = contract_boosts[relative]
+                score += boost
+                reasons.append(reason)
+
+            if relative in knowledge_boosts:
+                boost, reason = knowledge_boosts[relative]
                 score += boost
                 reasons.append(reason)
 
@@ -363,6 +402,27 @@ class ContextSelector:
             for item in (repository_map.relationships if repository_map else [])
             if item.source in selected_set or item.target in selected_set
         ]
+
+        # Phase 4.13: Query and format persistent knowledge context
+        active_kg = self.knowledge_graph or (self.knowledge_manager.get_graph() if self.knowledge_manager and hasattr(self.knowledge_manager, "get_graph") else None)
+        if self.knowledge_manager and hasattr(self.knowledge_manager, "query_context_knowledge"):
+            k_text, k_syms, k_invs, k_pats = self.knowledge_manager.query_context_knowledge(query_text, changed_files=selected)
+            if k_text:
+                context.metadata["persistent_knowledge"] = k_text
+                context.metadata["knowledge_symbols"] = [s.to_dict() for s in k_syms]
+                context.metadata["knowledge_invariants"] = [i.to_dict() for i in k_invs]
+                context.metadata["knowledge_failure_patterns"] = [p.to_dict() for p in k_pats]
+        elif active_kg:
+            from .knowledge import KnowledgeGraphManager
+            temp_mgr = KnowledgeGraphManager(self.filesystem, self.filesystem.root if hasattr(self.filesystem, 'root') else Path("."))
+            temp_mgr._graph = active_kg
+            k_text, k_syms, k_invs, k_pats = temp_mgr.query_context_knowledge(query_text, changed_files=selected)
+            if k_text:
+                context.metadata["persistent_knowledge"] = k_text
+                context.metadata["knowledge_symbols"] = [s.to_dict() for s in k_syms]
+                context.metadata["knowledge_invariants"] = [i.to_dict() for i in k_invs]
+                context.metadata["knowledge_failure_patterns"] = [p.to_dict() for p in k_pats]
+
         return context
 
     @staticmethod

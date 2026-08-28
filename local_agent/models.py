@@ -2281,3 +2281,246 @@ class ToolExecutionPolicy:
         )
 
 
+# Phase 4.13: Persistent Codebase Knowledge Graph & Cross-Task Architectural Memory
+
+@dataclass
+class BehavioralAssertion:
+    """A concrete runtime behavioral property proven by automated test execution."""
+    assertion_id: str
+    description: str
+    test_command: str
+    status: Literal["passed", "failed"]
+    commit_sha: str | None = None
+    verified_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "assertion_id": self.assertion_id,
+            "description": self.description,
+            "test_command": self.test_command,
+            "status": self.status,
+            "commit_sha": self.commit_sha,
+            "verified_at": self.verified_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        d = dict(data)
+        if isinstance(d.get("verified_at"), str):
+            d["verified_at"] = datetime.datetime.fromisoformat(d["verified_at"])
+        elif not d.get("verified_at"):
+            d["verified_at"] = datetime.datetime.now(datetime.timezone.utc)
+        return cls(**d)
+
+
+@dataclass
+class KnowledgeSymbolNode:
+    """Persistent representation of an exported symbol with verified behavioral contracts."""
+    symbol_id: str  # Canonical: "path/to/file.py::SymbolName"
+    name: str
+    kind: Literal["class", "function", "method", "type", "variable"] = "function"
+    file_path: str = ""
+    signature: str = ""
+    docstring: str = ""
+    content_hash: str = ""
+    verified_behaviors: list[BehavioralAssertion] = field(default_factory=list)
+    confidence: float = 1.0
+    provenance: Literal["behavioral_test", "subtask_contract", "ast_scan", "ai_inferred"] = "ast_scan"
+    last_verified_at: datetime.datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol_id": self.symbol_id,
+            "name": self.name,
+            "kind": self.kind,
+            "file_path": self.file_path,
+            "signature": self.signature,
+            "docstring": self.docstring,
+            "content_hash": self.content_hash,
+            "verified_behaviors": [b.to_dict() for b in self.verified_behaviors],
+            "confidence": self.confidence,
+            "provenance": self.provenance,
+            "last_verified_at": self.last_verified_at.isoformat() if self.last_verified_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        d = dict(data)
+        d["verified_behaviors"] = [
+            BehavioralAssertion.from_dict(b) if isinstance(b, dict) else b
+            for b in d.get("verified_behaviors", [])
+        ]
+        if isinstance(d.get("last_verified_at"), str):
+            d["last_verified_at"] = datetime.datetime.fromisoformat(d["last_verified_at"])
+        return cls(**d)
+
+
+@dataclass
+class KnowledgeFileNode:
+    """Persistent repository file node tracking invariants, symbols, and dependencies."""
+    path: str
+    content_hash: str = ""
+    language: str = ""
+    module_role: str = "module"
+    exported_symbol_ids: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    dependents: list[str] = field(default_factory=list)
+    validation_commands: list[str] = field(default_factory=list)
+    risk_level: Literal["standard", "high_risk"] = "standard"
+    last_modified_task_id: str | None = None
+    last_modified_at: datetime.datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "content_hash": self.content_hash,
+            "language": self.language,
+            "module_role": self.module_role,
+            "exported_symbol_ids": list(self.exported_symbol_ids),
+            "dependencies": list(self.dependencies),
+            "dependents": list(self.dependents),
+            "validation_commands": list(self.validation_commands),
+            "risk_level": self.risk_level,
+            "last_modified_task_id": self.last_modified_task_id,
+            "last_modified_at": self.last_modified_at.isoformat() if self.last_modified_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        d = dict(data)
+        if isinstance(d.get("last_modified_at"), str):
+            d["last_modified_at"] = datetime.datetime.fromisoformat(d["last_modified_at"])
+        return cls(**d)
+
+
+@dataclass
+class ArchitecturalInvariant:
+    """Repo-wide or module-wide invariant rule learned across tasks."""
+    invariant_id: str
+    scope: Literal["repository", "module", "file"] = "repository"
+    target_path: str = "*"
+    rule_text: str = ""
+    enforcement_type: Literal["contract", "security", "dependency", "concurrency"] = "contract"
+    source_task_id: str = ""
+    confidence: float = 1.0
+    created_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "invariant_id": self.invariant_id,
+            "scope": self.scope,
+            "target_path": self.target_path,
+            "rule_text": self.rule_text,
+            "enforcement_type": self.enforcement_type,
+            "source_task_id": self.source_task_id,
+            "confidence": self.confidence,
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        d = dict(data)
+        if isinstance(d.get("created_at"), str):
+            d["created_at"] = datetime.datetime.fromisoformat(d["created_at"])
+        elif not d.get("created_at"):
+            d["created_at"] = datetime.datetime.now(datetime.timezone.utc)
+        return cls(**d)
+
+
+@dataclass
+class FailurePatternRecord:
+    """Recurring failure pattern and its verified successful repair recipe."""
+    pattern_id: str
+    error_signature: str
+    failing_command: str = ""
+    root_cause_summary: str = ""
+    successful_repair_summary: str = ""
+    affected_files: list[str] = field(default_factory=list)
+    occurrence_count: int = 1
+    confidence: float = 0.8
+    last_seen_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pattern_id": self.pattern_id,
+            "error_signature": self.error_signature,
+            "failing_command": self.failing_command,
+            "root_cause_summary": self.root_cause_summary,
+            "successful_repair_summary": self.successful_repair_summary,
+            "affected_files": list(self.affected_files),
+            "occurrence_count": self.occurrence_count,
+            "confidence": self.confidence,
+            "last_seen_at": self.last_seen_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        d = dict(data)
+        if isinstance(d.get("last_seen_at"), str):
+            d["last_seen_at"] = datetime.datetime.fromisoformat(d["last_seen_at"])
+        elif not d.get("last_seen_at"):
+            d["last_seen_at"] = datetime.datetime.now(datetime.timezone.utc)
+        return cls(**d)
+
+
+@dataclass
+class RepositoryKnowledgeGraph:
+    """Top-level persistent repository knowledge graph."""
+    version: int = 1
+    repo_id: str = ""
+    updated_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+    files: dict[str, KnowledgeFileNode] = field(default_factory=dict)
+    symbols: dict[str, KnowledgeSymbolNode] = field(default_factory=dict)
+    invariants: list[ArchitecturalInvariant] = field(default_factory=list)
+    failure_patterns: list[FailurePatternRecord] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "repo_id": self.repo_id,
+            "updated_at": self.updated_at.isoformat(),
+            "files": {path: node.to_dict() for path, node in self.files.items()},
+            "symbols": {sym_id: node.to_dict() for sym_id, node in self.symbols.items()},
+            "invariants": [inv.to_dict() for inv in self.invariants],
+            "failure_patterns": [pat.to_dict() for pat in self.failure_patterns],
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        d = dict(data)
+        files = {
+            path: KnowledgeFileNode.from_dict(fn) if isinstance(fn, dict) else fn
+            for path, fn in d.get("files", {}).items()
+        }
+        symbols = {
+            sym_id: KnowledgeSymbolNode.from_dict(sn) if isinstance(sn, dict) else sn
+            for sym_id, sn in d.get("symbols", {}).items()
+        }
+        invariants = [
+            ArchitecturalInvariant.from_dict(inv) if isinstance(inv, dict) else inv
+            for inv in d.get("invariants", [])
+        ]
+        failure_patterns = [
+            FailurePatternRecord.from_dict(pat) if isinstance(pat, dict) else pat
+            for pat in d.get("failure_patterns", [])
+        ]
+        updated_at = d.get("updated_at")
+        if isinstance(updated_at, str):
+            updated_at = datetime.datetime.fromisoformat(updated_at)
+        elif not updated_at:
+            updated_at = datetime.datetime.now(datetime.timezone.utc)
+
+        return cls(
+            version=d.get("version", 1),
+            repo_id=d.get("repo_id", ""),
+            updated_at=updated_at,
+            files=files,
+            symbols=symbols,
+            invariants=invariants,
+            failure_patterns=failure_patterns,
+            metadata=d.get("metadata", {}),
+        )
+
+

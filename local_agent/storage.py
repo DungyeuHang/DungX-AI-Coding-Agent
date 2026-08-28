@@ -10,10 +10,9 @@ from abc import ABC, abstractmethod # noqa: F401
 from pathlib import Path
 from typing import Any, TypeVar
 
-from .models import Checkpoint, ProjectMemory, ProviderConfig, SchedulerState, Subtask, Task
+from .models import Checkpoint, ProjectMemory, ProviderConfig, RepositoryKnowledgeGraph, SchedulerState, SemanticIndex, Subtask, Task
 
 T = TypeVar("T", Task, Checkpoint)
-from .models import SemanticIndex # Added for Phase 3.15
 
 def _to_jsonable(obj: Any) -> Any:
     """JSON default handler: serialize datetime/date as ISO 8601 strings.
@@ -81,6 +80,14 @@ class TaskStorage(ABC):
     def load_project_memory(self) -> ProjectMemory:
         pass
 
+    @abstractmethod
+    def save_knowledge_graph(self, graph: RepositoryKnowledgeGraph) -> None:
+        pass
+
+    @abstractmethod
+    def load_knowledge_graph(self) -> RepositoryKnowledgeGraph:
+        pass
+
 class JsonFileStorage(TaskStorage):
     def __init__(self, base_dir: str | Path):
         self.base_dir = Path(base_dir)
@@ -107,6 +114,9 @@ class JsonFileStorage(TaskStorage):
 
     def _project_memory_path(self) -> Path:
         return self.base_dir / "project_memory.json"
+
+    def _knowledge_graph_path(self) -> Path:
+        return self.base_dir / "knowledge_graph.json"
 
     def _atomic_write(self, path: Path, data: dict[str, Any]) -> None:
         temp_path = path.with_suffix(".json.tmp")
@@ -217,3 +227,24 @@ class JsonFileStorage(TaskStorage):
         except (json.JSONDecodeError, KeyError) as e:
             print(f"Warning: Failed to load project memory due to malformed data: {e}. Returning empty memory.")
             return ProjectMemory()
+
+    def save_knowledge_graph(self, graph: RepositoryKnowledgeGraph) -> None:
+        self._atomic_write(self._knowledge_graph_path(), graph.to_dict())
+
+    def load_knowledge_graph(self) -> RepositoryKnowledgeGraph:
+        path = self._knowledge_graph_path()
+        if not path.exists():
+            return RepositoryKnowledgeGraph()
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return RepositoryKnowledgeGraph.from_dict(json.load(f))
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            # Quarantine corrupted file
+            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+            corrupt_path = self.base_dir / f"knowledge_graph.json.corrupt.{timestamp}"
+            try:
+                shutil.copy2(path, corrupt_path)
+            except Exception:
+                pass
+            print(f"Warning: Failed to load knowledge graph due to malformed data ({e}). Quarantined to {corrupt_path.name} and returning clean graph.")
+            return RepositoryKnowledgeGraph()

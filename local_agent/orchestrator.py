@@ -16,6 +16,7 @@ from .failure import FailureAnalyzer
 from .filesystem import ProjectFilesystem
 from .git import GitIntegration
 from .impact import ChangeImpactAnalyzer
+from .knowledge import KnowledgeGraphManager
 from .models import (
     ApprovalPolicy,
     ChangeImpact,
@@ -98,6 +99,7 @@ class Orchestrator:
         self.validation_intelligence = ValidationIntelligence(config.project)
         policies = [ApprovalPolicy.from_dict(p) for p in config.approval_policies]
         self.approval_engine = ApprovalPolicyEngine(policies)
+        self.knowledge_manager = KnowledgeGraphManager(storage, config.project) if getattr(config, "knowledge_graph_enabled", True) else None
 
     def analyze(self):
         return self.analyzer.analyze()
@@ -113,6 +115,8 @@ class Orchestrator:
 
         emit("[1/7] Analyzing project...")
         context = self.analyzer.scan()
+        if self.knowledge_manager and getattr(self.config, "knowledge_graph_enabled", True):
+            self.knowledge_manager.sync_with_scan(context)
         project_memory = self.storage.load_project_memory() if self.config.memory_enabled else ProjectMemory()
         if self.config.validation_commands:
             context.validation_commands = [CommandSpec(f"explicit-{index}", tuple(shlex.split(command)), "explicit CLI configuration") for index, command in enumerate(self.config.validation_commands, 1)]
@@ -136,6 +140,8 @@ class Orchestrator:
             max_tokens=self.config.max_context_tokens,
             dependency_depth=self.config.dependency_depth,
             project_memory=project_memory,
+            knowledge_manager=self.knowledge_manager if getattr(self.config, "knowledge_graph_enabled", True) else None,
+            knowledge_graph=self.knowledge_manager.get_graph() if (self.knowledge_manager and getattr(self.config, "knowledge_graph_enabled", True)) else None,
         ).select(
             task.objective,
             context,
@@ -729,6 +735,13 @@ class Orchestrator:
                                 preexisting_files=set(preexisting) if preexisting else None,
                                 behavioral_records=report.behavioral_evidence,
                             )
+                            if current_subtask.contract and self.knowledge_manager and getattr(self.config, "knowledge_graph_enabled", True):
+                                with self.memory_lock:
+                                    try:
+                                        self.knowledge_manager.promote_subtask_contract(current_subtask.contract, task_id=task.task_id)
+                                        self.knowledge_manager.save()
+                                    except Exception as err:
+                                        LOGGER.warning("Could not promote subtask contract to knowledge graph: %s", err)
                         except Exception as e:
                             LOGGER.warning("Could not extract subtask contract for %s: %s", current_subtask.subtask_id, e)
                     # Phase 3.24: Persist changed files on successful completion
@@ -1051,6 +1064,14 @@ class Orchestrator:
     def _create_memories_from_run(self, task: Task, report: RunReport):
         if task.autonomous and self.config.git_commit_on_completion:
             self._perform_git_commit(task)
+
+        if self.knowledge_manager and getattr(self.config, "knowledge_graph_enabled", True) and report.completed:
+            with self.memory_lock:
+                try:
+                    self.knowledge_manager.promote_run_report(task, report)
+                    self.knowledge_manager.save()
+                except Exception as e:
+                    LOGGER.warning("Could not promote knowledge from run report: %s", e)
 
         if not self.config.memory_enabled or not report.changed_files:
             return

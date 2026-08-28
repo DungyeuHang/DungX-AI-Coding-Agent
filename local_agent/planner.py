@@ -202,6 +202,10 @@ class Planner:
                 contract_sections.append(c.format_for_prompt(max_chars=1500))
             task_prompt = f"{subtask.goal}\n\n" + "\n\n".join(contract_sections)
 
+        knowledge_sec = context.metadata.get("persistent_knowledge")
+        if knowledge_sec:
+            task_prompt = f"{task_prompt}\n\nPERSISTENT REPOSITORY KNOWLEDGE:\n{knowledge_sec}"
+
         plan = self._run_tool_assisted_planning(
             task=task_prompt,
             context=context,
@@ -233,8 +237,13 @@ class Planner:
         report: RunReport | None = None,
     ) -> Plan:
         """Creates a Plan for a direct single-task objective, using tools if available."""
+        task_prompt = task
+        knowledge_sec = context.metadata.get("persistent_knowledge")
+        if knowledge_sec:
+            task_prompt = f"{task}\n\nPERSISTENT REPOSITORY KNOWLEDGE:\n{knowledge_sec}"
+
         plan = self._run_tool_assisted_planning(
-            task=task,
+            task=task_prompt,
             context=context,
             initial_history=initial_history,
             report=report,
@@ -249,7 +258,7 @@ class Planner:
             )
 
         # Single-shot fallback
-        raw_plan = self.provider.generate_plan(task, context)
+        raw_plan = self.provider.generate_plan(task_prompt, context)
         if isinstance(raw_plan, Plan):
             return raw_plan
         if isinstance(raw_plan, dict):
@@ -267,8 +276,13 @@ class Planner:
         if not task.strip():
             raise ValueError("task cannot be empty")
 
+        task_prompt = task
+        knowledge_sec = context.metadata.get("persistent_knowledge")
+        if knowledge_sec:
+            task_prompt = f"{task}\n\nPERSISTENT REPOSITORY KNOWLEDGE:\n{knowledge_sec}"
+
         plan = self._run_tool_assisted_planning(
-            task=task,
+            task=task_prompt,
             context=context,
             initial_history=initial_history,
             report=report,

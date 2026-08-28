@@ -87,6 +87,9 @@ class AgentConfig:
     verification_fallbacks: list[str] = field(default_factory=list)
     dual_review_enabled: bool = False
     high_risk_dual_review: bool = True
+    knowledge_graph_enabled: bool = True
+    max_knowledge_context_chars: int = 2000
+    max_knowledge_symbols: int = 1000
 
     @property
     def tool_policy(self) -> Any:
@@ -166,6 +169,9 @@ class AgentConfig:
             "verification_fallbacks": "AGENT_VERIFICATION_FALLBACKS",
             "dual_review_enabled": "AGENT_DUAL_REVIEW",
             "high_risk_dual_review": "AGENT_HIGH_RISK_DUAL_REVIEW",
+            "knowledge_graph_enabled": "AGENT_KNOWLEDGE_GRAPH_ENABLED",
+            "max_knowledge_context_chars": "AGENT_MAX_KNOWLEDGE_CONTEXT_CHARS",
+            "max_knowledge_symbols": "AGENT_MAX_KNOWLEDGE_SYMBOLS",
         }
 
         def value(name: str, default: object) -> object:
@@ -314,6 +320,9 @@ class AgentConfig:
             verification_fallbacks=_parse_fallbacks(value("verification_fallbacks", [])),
             dual_review_enabled=_bool(value("dual_review_enabled", False)),
             high_risk_dual_review=_bool(value("high_risk_dual_review", True)),
+            knowledge_graph_enabled=_bool(value("knowledge_graph_enabled", True)),
+            max_knowledge_context_chars=_positive_int(value("max_knowledge_context_chars", 2000), "max_knowledge_context_chars"),
+            max_knowledge_symbols=_positive_int(value("max_knowledge_symbols", 1000), "max_knowledge_symbols"),
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -342,7 +351,7 @@ class AgentConfig:
             raise ValueError("command_timeout_seconds must be positive")
         if self.max_parallel_subtasks < 1:
             raise ValueError("max_parallel_subtasks must be at least 1")
-        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats"):
+        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats", "max_knowledge_context_chars", "max_knowledge_symbols"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
         if self.provider_max_retries < 0:
@@ -371,6 +380,7 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--verification-provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"), default=None)
     parser.add_argument("--verification-model", default=None)
     parser.add_argument("--dual-review", type=_bool, default=None, help="enable deliberative dual-model review")
+    parser.add_argument("--knowledge-graph", type=_bool, default=None, help="enable persistent repository knowledge graph (true/false)")
     parser.add_argument("--max-iterations", type=int, default=None)
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
@@ -407,7 +417,8 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "verification_provider": getattr(args, "verification_provider", None),
             "verification_model": getattr(args, "verification_model", None),
             "dual_review_enabled": getattr(args, "dual_review", None),
-            "max_iterations": args.max_iterations,
+            "knowledge_graph_enabled": getattr(args, "knowledge_graph", None),
+            "max_iterations": getattr(args, "max_iterations", None),
             "validation_commands": args.validation,
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,
