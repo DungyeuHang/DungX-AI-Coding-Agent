@@ -15,6 +15,7 @@ from .models import (
     ProviderError,
     RunReport,
     Subtask,
+    SubtaskContract,
     SubtaskStatus,
     Task,
     TaskPlan,
@@ -187,10 +188,22 @@ class Planner:
         context: ProjectContext,
         initial_history: list[tuple[ToolCall, ToolResult]] | None = None,
         report: RunReport | None = None,
+        upstream_contracts: list[SubtaskContract] | None = None,
     ) -> Plan:
-        """Creates a simple, single-step plan for executing one subtask, using tools if available."""
+        """Creates a simple, single-step plan for executing one subtask, using tools if available and respecting upstream contracts."""
+        task_prompt = subtask.goal
+        if upstream_contracts:
+            contract_sections = [
+                "UPSTREAM SUBTASK CONTRACTS\n==========================\n"
+                "These contracts describe verified outputs from completed direct dependencies.\n"
+                "Treat them as authoritative interface constraints. Do not invent alternative signatures when a verified contract exists.\n"
+            ]
+            for c in upstream_contracts:
+                contract_sections.append(c.format_for_prompt(max_chars=1500))
+            task_prompt = f"{subtask.goal}\n\n" + "\n\n".join(contract_sections)
+
         plan = self._run_tool_assisted_planning(
-            task=subtask.goal,
+            task=task_prompt,
             context=context,
             initial_history=initial_history,
             report=report,
@@ -205,7 +218,7 @@ class Planner:
             )
 
         # Single-shot fallback
-        raw_plan = self.provider.generate_plan(subtask.goal, context)
+        raw_plan = self.provider.generate_plan(task_prompt, context)
         if isinstance(raw_plan, Plan):
             return raw_plan
         if isinstance(raw_plan, dict):

@@ -38,6 +38,7 @@ from .models import (
     RunReport,
     ScopeExpansionProposal,
     Subtask,
+    SubtaskContract,
     SubtaskStatus,
     Task,
     TaskPlan,
@@ -49,6 +50,7 @@ from .models import (
     ValidationPlan,
     normalize_diff_for_signature,
 )
+from .contract_extractor import ContractExtractor
 from .models import MemoryCategory
 from .planner import GraphValidator, Planner
 from .providers import AIProvider, ProviderError, QuotaExceededError, RateLimitError, build_provider
@@ -94,6 +96,17 @@ class Orchestrator:
         project_memory = self.storage.load_project_memory() if self.config.memory_enabled else ProjectMemory()
         if self.config.validation_commands:
             context.validation_commands = [CommandSpec(f"explicit-{index}", tuple(shlex.split(command)), "explicit CLI configuration") for index, command in enumerate(self.config.validation_commands, 1)]
+        current_subtask = next((s for s in (task.plan.subtasks if task.plan else []) if s.subtask_id == subtask_id), None)
+        task.current_subtask_id = subtask_id
+
+        # Phase 4.10: Resolve upstream contracts for the current subtask
+        upstream_contracts: list[SubtaskContract] = []
+        if task.plan and current_subtask and hasattr(task.plan, "get_upstream_contracts"):
+            upstream_contracts = task.plan.get_upstream_contracts(current_subtask.subtask_id)
+
+        if upstream_contracts:
+            context.metadata["upstream_contracts"] = [c.to_dict() for c in upstream_contracts]
+
         emit("[2/7] Building context...")
         ContextSelector(
             self.config.project,
@@ -103,7 +116,12 @@ class Orchestrator:
             max_tokens=self.config.max_context_tokens,
             dependency_depth=self.config.dependency_depth,
             project_memory=project_memory,
-        ).select(task.objective, context)
+        ).select(
+            task.objective,
+            context,
+            subtask_goal=current_subtask.goal if current_subtask else None,
+            upstream_contracts=upstream_contracts,
+        )
 
         emit("[2.5/7] Analyzing change impact...")
         impact = self.impact_analyzer.analyze(task.objective, context)
@@ -112,8 +130,6 @@ class Orchestrator:
 
         report = RunReport(project=context, task_id=task.task_id, subtask_id=subtask_id)
         report.impact = impact
-        current_subtask = next((s for s in (task.plan.subtasks if task.plan else []) if s.subtask_id == subtask_id), None)
-        task.current_subtask_id = subtask_id
 
         discovered_commands = self.validation_intelligence.discover_commands(context.repository_map) if context.repository_map else []
         for cmd in (getattr(context, "validation_commands", None) or []):
@@ -142,7 +158,7 @@ class Orchestrator:
                         provider,
                         registry=planning_registry,
                         policy=planning_policy,
-                    ).create_subtask_plan(current_subtask, context, report=report),
+                    ).create_subtask_plan(current_subtask, context, report=report, upstream_contracts=upstream_contracts),
                     "planning"
                 )
             else:
@@ -221,6 +237,10 @@ class Orchestrator:
                         task.plan.version = restored_tp.version
                         task.plan.amendments = list(restored_tp.amendments)
                         report.dag_amendments = list(restored_tp.amendments)
+                        for restored_sub in restored_tp.subtasks:
+                            matching = next((s for s in task.plan.subtasks if s.subtask_id == restored_sub.subtask_id), None)
+                            if matching and restored_sub.contract and not matching.contract:
+                                matching.contract = restored_sub.contract
                     # Load the last failure from checkpoint to continue repair iterations
                     last_failures = checkpoint.continuation_context.get("validation_state", {}).get("last_failures", [])
                     if last_failures:
@@ -624,6 +644,16 @@ class Orchestrator:
                     if current_subtask:
                         current_subtask.status = SubtaskStatus.COMPLETED
                         current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                        # Phase 4.10: Extract authoritative SubtaskContract from verified execution evidence
+                        try:
+                            extractor = ContractExtractor(filesystem=self.filesystem, project_root=self.config.project)
+                            current_subtask.contract = extractor.extract_contract(
+                                current_subtask,
+                                report,
+                                preexisting_files=set(preexisting) if preexisting else None,
+                            )
+                        except Exception as e:
+                            LOGGER.warning("Could not extract subtask contract for %s: %s", current_subtask.subtask_id, e)
                     # Phase 3.24: Persist changed files on successful completion
                     task.changed_files = sorted(list(set(task.changed_files + report.changed_files)))
                     active_subs = getattr(task.plan, "active_subtasks", task.plan.subtasks if task.plan else [])
@@ -738,6 +768,18 @@ class Orchestrator:
             except Exception:
                 provider_caps = None
             task_obj = task.objective if hasattr(task, "objective") else str(task)
+            raw_contracts = context.metadata.get("upstream_contracts")
+            if raw_contracts and isinstance(raw_contracts, list):
+                constraints_lines = [
+                    "\n\nUPSTREAM INTERFACE CONSTRAINTS\n============================\n"
+                    "These constraints describe verified outputs from completed direct dependencies.\n"
+                    "Treat them as authoritative interface constraints. Do NOT modify files outside the approved plan.\n"
+                ]
+                for raw_c in raw_contracts:
+                    contract = SubtaskContract.from_dict(raw_c) if isinstance(raw_c, dict) else raw_c
+                    if hasattr(contract, "format_for_prompt"):
+                        constraints_lines.append(contract.format_for_prompt(max_chars=1200))
+                task_obj = f"{task_obj}\n" + "\n\n".join(constraints_lines)
 
             if isinstance(provider_caps, (set, frozenset)) and ProviderCapability.TOOL_USE in provider_caps:
                 registry = ToolRegistry(

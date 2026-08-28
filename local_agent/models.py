@@ -781,6 +781,128 @@ class Checkpoint:
         data["timestamp"] = datetime.datetime.fromisoformat(data["timestamp"])
         return cls(**data)
 
+# Phase 4.10: Cross-Subtask Semantic Contract & Knowledge Fabric
+@dataclass
+class ExportedSymbol:
+    symbol_id: str
+    name: str
+    kind: str  # "class", "function", "variable", "type", "endpoint"
+    file_path: str
+    signature: str = ""
+    description: str = ""
+
+    def __post_init__(self):
+        if len(self.signature) > 500:
+            self.signature = self.signature[:497] + "..."
+        if len(self.description) > 500:
+            self.description = self.description[:497] + "..."
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol_id": self.symbol_id,
+            "name": self.name,
+            "kind": self.kind,
+            "file_path": self.file_path,
+            "signature": self.signature,
+            "description": self.description,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(
+            symbol_id=str(data.get("symbol_id", "")),
+            name=str(data.get("name", "")),
+            kind=str(data.get("kind", "function")),
+            file_path=str(data.get("file_path", "")),
+            signature=str(data.get("signature", "")),
+            description=str(data.get("description", "")),
+        )
+
+
+@dataclass
+class SubtaskContract:
+    subtask_id: str
+    title: str
+    exported_symbols: list[ExportedSymbol] = field(default_factory=list)
+    modified_files: list[str] = field(default_factory=list)
+    created_files: list[str] = field(default_factory=list)
+    validation_commands: list[str] = field(default_factory=list)
+    architectural_notes: list[str] = field(default_factory=list)
+    created_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+
+    def __post_init__(self):
+        if len(self.exported_symbols) > 10:
+            self.exported_symbols = self.exported_symbols[:10]
+        if len(self.modified_files) > 20:
+            self.modified_files = self.modified_files[:20]
+        if len(self.created_files) > 20:
+            self.created_files = self.created_files[:20]
+        if len(self.validation_commands) > 10:
+            self.validation_commands = self.validation_commands[:10]
+        if len(self.architectural_notes) > 10:
+            self.architectural_notes = self.architectural_notes[:10]
+
+    def format_for_prompt(self, max_chars: int = 2000) -> str:
+        lines = [f"### Subtask Contract: '{self.title}' ({self.subtask_id})"]
+        if self.created_files:
+            lines.append(f"- Created Files: {', '.join(self.created_files)}")
+        if self.modified_files:
+            lines.append(f"- Modified Files: {', '.join(self.modified_files)}")
+        if self.exported_symbols:
+            lines.append("- Exported Interfaces & Symbols:")
+            for sym in self.exported_symbols:
+                sig = sym.signature or sym.name
+                desc = f" ({sym.description})" if sym.description else ""
+                lines.append(f"  * [{sym.kind}] `{sig}` in `{sym.file_path}`{desc}")
+        if self.validation_commands:
+            lines.append(f"- Verified Validation Commands: {'; '.join(self.validation_commands)}")
+        if self.architectural_notes:
+            lines.append("- Architectural Invariants:")
+            for note in self.architectural_notes:
+                lines.append(f"  * {note}")
+        formatted = "\n".join(lines)
+        if len(formatted) > max_chars:
+            formatted = formatted[:max_chars - 3] + "..."
+        return formatted
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "subtask_id": self.subtask_id,
+            "title": self.title,
+            "exported_symbols": [s.to_dict() for s in self.exported_symbols],
+            "modified_files": list(self.modified_files),
+            "created_files": list(self.created_files),
+            "validation_commands": list(self.validation_commands),
+            "architectural_notes": list(self.architectural_notes),
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        raw_ts = data.get("created_at")
+        if isinstance(raw_ts, str):
+            ts = datetime.datetime.fromisoformat(raw_ts)
+        elif isinstance(raw_ts, datetime.datetime):
+            ts = raw_ts
+        else:
+            ts = datetime.datetime.now(datetime.timezone.utc)
+        raw_symbols = data.get("exported_symbols", [])
+        symbols = [
+            ExportedSymbol.from_dict(s) if isinstance(s, dict) else s
+            for s in raw_symbols
+        ] if isinstance(raw_symbols, list) else []
+        return cls(
+            subtask_id=str(data.get("subtask_id", "")),
+            title=str(data.get("title", "")),
+            exported_symbols=symbols,
+            modified_files=list(data.get("modified_files", [])),
+            created_files=list(data.get("created_files", [])),
+            validation_commands=list(data.get("validation_commands", [])),
+            architectural_notes=list(data.get("architectural_notes", [])),
+            created_at=ts,
+        )
+
+
 @dataclass
 class Subtask:
     subtask_id: str
@@ -798,6 +920,7 @@ class Subtask:
     provider_attempts: list[dict[str, Any]] = field(default_factory=list)
     latest_checkpoint_id: str | None = None
     completion_info: dict[str, Any] = field(default_factory=dict)
+    contract: SubtaskContract | None = None # Added for Phase 4.10
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -810,11 +933,24 @@ class Subtask:
             data["started_at"] = self.started_at.isoformat()
         if self.completed_at:
             data["completed_at"] = self.completed_at.isoformat()
+        if self.contract:
+            data["contract"] = self.contract.to_dict()
         return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
-        data["status"] = SubtaskStatus(data["status"])
+        data = dict(data)
+        if "status" in data:
+            raw_status = data["status"]
+            if isinstance(raw_status, SubtaskStatus):
+                data["status"] = raw_status
+            elif isinstance(raw_status, str):
+                try:
+                    data["status"] = SubtaskStatus(raw_status.lower())
+                except ValueError:
+                    data["status"] = SubtaskStatus(raw_status)
+        else:
+            data["status"] = SubtaskStatus.PENDING
         if data.get("created_at"):
             data["created_at"] = datetime.datetime.fromisoformat(data["created_at"])
         if data.get("updated_at"):
@@ -823,7 +959,13 @@ class Subtask:
             data["started_at"] = datetime.datetime.fromisoformat(data["started_at"])
         if data.get("completed_at"):
             data["completed_at"] = datetime.datetime.fromisoformat(data["completed_at"])
+        if data.get("contract"):
+            if isinstance(data["contract"], dict):
+                data["contract"] = SubtaskContract.from_dict(data["contract"])
+        else:
+            data["contract"] = None
         return cls(**data)
+
 
 # Phase 4.9: Typed DAG Restructuring & Evolution Models
 @dataclass
@@ -1033,6 +1175,24 @@ class TaskPlan:
     @property
     def active_subtask_ids(self) -> list[str]:
         return [s.subtask_id for s in self.active_subtasks]
+
+    def get_upstream_contracts(self, subtask_id: str) -> list[SubtaskContract]:
+        """
+        Resolves SubtaskContract records from direct, active COMPLETED dependencies.
+        Never returns contracts from SUPERSEDED, PRUNED, FAILED, RUNNING, or PENDING nodes.
+        Preserves deterministic dependency order.
+        """
+        active_map = {s.subtask_id: s for s in self.active_subtasks}
+        target = active_map.get(subtask_id)
+        if not target or not target.dependencies:
+            return []
+
+        contracts: list[SubtaskContract] = []
+        for dep_id in target.dependencies:
+            dep_sub = active_map.get(dep_id)
+            if dep_sub and dep_sub.status == SubtaskStatus.COMPLETED and dep_sub.contract is not None:
+                contracts.append(dep_sub.contract)
+        return contracts
 
     def apply_amendment(
         self,

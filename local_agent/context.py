@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .filesystem import ProjectFilesystem, ProtectedPathError, SandboxViolation
-from .models import ProjectContext, ProjectMemory, SemanticIndex
+from .models import ProjectContext, ProjectMemory, SemanticIndex, SubtaskContract
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
@@ -24,9 +24,8 @@ _RELATION_BONUS = {
     "tested_by": 0.16,
 }
 _SYNONYM_MAP = {
-    "login": {"auth", "authentication", "signin", "user", "session"},
-    "auth": {"login", "authentication", "signin", "user", "session"},
-    "authentication": {"login", "auth", "signin", "user", "session"},
+    "auth": {"login", "signin", "authentication", "session", "user"},
+    "login": {"auth", "signin", "authentication"},
     "signin": {"login", "auth", "authentication"},
     "signup": {"register", "registration", "user"},
     "register": {"signup", "registration", "user"},
@@ -45,9 +44,16 @@ class ContextSelector:
         self.dependency_depth = dependency_depth
         self.project_memory = project_memory or ProjectMemory()
 
-    def select(self, task: str, context: ProjectContext) -> ProjectContext:
-        keywords = self._keywords(task)
-        raw_terms = {word.lower() for word in _WORD_RE.findall(task)}
+    def select(
+        self,
+        task: str,
+        context: ProjectContext,
+        subtask_goal: str | None = None,
+        upstream_contracts: list[SubtaskContract] | None = None,
+    ) -> ProjectContext:
+        query_text = f"{task} {subtask_goal}" if subtask_goal else task
+        keywords = self._keywords(query_text)
+        raw_terms = {word.lower() for word in _WORD_RE.findall(query_text)}
         ui_task = bool(raw_terms & _UI_TASK_TERMS)
         repository_map = context.repository_map
         records = {item.path: item for item in repository_map.files} if repository_map else {}
@@ -64,7 +70,7 @@ class ContextSelector:
         semantic_boosts: dict[str, tuple[float, str]] = {}  # path -> (boost_score, reason)
         semantic_index = context.metadata.get("semantic_index")
         if semantic_index and isinstance(semantic_index, SemanticIndex):
-            candidate_symbols = self._extract_candidate_symbols(task)
+            candidate_symbols = self._extract_candidate_symbols(query_text)
 
             # Separate qualified and unqualified symbols
             qualified_candidates = {s for s in candidate_symbols if '.' in s}
@@ -133,7 +139,7 @@ class ContextSelector:
         # Phase 3.22: Add boosts from Project Memory
         memory_boosts: dict[str, tuple[float, str]] = {}  # path -> (boost, reason)
         if self.project_memory:
-            task_keywords = self._keywords(task)
+            task_keywords = self._keywords(query_text)
             expanded_task_keywords = set(task_keywords)
             for kw in task_keywords:
                 expanded_task_keywords.update(_SYNONYM_MAP.get(kw, set()))
@@ -151,6 +157,19 @@ class ContextSelector:
                         current_boost, _ = memory_boosts.get(memory.related_path, (0.0, ""))
                         if boost > current_boost:
                             memory_boosts[memory.related_path] = (boost, reason)
+
+        # Phase 4.10: Add boosts from Upstream Subtask Contracts
+        contract_boosts: dict[str, tuple[float, str]] = {}  # path -> (boost, reason)
+        if upstream_contracts:
+            for contract in upstream_contracts:
+                for created_path in contract.created_files:
+                    contract_boosts[created_path] = (0.50, f"upstream created file from '{contract.title}'")
+                for modified_path in contract.modified_files:
+                    if modified_path not in contract_boosts or contract_boosts[modified_path][0] < 0.35:
+                        contract_boosts[modified_path] = (0.35, f"upstream modified file from '{contract.title}'")
+                for sym in contract.exported_symbols:
+                    if sym.file_path and (sym.file_path not in contract_boosts or contract_boosts[sym.file_path][0] < 0.40):
+                        contract_boosts[sym.file_path] = (0.40, f"upstream exported symbol '{sym.name}'")
 
         for relative in candidates:
             try:
@@ -177,6 +196,11 @@ class ContextSelector:
 
             if relative in memory_boosts:
                 boost, reason = memory_boosts[relative]
+                score += boost
+                reasons.append(reason)
+
+            if relative in contract_boosts:
+                boost, reason = contract_boosts[relative]
                 score += boost
                 reasons.append(reason)
 
