@@ -66,6 +66,8 @@ class SubtaskStatus(str, Enum):
     FAILED = "failed"
     PAUSED = "paused" # e.g., due to quota
     BLOCKED = "blocked"
+    SUPERSEDED = "superseded" # Phase 4.9: invalidated upstream subtask preserved in history
+    PRUNED = "pruned" # Phase 4.9: obsolete subtask pruned from active execution
 
 @dataclass
 class ExecutionResult:
@@ -823,21 +825,69 @@ class Subtask:
             data["completed_at"] = datetime.datetime.fromisoformat(data["completed_at"])
         return cls(**data)
 
+# Phase 4.9: Typed DAG Restructuring & Evolution Models
 @dataclass
-class TaskPlan:
-    objective: str
-    subtasks: list[Subtask]
-    risks: list[str] = field(default_factory=list)
-    assumptions: list[str] = field(default_factory=list)
+class SubtaskAddition:
+    subtask: Subtask
 
     def to_dict(self) -> dict[str, Any]:
-        return {"objective": self.objective, "subtasks": [s.to_dict() for s in self.subtasks], "risks": self.risks, "assumptions": self.assumptions}
+        return {"subtask": self.subtask.to_dict()}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
-        return cls(objective=data["objective"], subtasks=[Subtask.from_dict(s) for s in data["subtasks"]], risks=data.get("risks", []), assumptions=data.get("assumptions", []))
+        return cls(subtask=Subtask.from_dict(data["subtask"]) if isinstance(data.get("subtask"), dict) else data["subtask"])
 
-# Phase 3.14: Typed Plan Modification Models
+
+@dataclass
+class SubtaskRemoval:
+    subtask_id: str
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"subtask_id": self.subtask_id, "reason": self.reason}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(subtask_id=str(data.get("subtask_id", "")), reason=str(data.get("reason", "")))
+
+
+@dataclass
+class DependencyUpdate:
+    subtask_id: str
+    dependencies: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"subtask_id": self.subtask_id, "dependencies": list(self.dependencies)}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(subtask_id=str(data.get("subtask_id", "")), dependencies=list(data.get("dependencies", [])))
+
+
+@dataclass
+class SubtaskInvalidation:
+    subtask_id: str
+    reason: str = ""
+    replacement_subtask: Subtask | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "subtask_id": self.subtask_id,
+            "reason": self.reason,
+            "replacement_subtask": self.replacement_subtask.to_dict() if self.replacement_subtask else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        rep = data.get("replacement_subtask")
+        return cls(
+            subtask_id=str(data.get("subtask_id", "")),
+            reason=str(data.get("reason", "")),
+            replacement_subtask=Subtask.from_dict(rep) if isinstance(rep, dict) else None,
+        )
+
+
+# Phase 3.14: Typed Plan Modification Models (Retained for backward compatibility)
 @dataclass
 class SubtaskModification:
     subtask_id: str
@@ -850,14 +900,15 @@ class SubtaskModification:
     def from_dict(cls, data: dict[str, Any]) -> Self:
         return cls(**data)
 
+
 @dataclass
 class AddSubtask:
     subtask: Subtask
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Self: # Existing fix, ensuring it's not regressed
-        # Required for PlanProposal deserialization
-        return cls(subtask=Subtask.from_dict(data["subtask"]))
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(subtask=Subtask.from_dict(data["subtask"]) if isinstance(data.get("subtask"), dict) else data["subtask"])
+
 
 @dataclass
 class PlanProposal:
@@ -874,6 +925,384 @@ class PlanProposal:
             reason=data.get("reason", ""),
             modifications=[SubtaskModification.from_dict(m) for m in data.get("modifications", [])],
             additions=[AddSubtask.from_dict(a) for a in data.get("additions", [])],
+        )
+
+
+@dataclass
+class DAGProposal:
+    reason: str = ""
+    additions: list[SubtaskAddition] = field(default_factory=list)
+    removals: list[SubtaskRemoval] = field(default_factory=list)
+    dependency_updates: list[DependencyUpdate] = field(default_factory=list)
+    invalidations: list[SubtaskInvalidation] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "additions": [a.to_dict() for a in self.additions],
+            "removals": [r.to_dict() for r in self.removals],
+            "dependency_updates": [d.to_dict() for d in self.dependency_updates],
+            "invalidations": [i.to_dict() for i in self.invalidations],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            reason=str(data.get("reason", "")),
+            additions=[SubtaskAddition.from_dict(a) if isinstance(a, dict) else a for a in data.get("additions", [])],
+            removals=[SubtaskRemoval.from_dict(r) if isinstance(r, dict) else r for r in data.get("removals", [])],
+            dependency_updates=[DependencyUpdate.from_dict(d) if isinstance(d, dict) else d for d in data.get("dependency_updates", [])],
+            invalidations=[SubtaskInvalidation.from_dict(i) if isinstance(i, dict) else i for i in data.get("invalidations", [])],
+        )
+
+    @classmethod
+    def from_plan_proposal(cls, prop: PlanProposal) -> Self:
+        additions = [SubtaskAddition(subtask=a.subtask) for a in prop.additions]
+        dependency_updates = []
+        for mod in prop.modifications:
+            if mod.dependencies is not None:
+                dependency_updates.append(DependencyUpdate(subtask_id=mod.subtask_id, dependencies=mod.dependencies))
+        return cls(
+            reason=prop.reason,
+            additions=additions,
+            dependency_updates=dependency_updates,
+        )
+
+
+@dataclass(frozen=True)
+class TaskPlanAmendment:
+    amendment_id: str
+    version: int
+    timestamp: datetime.datetime
+    proposal: DAGProposal
+    approved_by: Literal["deterministic_policy", "user_approval"] = "deterministic_policy"
+    previous_active_subtask_ids: list[str] = field(default_factory=list)
+    new_active_subtask_ids: list[str] = field(default_factory=list)
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "amendment_id": self.amendment_id,
+            "version": self.version,
+            "timestamp": self.timestamp.isoformat(),
+            "proposal": self.proposal.to_dict(),
+            "approved_by": self.approved_by,
+            "previous_active_subtask_ids": list(self.previous_active_subtask_ids),
+            "new_active_subtask_ids": list(self.new_active_subtask_ids),
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        raw_ts = data.get("timestamp")
+        if isinstance(raw_ts, str):
+            ts = datetime.datetime.fromisoformat(raw_ts)
+        elif isinstance(raw_ts, datetime.datetime):
+            ts = raw_ts
+        else:
+            ts = datetime.datetime.now(datetime.timezone.utc)
+        raw_prop = data.get("proposal", {})
+        prop = DAGProposal.from_dict(raw_prop) if isinstance(raw_prop, dict) else raw_prop
+        return cls(
+            amendment_id=str(data.get("amendment_id", "")),
+            version=int(data.get("version", 1)),
+            timestamp=ts,
+            proposal=prop,
+            approved_by=data.get("approved_by", "deterministic_policy"),
+            previous_active_subtask_ids=list(data.get("previous_active_subtask_ids", [])),
+            new_active_subtask_ids=list(data.get("new_active_subtask_ids", [])),
+            reason=str(data.get("reason", "")),
+        )
+
+
+@dataclass
+class TaskPlan:
+    objective: str
+    subtasks: list[Subtask]
+    risks: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    version: int = 1
+    amendments: list[TaskPlanAmendment] = field(default_factory=list)
+
+    @property
+    def active_subtasks(self) -> list[Subtask]:
+        return [s for s in self.subtasks if s.status not in {SubtaskStatus.SUPERSEDED, SubtaskStatus.PRUNED}]
+
+    @property
+    def active_subtask_ids(self) -> list[str]:
+        return [s.subtask_id for s in self.active_subtasks]
+
+    def apply_amendment(
+        self,
+        proposal: DAGProposal | PlanProposal,
+        approved_by: Literal["deterministic_policy", "user_approval"] = "deterministic_policy",
+    ) -> TaskPlanAmendment:
+        raw_plan_proposal = proposal if isinstance(proposal, PlanProposal) else None
+        if isinstance(proposal, PlanProposal):
+            proposal = DAGProposal.from_plan_proposal(proposal)
+
+        prev_active_ids = self.active_subtask_ids
+        subtask_map = {s.subtask_id: s for s in self.subtasks}
+
+        # 0. If original was PlanProposal, apply field modifications
+        if raw_plan_proposal and raw_plan_proposal.modifications:
+            for mod in raw_plan_proposal.modifications:
+                if mod.subtask_id in subtask_map:
+                    target = subtask_map[mod.subtask_id]
+                    if mod.title is not None:
+                        target.title = mod.title
+                    if mod.goal is not None:
+                        target.goal = mod.goal
+                    if mod.acceptance_criteria is not None:
+                        target.acceptance_criteria = list(mod.acceptance_criteria)
+                    if mod.dependencies is not None:
+                        target.dependencies = list(mod.dependencies)
+                    target.updated_at = datetime.datetime.now(datetime.timezone.utc)
+
+        # 1. Process invalidations (mark original as SUPERSEDED, insert replacement if given)
+        for inv in proposal.invalidations:
+            if inv.subtask_id in subtask_map:
+                target = subtask_map[inv.subtask_id]
+                target.status = SubtaskStatus.SUPERSEDED
+                target.updated_at = datetime.datetime.now(datetime.timezone.utc)
+                if inv.replacement_subtask:
+                    if inv.replacement_subtask.subtask_id not in subtask_map:
+                        self.subtasks.append(inv.replacement_subtask)
+                        subtask_map[inv.replacement_subtask.subtask_id] = inv.replacement_subtask
+
+        # 2. Process removals / pruning
+        for rem in proposal.removals:
+            if rem.subtask_id in subtask_map:
+                target = subtask_map[rem.subtask_id]
+                target.status = SubtaskStatus.PRUNED
+                target.updated_at = datetime.datetime.now(datetime.timezone.utc)
+
+        # 3. Process dependency updates
+        for dep_up in proposal.dependency_updates:
+            if dep_up.subtask_id in subtask_map:
+                subtask_map[dep_up.subtask_id].dependencies = list(dep_up.dependencies)
+                subtask_map[dep_up.subtask_id].updated_at = datetime.datetime.now(datetime.timezone.utc)
+
+        # 4. Process additions
+        for add in proposal.additions:
+            if add.subtask.subtask_id not in subtask_map:
+                self.subtasks.append(add.subtask)
+                subtask_map[add.subtask.subtask_id] = add.subtask
+
+        self.version += 1
+        new_active_ids = self.active_subtask_ids
+        amendment = TaskPlanAmendment(
+            amendment_id=str(uuid.uuid4()),
+            version=self.version,
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+            proposal=proposal,
+            approved_by=approved_by,
+            previous_active_subtask_ids=prev_active_ids,
+            new_active_subtask_ids=new_active_ids,
+            reason=proposal.reason,
+        )
+        self.amendments.append(amendment)
+        return amendment
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "objective": self.objective,
+            "subtasks": [s.to_dict() for s in self.subtasks],
+            "risks": self.risks,
+            "assumptions": self.assumptions,
+            "version": self.version,
+            "amendments": [a.to_dict() for a in self.amendments],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        raw_amendments = data.get("amendments", [])
+        amendments = [
+            TaskPlanAmendment.from_dict(a) if isinstance(a, dict) else a
+            for a in raw_amendments
+        ] if isinstance(raw_amendments, list) else []
+        return cls(
+            objective=data["objective"],
+            subtasks=[Subtask.from_dict(s) for s in data.get("subtasks", [])],
+            risks=data.get("risks", []),
+            assumptions=data.get("assumptions", []),
+            version=int(data.get("version", 1)),
+            amendments=amendments,
+        )
+
+
+@dataclass
+class DAGAmendmentGuard:
+    """Deterministic guard enforcing safety, acyclicity, quotas, and limits on DAG amendments."""
+    max_dag_amendments: int = 3
+    max_subtask_additions: int = 5
+    max_total_subtasks: int = 15
+    max_subtask_invalidations_per_node: int = 2
+
+    def evaluate(
+        self,
+        proposal: DAGProposal | PlanProposal,
+        plan: TaskPlan,
+        initial_subtask_count: int = 0,
+    ) -> tuple[bool, str]:
+        # 1. Amendment budget check
+        if len(plan.amendments) >= self.max_dag_amendments:
+            return False, f"Maximum DAG amendments limit ({self.max_dag_amendments}) reached"
+
+        # 2. Check empty proposal & convert PlanProposal
+        if isinstance(proposal, PlanProposal):
+            if not proposal.additions and not proposal.modifications:
+                return False, "Proposal contains no additions or modifications"
+            subtask_ids = {s.subtask_id for s in plan.subtasks}
+            for mod in proposal.modifications:
+                if mod.subtask_id not in subtask_ids:
+                    return False, f"Modification target subtask '{mod.subtask_id}' does not exist in plan"
+            dag_prop = DAGProposal.from_plan_proposal(proposal)
+            if not dag_prop.additions and not dag_prop.removals and not dag_prop.dependency_updates and not dag_prop.invalidations:
+                return True, "Approved under deterministic DAG policy"
+            proposal = dag_prop
+        else:
+            if not proposal.additions and not proposal.removals and not proposal.dependency_updates and not proposal.invalidations:
+                return False, "DAG proposal contains no additions, removals, updates, or invalidations"
+
+        # 3. Additions budget check
+        total_prev_additions = sum(len(a.proposal.additions) for a in plan.amendments if hasattr(a.proposal, "additions"))
+        if total_prev_additions + len(proposal.additions) > self.max_subtask_additions:
+            return False, f"Maximum subtask additions limit ({self.max_subtask_additions}) exceeded"
+
+        # 4. Total active subtasks limit check & clone state
+        sim_subtasks: dict[str, Subtask] = {
+            s.subtask_id: Subtask(
+                subtask_id=s.subtask_id,
+                title=s.title,
+                goal=s.goal,
+                status=s.status,
+                dependencies=list(s.dependencies),
+                acceptance_criteria=list(s.acceptance_criteria),
+            )
+            for s in plan.subtasks
+        }
+
+        # 5. Invalidation limits check & simulation
+        invalidation_counts: dict[str, int] = {}
+        for a in plan.amendments:
+            if hasattr(a.proposal, "invalidations"):
+                for inv in a.proposal.invalidations:
+                    invalidation_counts[inv.subtask_id] = invalidation_counts.get(inv.subtask_id, 0) + 1
+
+        for inv in proposal.invalidations:
+            if inv.subtask_id not in sim_subtasks:
+                return False, f"Invalidation target subtask '{inv.subtask_id}' does not exist in plan"
+            curr_count = invalidation_counts.get(inv.subtask_id, 0) + 1
+            if curr_count > self.max_subtask_invalidations_per_node:
+                return False, f"Subtask '{inv.subtask_id}' exceeded max invalidations limit ({self.max_subtask_invalidations_per_node})"
+
+            target = sim_subtasks[inv.subtask_id]
+            target.status = SubtaskStatus.SUPERSEDED
+            if inv.replacement_subtask:
+                rep = inv.replacement_subtask
+                if not rep.subtask_id or not rep.title.strip() or not rep.goal.strip():
+                    return False, "Replacement subtask must have a valid non-empty ID, title, and goal"
+                if rep.subtask_id in sim_subtasks and sim_subtasks[rep.subtask_id].status not in {SubtaskStatus.SUPERSEDED, SubtaskStatus.PRUNED}:
+                    return False, f"Replacement subtask ID '{rep.subtask_id}' conflicts with existing active subtask"
+                sim_subtasks[rep.subtask_id] = Subtask(
+                    subtask_id=rep.subtask_id,
+                    title=rep.title,
+                    goal=rep.goal,
+                    status=rep.status if rep.status != SubtaskStatus.SUPERSEDED else SubtaskStatus.PENDING,
+                    dependencies=list(rep.dependencies),
+                    acceptance_criteria=list(rep.acceptance_criteria),
+                )
+
+        # 6. Removal / Pruning check & simulation
+        for rem in proposal.removals:
+            if rem.subtask_id not in sim_subtasks:
+                return False, f"Removal target subtask '{rem.subtask_id}' does not exist in plan"
+            target = sim_subtasks[rem.subtask_id]
+            if target.status == SubtaskStatus.RUNNING:
+                return False, f"Cannot prune currently running subtask '{rem.subtask_id}'"
+            target.status = SubtaskStatus.PRUNED
+
+        # 7. Additions simulation
+        for add in proposal.additions:
+            sub = add.subtask
+            if not sub.subtask_id or not sub.title.strip() or not sub.goal.strip():
+                return False, "Added subtask must have a valid non-empty ID, title, and goal"
+            if sub.subtask_id in sim_subtasks and sim_subtasks[sub.subtask_id].status not in {SubtaskStatus.SUPERSEDED, SubtaskStatus.PRUNED}:
+                return False, f"Duplicate active subtask ID: '{sub.subtask_id}'"
+            sim_subtasks[sub.subtask_id] = Subtask(
+                subtask_id=sub.subtask_id,
+                title=sub.title,
+                goal=sub.goal,
+                status=sub.status if sub.status != SubtaskStatus.SUPERSEDED else SubtaskStatus.PENDING,
+                dependencies=list(sub.dependencies),
+                acceptance_criteria=list(sub.acceptance_criteria),
+            )
+
+        # 8. Dependency updates simulation
+        for dep_up in proposal.dependency_updates:
+            if dep_up.subtask_id not in sim_subtasks:
+                return False, f"Dependency update target '{dep_up.subtask_id}' does not exist in plan"
+            if sim_subtasks[dep_up.subtask_id].status in {SubtaskStatus.SUPERSEDED, SubtaskStatus.PRUNED}:
+                return False, f"Cannot update dependencies for superseded/pruned subtask '{dep_up.subtask_id}'"
+            sim_subtasks[dep_up.subtask_id].dependencies = list(dep_up.dependencies)
+
+        # 9. Verify candidate active subtasks
+        active_sim = [s for s in sim_subtasks.values() if s.status not in {SubtaskStatus.SUPERSEDED, SubtaskStatus.PRUNED}]
+        if not active_sim:
+            return False, "DAG proposal would result in an empty active task plan"
+        if len(active_sim) > self.max_total_subtasks:
+            return False, f"Total active subtasks ({len(active_sim)}) would exceed max limit ({self.max_total_subtasks})"
+
+        # 10. Dependency validity, self-dependencies, and acyclicity check
+        active_sim_map = {s.subtask_id: s for s in active_sim}
+        for sub in active_sim:
+            for dep_id in sub.dependencies:
+                if dep_id == sub.subtask_id:
+                    return False, f"Subtask '{sub.subtask_id}' has a self-dependency"
+                if dep_id not in active_sim_map:
+                    return False, f"Subtask '{sub.subtask_id}' references non-existent or pruned dependency '{dep_id}'"
+
+        # DFS Cycle detection on active graph
+        visited: set[str] = set()
+        path: set[str] = set()
+
+        def _is_cyclic(node_id: str) -> bool:
+            visited.add(node_id)
+            path.add(node_id)
+            for dep in active_sim_map[node_id].dependencies:
+                if dep not in visited:
+                    if _is_cyclic(dep):
+                        return True
+                elif dep in path:
+                    return True
+            path.remove(node_id)
+            return False
+
+        for node_id in active_sim_map:
+            if node_id not in visited:
+                if _is_cyclic(node_id):
+                    return False, "Dependency cycle detected in proposed DAG amendment"
+
+        return True, "Approved under deterministic DAG policy"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_dag_amendments": self.max_dag_amendments,
+            "max_subtask_additions": self.max_subtask_additions,
+            "max_total_subtasks": self.max_total_subtasks,
+            "max_subtask_invalidations_per_node": self.max_subtask_invalidations_per_node,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return cls(
+            max_dag_amendments=data.get("max_dag_amendments", 3),
+            max_subtask_additions=data.get("max_subtask_additions", 5),
+            max_total_subtasks=data.get("max_total_subtasks", 15),
+            max_subtask_invalidations_per_node=data.get("max_subtask_invalidations_per_node", 2),
         )
 
 
@@ -1094,6 +1523,8 @@ class RunReport:
     tool_history: list[tuple[ToolCall, ToolResult]] = field(default_factory=list)
     recovery_state: RecoveryState | None = None
     amendments: list[PlanAmendment] = field(default_factory=list)
+    dag_proposal: DAGProposal | None = None
+    dag_amendments: list[TaskPlanAmendment] = field(default_factory=list)
 
 
 class ProviderError(RuntimeError):

@@ -341,24 +341,25 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
             if task.plan:
-                # Apply modifications
-                if task.plan_proposal.modifications:
+                proposal = task.plan_proposal
+                if hasattr(task.plan, "apply_amendment"):
+                    task.plan.apply_amendment(proposal, approved_by="user_approval")
+                elif getattr(proposal, "additions", None):
+                    for addition in proposal.additions:
+                        task.plan.subtasks.append(addition.subtask if hasattr(addition, "subtask") else addition)
+
+                if hasattr(proposal, "modifications") and proposal.modifications:
                     subtask_map = {s.subtask_id: s for s in task.plan.subtasks}
-                    for mod in task.plan_proposal.modifications:
+                    for mod in proposal.modifications:
                         if mod.subtask_id in subtask_map:
                             subtask = subtask_map[mod.subtask_id]
-                            if mod.title is not None: subtask.title = mod.title
-                            if mod.goal is not None: subtask.goal = mod.goal
-                            if mod.acceptance_criteria is not None: subtask.acceptance_criteria = mod.acceptance_criteria
-                            if mod.dependencies is not None: subtask.dependencies = mod.dependencies
+                            if getattr(mod, "title", None) is not None: subtask.title = mod.title
+                            if getattr(mod, "goal", None) is not None: subtask.goal = mod.goal
+                            if getattr(mod, "acceptance_criteria", None) is not None: subtask.acceptance_criteria = mod.acceptance_criteria
+                            if getattr(mod, "dependencies", None) is not None: subtask.dependencies = mod.dependencies
 
-                # Apply additions
-                if task.plan_proposal.additions:
-                    for addition in task.plan_proposal.additions:
-                        task.plan.subtasks.append(addition.subtask)
-
-                # Validate graph after changes
-                validator = GraphValidator(task.plan.subtasks)
+                active_subs = getattr(task.plan, "active_subtasks", task.plan.subtasks)
+                validator = GraphValidator(active_subs)
                 errors = validator.validate()
                 if errors:
                     print(f"error: Approving proposal for task {args.task_id} results in an invalid plan:", file=sys.stderr)

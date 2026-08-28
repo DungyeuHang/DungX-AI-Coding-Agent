@@ -6,14 +6,19 @@ from typing import Any
 import uuid
 
 from .models import (
+    DAGProposal,
+    FailureAnalysis,
     Plan,
+    PlanProposal,
     ProjectContext,
     ProviderCapability,
     ProviderError,
     RunReport,
     Subtask,
     SubtaskStatus,
+    Task,
     TaskPlan,
+    TaskPlanAmendment,
     TaskStatus,
     ToolCall,
     ToolDefinition,
@@ -341,3 +346,23 @@ class Planner:
                 new_plan.files_likely_to_create.append(p)
 
         return new_plan
+
+    def create_dag_proposal(
+        self,
+        task: str | Task,
+        current_task_plan: TaskPlan,
+        failure: FailureAnalysis | None = None,
+        context: ProjectContext | None = None,
+    ) -> DAGProposal | None:
+        """Propose structured additions, removals, dependency updates, or invalidations for a TaskPlan."""
+        task_text = task.objective if hasattr(task, "objective") else str(task)
+        if hasattr(self.provider, "propose_plan_modification"):
+            prop = self.provider.propose_plan_modification(task_text, current_task_plan, failure)
+            if prop:
+                if isinstance(prop, DAGProposal):
+                    return prop
+                if isinstance(prop, PlanProposal):
+                    return DAGProposal.from_plan_proposal(prop)
+                if isinstance(prop, dict):
+                    return DAGProposal.from_dict(prop)
+        return None

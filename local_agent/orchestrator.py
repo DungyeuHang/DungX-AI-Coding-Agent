@@ -21,6 +21,8 @@ from .models import (
     ChangeImpact,
     Checkpoint,
     CommandSpec,
+    DAGAmendmentGuard,
+    DAGProposal,
     ExecutionResult,
     FailureAnalysis,
     Plan,
@@ -38,6 +40,8 @@ from .models import (
     Subtask,
     SubtaskStatus,
     Task,
+    TaskPlan,
+    TaskPlanAmendment,
     TaskStatus,
     ToolCall,
     ToolExecutionMetrics,
@@ -211,6 +215,12 @@ class Orchestrator:
                     raw_tool_metrics = checkpoint.continuation_context.get("tool_metrics", [])
                     if raw_tool_metrics:
                         report.tool_metrics = [ToolExecutionMetrics.from_dict(m) if isinstance(m, dict) else m for m in raw_tool_metrics]
+                    raw_task_plan = checkpoint.continuation_context.get("task_plan")
+                    if raw_task_plan and isinstance(raw_task_plan, dict) and task.plan:
+                        restored_tp = TaskPlan.from_dict(raw_task_plan)
+                        task.plan.version = restored_tp.version
+                        task.plan.amendments = list(restored_tp.amendments)
+                        report.dag_amendments = list(restored_tp.amendments)
                     # Load the last failure from checkpoint to continue repair iterations
                     last_failures = checkpoint.continuation_context.get("validation_state", {}).get("last_failures", [])
                     if last_failures:
@@ -609,14 +619,15 @@ class Orchestrator:
                 emit("[7/7] Complete")
 
             # Status setting logic moved outside the loop to ensure it always runs
-            if not report.plan_proposal:
+            if not report.plan_proposal and not getattr(report, "dag_proposal", None):
                 if report.completed:
                     if current_subtask:
                         current_subtask.status = SubtaskStatus.COMPLETED
                         current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     # Phase 3.24: Persist changed files on successful completion
                     task.changed_files = sorted(list(set(task.changed_files + report.changed_files)))
-                    if task.plan and all(s.status == SubtaskStatus.COMPLETED for s in task.plan.subtasks):
+                    active_subs = getattr(task.plan, "active_subtasks", task.plan.subtasks if task.plan else [])
+                    if task.plan and all(s.status == SubtaskStatus.COMPLETED for s in active_subs):
                         task.status = TaskStatus.COMPLETED
                     elif not task.plan:
                         task.status = TaskStatus.COMPLETED
@@ -903,6 +914,10 @@ class Orchestrator:
                 continuation_context["tool_metrics"] = [m.to_dict() if hasattr(m, "to_dict") else m for m in report.tool_metrics]
             if report.recovery_state and "recovery_state" not in continuation_context:
                 continuation_context["recovery_state"] = report.recovery_state.to_dict()
+            if task.plan and isinstance(task.plan, TaskPlan) and "task_plan" not in continuation_context:
+                continuation_context["task_plan"] = task.plan.to_dict()
+                continuation_context["task_plan_version"] = getattr(task.plan, "version", 1)
+                continuation_context["dag_amendments"] = [a.to_dict() for a in getattr(task.plan, "amendments", []) if hasattr(a, "to_dict")]
 
         checkpoint = Checkpoint(
             checkpoint_id=checkpoint_id,
