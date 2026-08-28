@@ -381,7 +381,6 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--verification-model", default=None)
     parser.add_argument("--dual-review", type=_bool, default=None, help="enable deliberative dual-model review")
     parser.add_argument("--knowledge-graph", type=_bool, default=None, help="enable persistent repository knowledge graph (true/false)")
-    parser.add_argument("--max-iterations", type=int, default=None)
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
@@ -418,7 +417,6 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "verification_model": getattr(args, "verification_model", None),
             "dual_review_enabled": getattr(args, "dual_review", None),
             "knowledge_graph_enabled": getattr(args, "knowledge_graph", None),
-            "max_iterations": getattr(args, "max_iterations", None),
             "validation_commands": args.validation,
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,
