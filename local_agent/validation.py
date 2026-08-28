@@ -423,6 +423,22 @@ class ValidationIntelligence:
 
         return targeted
 
+    def analyze_verification_gap(
+        self,
+        changed_files: list[str],
+        exported_symbols: list[Any],
+        context: ProjectContext,
+        targeted_commands: list[CommandSpec] | None = None,
+    ) -> Any | None:
+        """Analyzes whether changed files / exported symbols have targeted verification coverage."""
+        from .test_synthesizer import VerificationGapAnalyzer
+        return VerificationGapAnalyzer(self.root).analyze(
+            changed_files,
+            exported_symbols,
+            context,
+            targeted_commands=targeted_commands,
+        )
+
 
 @dataclass
 class VerificationResult:

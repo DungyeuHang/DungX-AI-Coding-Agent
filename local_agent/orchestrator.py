@@ -44,10 +44,12 @@ from .models import (
     TaskPlan,
     TaskPlanAmendment,
     TaskStatus,
+    TestExecutionRecord,
     ToolCall,
     ToolExecutionMetrics,
     ToolResult,
     ValidationPlan,
+    VerificationGap,
     normalize_diff_for_signature,
 )
 from .contract_extractor import ContractExtractor
@@ -56,6 +58,7 @@ from .planner import GraphValidator, Planner
 from .providers import AIProvider, ProviderError, QuotaExceededError, RateLimitError, build_provider
 from .repository import RepositoryIntelligence
 from .reviewer import Reviewer
+from .test_synthesizer import BehavioralVerifier, TestSynthesizer, VerificationGapAnalyzer
 from .tool_engine import IterationHistoryCompactor, ToolEngine, history_from_dict, history_to_dict
 from .tools import ToolRegistry
 from .validation import ValidationIntelligence
@@ -464,6 +467,65 @@ class Orchestrator:
                     self.storage.save_task(task)
                     failed = next((result for result in full_executions if not result.succeeded), None)
 
+                # Phase 4.11: Autonomous Verification Gap Analysis & Behavioral Test Synthesis
+                if failed is None and report.changed_files:
+                    try:
+                        extractor = ContractExtractor(filesystem=self.filesystem, project_root=self.config.project)
+                        prelim_sub = current_subtask or Subtask(subtask_id=task.task_id)
+                        prelim_contract = extractor.extract_contract(
+                            prelim_sub,
+                            report,
+                            preexisting_files=set(preexisting) if preexisting else None,
+                        )
+                        gap_analyzer = VerificationGapAnalyzer(self.config.project, filesystem=self.filesystem)
+                        gap = gap_analyzer.analyze(
+                            report.changed_files,
+                            prelim_contract.exported_symbols,
+                            context,
+                            targeted_commands=targeted_commands,
+                        )
+                        report.verification_gap = gap
+                        if gap and (gap.missing_test_symbols or gap.untested_files):
+                            emit(f"[5.5/7] Verification gap detected ({len(gap.missing_test_symbols)} untested symbol(s)); synthesizing behavioral verification fixture...")
+                            planning_prov = None
+                            try:
+                                planning_prov = self._get_provider_for_capability(ProviderCapability.PLANNING)
+                            except Exception:
+                                pass
+                            synthesizer = TestSynthesizer(
+                                self.config.project,
+                                provider=planning_prov,
+                                filesystem=self.filesystem,
+                            )
+                            test_code = synthesizer.synthesize_test(prelim_sub, gap, context)
+                            if test_code:
+                                verifier = BehavioralVerifier(
+                                    self.config.project,
+                                    runner=self.runner,
+                                    filesystem=self.filesystem,
+                                )
+                                record = verifier.verify(
+                                    test_code,
+                                    prelim_sub.subtask_id,
+                                    exercised_symbols=gap.missing_test_symbols,
+                                )
+                                report.behavioral_evidence.append(record)
+                                if record.status == "passed":
+                                    emit(f"[5.6/7] Behavioral verification fixture PASSED for {len(record.exercised_symbols)} symbol(s).")
+                                else:
+                                    emit(f"[5.6/7] Behavioral verification fixture FAILED (exit {record.exit_code}): {record.stderr_summary[:100]}")
+                                    failed = ExecutionResult(
+                                        command=record.command,
+                                        exit_code=record.exit_code,
+                                        stdout=record.stdout_summary,
+                                        stderr=record.stderr_summary,
+                                        duration_seconds=record.duration_seconds,
+                                    )
+                                    executions.append(failed)
+                                    report.executions.append(failed)
+                    except Exception as e:
+                        LOGGER.warning("Behavioral verification synthesis encountered an error: %s", e)
+
                 if failed is not None:
                     emit("[5/7] Validation failed")
 
@@ -644,13 +706,14 @@ class Orchestrator:
                     if current_subtask:
                         current_subtask.status = SubtaskStatus.COMPLETED
                         current_subtask.completed_at = datetime.datetime.now(datetime.timezone.utc)
-                        # Phase 4.10: Extract authoritative SubtaskContract from verified execution evidence
+                        # Phase 4.10 / Phase 4.11: Extract authoritative SubtaskContract with behavioral evidence
                         try:
                             extractor = ContractExtractor(filesystem=self.filesystem, project_root=self.config.project)
                             current_subtask.contract = extractor.extract_contract(
                                 current_subtask,
                                 report,
                                 preexisting_files=set(preexisting) if preexisting else None,
+                                behavioral_records=report.behavioral_evidence,
                             )
                         except Exception as e:
                             LOGGER.warning("Could not extract subtask contract for %s: %s", current_subtask.subtask_id, e)

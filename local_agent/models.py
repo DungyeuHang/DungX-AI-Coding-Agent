@@ -781,7 +781,7 @@ class Checkpoint:
         data["timestamp"] = datetime.datetime.fromisoformat(data["timestamp"])
         return cls(**data)
 
-# Phase 4.10: Cross-Subtask Semantic Contract & Knowledge Fabric
+# Phase 4.10 / Phase 4.11: Cross-Subtask Semantic Contract & Behavioral Verification Models
 @dataclass
 class ExportedSymbol:
     symbol_id: str
@@ -790,12 +790,16 @@ class ExportedSymbol:
     file_path: str
     signature: str = ""
     description: str = ""
+    verified: bool = False
+    verification_source: str = ""
 
     def __post_init__(self):
         if len(self.signature) > 500:
             self.signature = self.signature[:497] + "..."
         if len(self.description) > 500:
             self.description = self.description[:497] + "..."
+        if len(self.verification_source) > 200:
+            self.verification_source = self.verification_source[:197] + "..."
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -805,6 +809,8 @@ class ExportedSymbol:
             "file_path": self.file_path,
             "signature": self.signature,
             "description": self.description,
+            "verified": self.verified,
+            "verification_source": self.verification_source,
         }
 
     @classmethod
@@ -816,6 +822,113 @@ class ExportedSymbol:
             file_path=str(data.get("file_path", "")),
             signature=str(data.get("signature", "")),
             description=str(data.get("description", "")),
+            verified=bool(data.get("verified", False)),
+            verification_source=str(data.get("verification_source", "")),
+        )
+
+
+@dataclass
+class TestExecutionRecord:
+    __test__ = False
+    test_id: str
+    command: str
+    status: Literal["passed", "failed", "timeout", "inconclusive", "skipped"]
+    exit_code: int
+    duration_seconds: float = 0.0
+    stdout_summary: str = ""
+    stderr_summary: str = ""
+    synthesized: bool = True
+    exercised_symbols: list[str] = field(default_factory=list)
+    timestamp: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+    failure_classification: str = ""
+
+    def __post_init__(self):
+        if len(self.stdout_summary) > 500:
+            self.stdout_summary = self.stdout_summary[:497] + "..."
+        if len(self.stderr_summary) > 500:
+            self.stderr_summary = self.stderr_summary[:497] + "..."
+        if len(self.failure_classification) > 200:
+            self.failure_classification = self.failure_classification[:197] + "..."
+        if len(self.exercised_symbols) > 20:
+            self.exercised_symbols = self.exercised_symbols[:20]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "test_id": self.test_id,
+            "command": self.command,
+            "status": self.status,
+            "exit_code": self.exit_code,
+            "duration_seconds": self.duration_seconds,
+            "stdout_summary": self.stdout_summary,
+            "stderr_summary": self.stderr_summary,
+            "synthesized": self.synthesized,
+            "exercised_symbols": list(self.exercised_symbols),
+            "timestamp": self.timestamp.isoformat() if isinstance(self.timestamp, datetime.datetime) else str(self.timestamp),
+            "failure_classification": self.failure_classification,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        raw_ts = data.get("timestamp")
+        if isinstance(raw_ts, str):
+            try:
+                ts = datetime.datetime.fromisoformat(raw_ts)
+            except ValueError:
+                ts = datetime.datetime.now(datetime.timezone.utc)
+        elif isinstance(raw_ts, datetime.datetime):
+            ts = raw_ts
+        else:
+            ts = datetime.datetime.now(datetime.timezone.utc)
+        return cls(
+            test_id=str(data.get("test_id", "")),
+            command=str(data.get("command", "")),
+            status=data.get("status", "inconclusive"),
+            exit_code=int(data.get("exit_code", 0)),
+            duration_seconds=float(data.get("duration_seconds", 0.0)),
+            stdout_summary=str(data.get("stdout_summary", "")),
+            stderr_summary=str(data.get("stderr_summary", "")),
+            synthesized=bool(data.get("synthesized", True)),
+            exercised_symbols=list(data.get("exercised_symbols", [])),
+            timestamp=ts,
+            failure_classification=str(data.get("failure_classification", "")),
+        )
+
+
+@dataclass
+class VerificationGap:
+    missing_test_symbols: list[ExportedSymbol] = field(default_factory=list)
+    untested_files: list[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+    severity: Literal["low", "medium", "high"] = "low"
+
+    def __post_init__(self):
+        if len(self.missing_test_symbols) > 20:
+            self.missing_test_symbols = self.missing_test_symbols[:20]
+        if len(self.untested_files) > 20:
+            self.untested_files = self.untested_files[:20]
+        if len(self.reasons) > 20:
+            self.reasons = self.reasons[:20]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "missing_test_symbols": [s.to_dict() for s in self.missing_test_symbols],
+            "untested_files": list(self.untested_files),
+            "reasons": list(self.reasons),
+            "severity": self.severity,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        raw_syms = data.get("missing_test_symbols", [])
+        syms = [
+            ExportedSymbol.from_dict(s) if isinstance(s, dict) else s
+            for s in raw_syms
+        ] if isinstance(raw_syms, list) else []
+        return cls(
+            missing_test_symbols=syms,
+            untested_files=list(data.get("untested_files", [])),
+            reasons=list(data.get("reasons", [])),
+            severity=data.get("severity", "low"),
         )
 
 
@@ -828,6 +941,7 @@ class SubtaskContract:
     created_files: list[str] = field(default_factory=list)
     validation_commands: list[str] = field(default_factory=list)
     architectural_notes: list[str] = field(default_factory=list)
+    behavioral_evidence: list[TestExecutionRecord] = field(default_factory=list)
     created_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
 
     def __post_init__(self):
@@ -841,6 +955,8 @@ class SubtaskContract:
             self.validation_commands = self.validation_commands[:10]
         if len(self.architectural_notes) > 10:
             self.architectural_notes = self.architectural_notes[:10]
+        if len(self.behavioral_evidence) > 10:
+            self.behavioral_evidence = self.behavioral_evidence[:10]
 
     def format_for_prompt(self, max_chars: int = 2000) -> str:
         lines = [f"### Subtask Contract: '{self.title}' ({self.subtask_id})"]
@@ -853,7 +969,12 @@ class SubtaskContract:
             for sym in self.exported_symbols:
                 sig = sym.signature or sym.name
                 desc = f" ({sym.description})" if sym.description else ""
-                lines.append(f"  * [{sym.kind}] `{sig}` in `{sym.file_path}`{desc}")
+                status_tag = " [VERIFIED]" if sym.verified else " [UNVERIFIED]"
+                lines.append(f"  * [{sym.kind}] `{sig}` in `{sym.file_path}`{desc}{status_tag}")
+        if self.behavioral_evidence:
+            lines.append("- Behavioral Verification Evidence:")
+            for rec in self.behavioral_evidence:
+                lines.append(f"  * [{rec.status.upper()}] `{rec.command}` (exit {rec.exit_code})")
         if self.validation_commands:
             lines.append(f"- Verified Validation Commands: {'; '.join(self.validation_commands)}")
         if self.architectural_notes:
@@ -874,6 +995,7 @@ class SubtaskContract:
             "created_files": list(self.created_files),
             "validation_commands": list(self.validation_commands),
             "architectural_notes": list(self.architectural_notes),
+            "behavioral_evidence": [r.to_dict() for r in self.behavioral_evidence],
             "created_at": self.created_at.isoformat(),
         }
 
@@ -881,7 +1003,10 @@ class SubtaskContract:
     def from_dict(cls, data: dict[str, Any]) -> Self:
         raw_ts = data.get("created_at")
         if isinstance(raw_ts, str):
-            ts = datetime.datetime.fromisoformat(raw_ts)
+            try:
+                ts = datetime.datetime.fromisoformat(raw_ts)
+            except ValueError:
+                ts = datetime.datetime.now(datetime.timezone.utc)
         elif isinstance(raw_ts, datetime.datetime):
             ts = raw_ts
         else:
@@ -891,6 +1016,11 @@ class SubtaskContract:
             ExportedSymbol.from_dict(s) if isinstance(s, dict) else s
             for s in raw_symbols
         ] if isinstance(raw_symbols, list) else []
+        raw_evidence = data.get("behavioral_evidence", [])
+        evidence = [
+            TestExecutionRecord.from_dict(r) if isinstance(r, dict) else r
+            for r in raw_evidence
+        ] if isinstance(raw_evidence, list) else []
         return cls(
             subtask_id=str(data.get("subtask_id", "")),
             title=str(data.get("title", "")),
@@ -899,6 +1029,7 @@ class SubtaskContract:
             created_files=list(data.get("created_files", [])),
             validation_commands=list(data.get("validation_commands", [])),
             architectural_notes=list(data.get("architectural_notes", [])),
+            behavioral_evidence=evidence,
             created_at=ts,
         )
 
@@ -1685,6 +1816,8 @@ class RunReport:
     amendments: list[PlanAmendment] = field(default_factory=list)
     dag_proposal: DAGProposal | None = None
     dag_amendments: list[TaskPlanAmendment] = field(default_factory=list)
+    behavioral_evidence: list[TestExecutionRecord] = field(default_factory=list)
+    verification_gap: VerificationGap | None = None
 
 
 class ProviderError(RuntimeError):

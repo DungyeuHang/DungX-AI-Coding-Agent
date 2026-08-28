@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .filesystem import ProjectFilesystem
-from .models import ExportedSymbol, RunReport, Subtask, SubtaskContract
+from .models import ExportedSymbol, RunReport, Subtask, SubtaskContract, TestExecutionRecord
 
 LOGGER = logging.getLogger(__name__)
 
@@ -20,6 +20,7 @@ class ContractExtractor:
     - AST parsing of modified/created Python modules for exported classes, functions, and types
     - Regex pattern extraction for TypeScript/JavaScript exports
     - Verified validation commands executed during the run
+    - Behavioral runtime verification records from TestExecutionRecord
     - Concise, deterministic architectural invariants and file deltas
     """
 
@@ -32,6 +33,7 @@ class ContractExtractor:
         subtask: Subtask,
         report: RunReport,
         preexisting_files: set[str] | None = None,
+        behavioral_records: list[TestExecutionRecord] | None = None,
     ) -> SubtaskContract:
         """Extracts an authoritative, bounded SubtaskContract for a completed subtask."""
         all_changed = list(report.changed_files) if hasattr(report, "changed_files") and report.changed_files else []
@@ -59,6 +61,20 @@ class ContractExtractor:
             else:
                 modified_files = list(all_changed)
 
+        # Collect behavioral evidence from parameter or report
+        evidence = list(behavioral_records or [])
+        if not evidence and hasattr(report, "behavioral_evidence") and report.behavioral_evidence:
+            evidence = list(report.behavioral_evidence)
+
+        # Build set of exercised verified symbols from passing behavioral records
+        verified_symbol_names: set[str] = set()
+        symbol_verification_source: dict[str, str] = {}
+        for rec in evidence:
+            if rec.status == "passed":
+                for sym_name in rec.exercised_symbols:
+                    verified_symbol_names.add(sym_name)
+                    symbol_verification_source[sym_name] = rec.test_id or rec.command
+
         # Extract exported symbols from changed files
         exported_symbols: list[ExportedSymbol] = []
         for file_path in all_changed:
@@ -68,6 +84,9 @@ class ContractExtractor:
             for sym in symbols:
                 if len(exported_symbols) >= 10:
                     break
+                if sym.name in verified_symbol_names:
+                    sym.verified = True
+                    sym.verification_source = symbol_verification_source.get(sym.name, "behavioral_test")
                 exported_symbols.append(sym)
 
         # Extract verified validation commands
@@ -92,6 +111,9 @@ class ContractExtractor:
             top_funcs = [s.name for s in exported_symbols if s.kind == "function"]
             if top_funcs:
                 architectural_notes.append(f"Exported core functions: {', '.join(top_funcs[:4])}")
+        if evidence:
+            passed_tests = sum(1 for e in evidence if e.status == "passed")
+            architectural_notes.append(f"Behavioral verification: {passed_tests}/{len(evidence)} test fixture(s) passed")
         if validation_commands:
             architectural_notes.append(f"Verified against suite: {validation_commands[0][:80]}")
 
@@ -103,6 +125,7 @@ class ContractExtractor:
             created_files=created_files[:20],
             validation_commands=validation_commands[:10],
             architectural_notes=architectural_notes[:10],
+            behavioral_evidence=evidence[:10],
             created_at=datetime.datetime.now(datetime.timezone.utc),
         )
 
