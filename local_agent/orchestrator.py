@@ -34,9 +34,11 @@ from .models import (
     ProviderCapability,
     RecoveryState,
     RepairSignature,
+    ReviewConsensusRecord,
     ReviewResult,
     RunReport,
     ScopeExpansionProposal,
+    SpecialistRole,
     Subtask,
     SubtaskContract,
     SubtaskStatus,
@@ -55,9 +57,16 @@ from .models import (
 from .contract_extractor import ContractExtractor
 from .models import MemoryCategory
 from .planner import GraphValidator, Planner
-from .providers import AIProvider, ProviderError, QuotaExceededError, RateLimitError, build_provider
+from .providers import (
+    AIProvider,
+    ProviderError,
+    QuotaExceededError,
+    RateLimitError,
+    SpecialistModelRouter,
+    build_provider,
+)
 from .repository import RepositoryIntelligence
-from .reviewer import Reviewer
+from .reviewer import DeliberativeReviewConsensus, Reviewer
 from .test_synthesizer import BehavioralVerifier, TestSynthesizer, VerificationGapAnalyzer
 from .tool_engine import IterationHistoryCompactor, ToolEngine, history_from_dict, history_to_dict
 from .tools import ToolRegistry
@@ -73,6 +82,14 @@ class Orchestrator:
         self.scheduler = scheduler
         self.repo_lock = repo_lock
         self.memory_lock = memory_lock
+        cred_store = getattr(self.scheduler, "credential_store", None) if self.scheduler else None
+        sched_state = getattr(self.scheduler, "state", None) if self.scheduler else None
+        self.router = SpecialistModelRouter(
+            config,
+            credential_store=cred_store,
+            scheduler_state=sched_state,
+            provider_factory=lambda cfg, api_key=None: build_provider(cfg, api_key=api_key),
+        )
         self.analyzer = RepositoryIntelligence(config.project)
         self.filesystem = ProjectFilesystem(config.project)
         self.git = GitIntegration(config.project)
@@ -487,14 +504,10 @@ class Orchestrator:
                         report.verification_gap = gap
                         if gap and (gap.missing_test_symbols or gap.untested_files):
                             emit(f"[5.5/7] Verification gap detected ({len(gap.missing_test_symbols)} untested symbol(s)); synthesizing behavioral verification fixture...")
-                            planning_prov = None
-                            try:
-                                planning_prov = self._get_provider_for_capability(ProviderCapability.PLANNING)
-                            except Exception:
-                                pass
+                            verification_prov = self.router.get_provider(SpecialistRole.VERIFICATION)
                             synthesizer = TestSynthesizer(
                                 self.config.project,
-                                provider=planning_prov,
+                                provider=verification_prov,
                                 filesystem=self.filesystem,
                             )
                             test_code = synthesizer.synthesize_test(prelim_sub, gap, context)
@@ -660,16 +673,17 @@ class Orchestrator:
                     review_policy = getattr(self.config, "tool_policy", None)
                     report.review = self._execute_with_specialist(
                         task,
-                        ProviderCapability.REVIEW,
-                        lambda provider: Reviewer(
-                            provider,
-                            registry=review_registry,
-                            policy=review_policy,
-                        ).review(
-                            current_subtask.goal if current_subtask else task.objective,
-                            plan,
-                            coding_agent.diff() or self.git.diff(),
-                            context,
+                        SpecialistRole.REVIEW,
+                        lambda provider: self._review_with_consensus(
+                            provider=provider,
+                            task=task,
+                            subtask=current_subtask,
+                            plan=plan,
+                            diff=coding_agent.diff() or self.git.diff(),
+                            context=context,
+                            review_registry=review_registry,
+                            review_policy=review_policy,
+                            initial_history=None,
                             report=report,
                         ),
                         "review"
@@ -789,20 +803,111 @@ class Orchestrator:
 
         return report
 
-    def _select_specialists(self, task: Task, capability: ProviderCapability):
+    def _map_role(self, capability: ProviderCapability | SpecialistRole | str) -> SpecialistRole:
+        if isinstance(capability, SpecialistRole):
+            return capability
+        role_map = {
+            ProviderCapability.PLANNING: SpecialistRole.PLANNING,
+            ProviderCapability.IMPLEMENTATION: SpecialistRole.IMPLEMENTATION,
+            ProviderCapability.REPAIR: SpecialistRole.REPAIR,
+            ProviderCapability.REVIEW: SpecialistRole.REVIEW,
+            "planning": SpecialistRole.PLANNING,
+            "implementation": SpecialistRole.IMPLEMENTATION,
+            "repair": SpecialistRole.REPAIR,
+            "review": SpecialistRole.REVIEW,
+            "verification": SpecialistRole.VERIFICATION,
+        }
+        return role_map.get(capability, SpecialistRole.IMPLEMENTATION)
+
+    def _select_specialists(self, task: Task, capability: ProviderCapability | SpecialistRole | str):
+        role = self._map_role(capability)
+        cap = capability if isinstance(capability, ProviderCapability) else {
+            SpecialistRole.PLANNING: ProviderCapability.PLANNING,
+            SpecialistRole.IMPLEMENTATION: ProviderCapability.IMPLEMENTATION,
+            SpecialistRole.REPAIR: ProviderCapability.REPAIR,
+            SpecialistRole.REVIEW: ProviderCapability.REVIEW,
+        }.get(role, ProviderCapability.IMPLEMENTATION)
+
         if self.scheduler is not None:
-            provider_configs = self.scheduler._select_providers(task, {capability})
+            provider_configs = self.scheduler._select_providers(task, {cap})
             for provider_config in provider_configs:
                 provider = self.scheduler._build_provider_instance(provider_config.provider)
                 if provider:
                     yield provider
             return
-        yield build_provider(self.config)
 
-    def _execute_with_specialist(self, task: Task, capability: ProviderCapability, action, stage_name: str):
-        for provider in self._select_specialists(task, capability):
-            return action(provider)
-        raise ProviderError(f"No available and capable provider found for stage: {stage_name}")
+        for provider in self.router.get_provider_chain(role):
+            yield provider
+
+    def _execute_with_specialist(self, task: Task, capability: ProviderCapability | SpecialistRole | str, action, stage_name: str):
+        role = self._map_role(capability)
+        if self.scheduler is not None:
+            for provider in self._select_specialists(task, capability):
+                return action(provider)
+            raise ProviderError(f"No available and capable provider found for stage: {stage_name}")
+
+        return self.router.execute_with_fallback(role, action, stage_name)
+
+    def _get_secondary_review_provider(self, primary_provider: AIProvider, task: Task | None = None) -> AIProvider | None:
+        if self.scheduler is not None:
+            if task:
+                for p in self._select_specialists(task, ProviderCapability.REVIEW):
+                    if p != primary_provider:
+                        return p
+            return None
+
+        # Check explicit fallbacks for review role
+        _, _, fallbacks = self.router.get_role_config(SpecialistRole.REVIEW)
+        for fb_id in fallbacks:
+            fb_p = self.router._build_provider_for_spec(fb_id)
+            if fb_p and fb_p != primary_provider:
+                return fb_p
+
+        # Check if planning or implementation has an explicitly different provider configured
+        for role in (SpecialistRole.PLANNING, SpecialistRole.IMPLEMENTATION):
+            role_override = getattr(self.config, f"{role.value}_provider", None)
+            if role_override:
+                p = self.router.get_provider(role)
+                if p and p != primary_provider:
+                    return p
+
+        return None
+
+    def _review_with_consensus(
+        self,
+        provider: AIProvider,
+        task: Task,
+        subtask: Subtask | None,
+        plan: Plan,
+        diff: str,
+        context: ProjectContext,
+        review_registry: ToolRegistry | None,
+        review_policy: Any | None,
+        initial_history: list[tuple[ToolCall, ToolResult]] | None,
+        report: RunReport,
+    ) -> ReviewResult:
+        primary_reviewer = Reviewer(provider, registry=review_registry, policy=review_policy)
+
+        # Determine secondary review provider if explicitly available
+        secondary_provider = self._get_secondary_review_provider(provider, task=task)
+        secondary_reviewer = Reviewer(secondary_provider, registry=review_registry, policy=review_policy) if secondary_provider else None
+
+        consensus_engine = DeliberativeReviewConsensus(
+            primary_reviewer=primary_reviewer,
+            secondary_reviewer=secondary_reviewer,
+            dual_review_enabled=self.config.dual_review_enabled,
+            high_risk_dual_review=self.config.high_risk_dual_review,
+        )
+
+        return consensus_engine.review(
+            task=subtask.goal if subtask else task.objective,
+            plan=plan,
+            diff=diff,
+            context=context,
+            changed_files=report.changed_files,
+            initial_history=initial_history,
+            report=report,
+        )
 
     def _execute_code_generation(
         self,
@@ -1023,6 +1128,16 @@ class Orchestrator:
                 continuation_context["task_plan"] = task.plan.to_dict()
                 continuation_context["task_plan_version"] = getattr(task.plan, "version", 1)
                 continuation_context["dag_amendments"] = [a.to_dict() for a in getattr(task.plan, "amendments", []) if hasattr(a, "to_dict")]
+            if getattr(report, "review_consensus", None):
+                continuation_context["review_consensus"] = [r.to_dict() if hasattr(r, "to_dict") else r for r in report.review_consensus]
+            if hasattr(self, "router"):
+                continuation_context["specialist_routing_state"] = {
+                    "planning": list(self.router.get_role_config(SpecialistRole.PLANNING)),
+                    "implementation": list(self.router.get_role_config(SpecialistRole.IMPLEMENTATION)),
+                    "repair": list(self.router.get_role_config(SpecialistRole.REPAIR)),
+                    "review": list(self.router.get_role_config(SpecialistRole.REVIEW)),
+                    "verification": list(self.router.get_role_config(SpecialistRole.VERIFICATION)),
+                }
 
         checkpoint = Checkpoint(
             checkpoint_id=checkpoint_id,
@@ -1124,6 +1239,8 @@ class Orchestrator:
         tool_metrics: list[ToolExecutionMetrics] = []
         tool_history: list[tuple[ToolCall, ToolResult]] = []
         recovery_state: RecoveryState | None = None
+        review_consensus: list[ReviewConsensusRecord] = []
+        specialist_routing_state: dict[str, Any] = {}
 
         # Attempt to load from latest checkpoint if available
         if task.latest_checkpoint_id:
@@ -1143,6 +1260,10 @@ class Orchestrator:
                     raw_rec = checkpoint.continuation_context.get("recovery_state")
                     if raw_rec and isinstance(raw_rec, dict):
                         recovery_state = RecoveryState.from_dict(raw_rec)
+                    raw_consensus = checkpoint.continuation_context.get("review_consensus", [])
+                    if raw_consensus:
+                        review_consensus = [ReviewConsensusRecord.from_dict(r) if isinstance(r, dict) else r for r in raw_consensus]
+                    specialist_routing_state = checkpoint.continuation_context.get("specialist_routing_state", {})
             except FileNotFoundError:
                 pass # Checkpoint might be missing if task is new or corrupted
 
@@ -1176,5 +1297,7 @@ class Orchestrator:
             tool_metrics=tool_metrics,
             tool_history=tool_history,
             recovery_state=recovery_state,
+            review_consensus=review_consensus,
+            specialist_routing_state=specialist_routing_state,
         )
 

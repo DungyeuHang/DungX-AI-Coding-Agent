@@ -50,6 +50,13 @@ class ProviderCapability(str, Enum):
     REVIEW = "review"
     TOOL_USE = "tool_use"
 
+class SpecialistRole(str, Enum):
+    PLANNING = "planning"
+    IMPLEMENTATION = "implementation"
+    REPAIR = "repair"
+    REVIEW = "review"
+    VERIFICATION = "verification"
+
 class ProviderAvailability(str, Enum):
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
@@ -1784,10 +1791,91 @@ class ProviderConfig:
         return cls(**data)
 
 @dataclass
+class ReviewConsensusRecord:
+    role: str = "review"
+    primary_provider: str = ""
+    primary_model: str = ""
+    secondary_provider: str = ""
+    secondary_model: str = ""
+    primary_verdict: str = ""
+    secondary_verdict: str = ""
+    final_consensus_verdict: str = ""
+    is_high_risk: bool = False
+    high_risk_reason: str = ""
+    timestamp: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "primary_provider": self.primary_provider,
+            "primary_model": self.primary_model,
+            "secondary_provider": self.secondary_provider,
+            "secondary_model": self.secondary_model,
+            "primary_verdict": self.primary_verdict,
+            "secondary_verdict": self.secondary_verdict,
+            "final_consensus_verdict": self.final_consensus_verdict,
+            "is_high_risk": self.is_high_risk,
+            "high_risk_reason": self.high_risk_reason,
+            "timestamp": self.timestamp.isoformat() if hasattr(self.timestamp, "isoformat") else str(self.timestamp),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ReviewConsensusRecord":
+        ts_raw = data.get("timestamp")
+        ts = datetime.datetime.now(datetime.timezone.utc)
+        if isinstance(ts_raw, str):
+            try:
+                ts = datetime.datetime.fromisoformat(ts_raw)
+            except Exception:
+                pass
+        elif isinstance(ts_raw, datetime.datetime):
+            ts = ts_raw
+        return cls(
+            role=str(data.get("role", "review")),
+            primary_provider=str(data.get("primary_provider", "")),
+            primary_model=str(data.get("primary_model", "")),
+            secondary_provider=str(data.get("secondary_provider", "")),
+            secondary_model=str(data.get("secondary_model", "")),
+            primary_verdict=str(data.get("primary_verdict", "")),
+            secondary_verdict=str(data.get("secondary_verdict", "")),
+            final_consensus_verdict=str(data.get("final_consensus_verdict", "")),
+            is_high_risk=bool(data.get("is_high_risk", False)),
+            high_risk_reason=str(data.get("high_risk_reason", "")),
+            timestamp=ts,
+        )
+
+
+@dataclass
 class ReviewResult:
     verdict: str
     summary: str
     findings: list[str] = field(default_factory=list)
+    consensus_records: list[ReviewConsensusRecord] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "summary": self.summary,
+            "findings": list(self.findings),
+            "consensus_records": [r.to_dict() if hasattr(r, "to_dict") else r for r in self.consensus_records],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ReviewResult":
+        raw_consensus = data.get("consensus_records", [])
+        records = []
+        if isinstance(raw_consensus, list):
+            for r in raw_consensus:
+                if isinstance(r, dict):
+                    records.append(ReviewConsensusRecord.from_dict(r))
+                elif isinstance(r, ReviewConsensusRecord):
+                    records.append(r)
+        return cls(
+            verdict=str(data.get("verdict", "CHANGES_REQUIRED")),
+            summary=str(data.get("summary", "")),
+            findings=list(data.get("findings", [])),
+            consensus_records=records,
+        )
 
 
 @dataclass
@@ -1818,6 +1906,8 @@ class RunReport:
     dag_amendments: list[TaskPlanAmendment] = field(default_factory=list)
     behavioral_evidence: list[TestExecutionRecord] = field(default_factory=list)
     verification_gap: VerificationGap | None = None
+    specialist_routing_state: dict[str, Any] = field(default_factory=dict)
+    review_consensus: list[ReviewConsensusRecord] = field(default_factory=list)
 
 
 class ProviderError(RuntimeError):

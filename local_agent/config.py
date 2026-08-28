@@ -70,6 +70,23 @@ class AgentConfig:
     disallowed_tools: list[str] = field(default_factory=list)
     tool_history_compaction_window: int = 2
     max_tool_history_context_bytes: int = 8000
+    planning_provider: str | None = None
+    planning_model: str | None = None
+    planning_fallbacks: list[str] = field(default_factory=list)
+    implementation_provider: str | None = None
+    implementation_model: str | None = None
+    implementation_fallbacks: list[str] = field(default_factory=list)
+    repair_provider: str | None = None
+    repair_model: str | None = None
+    repair_fallbacks: list[str] = field(default_factory=list)
+    review_provider: str | None = None
+    review_model: str | None = None
+    review_fallbacks: list[str] = field(default_factory=list)
+    verification_provider: str | None = None
+    verification_model: str | None = None
+    verification_fallbacks: list[str] = field(default_factory=list)
+    dual_review_enabled: bool = False
+    high_risk_dual_review: bool = True
 
     @property
     def tool_policy(self) -> Any:
@@ -132,6 +149,23 @@ class AgentConfig:
             "max_tool_history_context_bytes": "AGENT_MAX_TOOL_HISTORY_CONTEXT_BYTES",
             "max_plan_amendments": "AGENT_MAX_PLAN_AMENDMENTS",
             "max_scope_growth_factor": "AGENT_MAX_SCOPE_GROWTH_FACTOR",
+            "planning_provider": "AGENT_PLANNING_PROVIDER",
+            "planning_model": "AGENT_PLANNING_MODEL",
+            "planning_fallbacks": "AGENT_PLANNING_FALLBACKS",
+            "implementation_provider": "AGENT_IMPLEMENTATION_PROVIDER",
+            "implementation_model": "AGENT_IMPLEMENTATION_MODEL",
+            "implementation_fallbacks": "AGENT_IMPLEMENTATION_FALLBACKS",
+            "repair_provider": "AGENT_REPAIR_PROVIDER",
+            "repair_model": "AGENT_REPAIR_MODEL",
+            "repair_fallbacks": "AGENT_REPAIR_FALLBACKS",
+            "review_provider": "AGENT_REVIEW_PROVIDER",
+            "review_model": "AGENT_REVIEW_MODEL",
+            "review_fallbacks": "AGENT_REVIEW_FALLBACKS",
+            "verification_provider": "AGENT_VERIFICATION_PROVIDER",
+            "verification_model": "AGENT_VERIFICATION_MODEL",
+            "verification_fallbacks": "AGENT_VERIFICATION_FALLBACKS",
+            "dual_review_enabled": "AGENT_DUAL_REVIEW",
+            "high_risk_dual_review": "AGENT_HIGH_RISK_DUAL_REVIEW",
         }
 
         def value(name: str, default: object) -> object:
@@ -194,6 +228,26 @@ class AgentConfig:
             configured_model = os.environ.get(model_env, "gemini-2.5-flash" if provider_name == "gemini" else "gpt-4.1-mini")
             if provider_name == "antigravity" and model_env not in os.environ:
                 configured_model = "gemini-3.7-flash"
+
+        def _parse_fallbacks(val: object) -> list[str]:
+            if isinstance(val, str) and val.strip():
+                try:
+                    parsed = json.loads(val)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if str(x).strip()]
+                except Exception:
+                    pass
+                return [x.strip() for x in val.split(",") if x.strip()]
+            elif isinstance(val, (list, tuple, set)):
+                return [str(x).strip() for x in val if str(x).strip()]
+            return []
+
+        def _opt_str(val: object) -> str | None:
+            if val is None:
+                return None
+            s = str(val).strip()
+            return s if s else None
+
         config = cls(
             project=Path(project).expanduser().resolve(),
             provider=provider_name,
@@ -243,6 +297,23 @@ class AgentConfig:
             max_tool_history_context_bytes=_positive_int(value("max_tool_history_context_bytes", 8000), "max_tool_history_context_bytes"),
             max_plan_amendments=_positive_int(value("max_plan_amendments", 5), "max_plan_amendments"),
             max_scope_growth_factor=float(value("max_scope_growth_factor", 2.0)),
+            planning_provider=_opt_str(value("planning_provider", None)),
+            planning_model=_opt_str(value("planning_model", None)),
+            planning_fallbacks=_parse_fallbacks(value("planning_fallbacks", [])),
+            implementation_provider=_opt_str(value("implementation_provider", None)),
+            implementation_model=_opt_str(value("implementation_model", None)),
+            implementation_fallbacks=_parse_fallbacks(value("implementation_fallbacks", [])),
+            repair_provider=_opt_str(value("repair_provider", None)),
+            repair_model=_opt_str(value("repair_model", None)),
+            repair_fallbacks=_parse_fallbacks(value("repair_fallbacks", [])),
+            review_provider=_opt_str(value("review_provider", None)),
+            review_model=_opt_str(value("review_model", None)),
+            review_fallbacks=_parse_fallbacks(value("review_fallbacks", [])),
+            verification_provider=_opt_str(value("verification_provider", None)),
+            verification_model=_opt_str(value("verification_model", None)),
+            verification_fallbacks=_parse_fallbacks(value("verification_fallbacks", [])),
+            dual_review_enabled=_bool(value("dual_review_enabled", False)),
+            high_risk_dual_review=_bool(value("high_risk_dual_review", True)),
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -251,8 +322,18 @@ class AgentConfig:
     def validate(self) -> None:
         if not self.project.is_dir():
             raise ValueError(f"project directory does not exist: {self.project}")
-        if self.provider not in {"mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"}:
+        valid_providers = {"mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"}
+        if self.provider not in valid_providers:
             raise ValueError("provider must be one of 'mock', 'openai', 'gemini', 'antigravity', 'deepseek', 'anthropic'")
+        for role_name, prov in (
+            ("planning_provider", self.planning_provider),
+            ("implementation_provider", self.implementation_provider),
+            ("repair_provider", self.repair_provider),
+            ("review_provider", self.review_provider),
+            ("verification_provider", self.verification_provider),
+        ):
+            if prov is not None and prov not in valid_providers:
+                raise ValueError(f"{role_name} must be one of 'mock', 'openai', 'gemini', 'antigravity', 'deepseek', 'anthropic'")
         if self.approval not in {"never", "always", "policy"}:
             raise ValueError("approval must be 'never', 'always', or 'policy'")
         if self.approval_mode not in {"never", "plan_review", "always"}:
@@ -279,6 +360,17 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--project", default=".", help="local project directory")
     parser.add_argument("--provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"), default=None)
     parser.add_argument("--model", default=None)
+    parser.add_argument("--planning-provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"), default=None)
+    parser.add_argument("--planning-model", default=None)
+    parser.add_argument("--implementation-provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"), default=None)
+    parser.add_argument("--implementation-model", default=None)
+    parser.add_argument("--repair-provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"), default=None)
+    parser.add_argument("--repair-model", default=None)
+    parser.add_argument("--review-provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"), default=None)
+    parser.add_argument("--review-model", default=None)
+    parser.add_argument("--verification-provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"), default=None)
+    parser.add_argument("--verification-model", default=None)
+    parser.add_argument("--dual-review", type=_bool, default=None, help="enable deliberative dual-model review")
     parser.add_argument("--max-iterations", type=int, default=None)
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
@@ -304,6 +396,17 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
         key: value for key, value in {
             "provider": args.provider,
             "model": args.model,
+            "planning_provider": getattr(args, "planning_provider", None),
+            "planning_model": getattr(args, "planning_model", None),
+            "implementation_provider": getattr(args, "implementation_provider", None),
+            "implementation_model": getattr(args, "implementation_model", None),
+            "repair_provider": getattr(args, "repair_provider", None),
+            "repair_model": getattr(args, "repair_model", None),
+            "review_provider": getattr(args, "review_provider", None),
+            "review_model": getattr(args, "review_model", None),
+            "verification_provider": getattr(args, "verification_provider", None),
+            "verification_model": getattr(args, "verification_model", None),
+            "dual_review_enabled": getattr(args, "dual_review", None),
             "max_iterations": args.max_iterations,
             "validation_commands": args.validation,
             "log_level": args.log_level,

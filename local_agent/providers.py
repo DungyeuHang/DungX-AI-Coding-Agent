@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, field
-from typing import Any
+from typing import Any, Callable
 
 from .config import AgentConfig
 from .models import (
@@ -30,12 +32,15 @@ from .models import (
     QuotaExceededError,
     RateLimitError,
     ReviewResult,
+    SpecialistRole,
     TaskPlan,
     ToolCall,
     ToolDefinition,
     ToolResult,
     UnknownProviderError,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AIProvider:
@@ -2456,3 +2461,175 @@ def build_provider(config: AgentConfig, api_key: str | None = None) -> AIProvide
     if config.provider == "anthropic":
         return AnthropicProvider(config)
     raise ProviderError(f"unsupported provider: {config.provider}")
+
+
+class SpecialistModelRouter:
+    """
+    Manages role-specific AI provider resolution, capability negotiation,
+    thread-safe provider instance caching, and bounded multi-tier fallback chains.
+    """
+
+    def __init__(
+        self,
+        base_config: AgentConfig,
+        credential_store: Any | None = None,
+        scheduler_state: Any | None = None,
+        provider_factory: Callable[..., AIProvider] | None = None,
+    ):
+        self.base_config = base_config
+        self.credential_store = credential_store
+        self.scheduler_state = scheduler_state
+        self.provider_factory = provider_factory or build_provider
+        self._provider_cache: dict[tuple[str, str, str], AIProvider] = {}
+        self._lock = threading.Lock()
+
+    def get_role_config(self, role: SpecialistRole | str) -> tuple[str, str | None, list[str]]:
+        """
+        Returns (provider_name, model_name, fallback_provider_list) for the given specialist role.
+        """
+        role_str = role.value if isinstance(role, SpecialistRole) else str(role).lower()
+
+        provider_override = getattr(self.base_config, f"{role_str}_provider", None)
+        model_override = getattr(self.base_config, f"{role_str}_model", None)
+        fallbacks_override = getattr(self.base_config, f"{role_str}_fallbacks", None) or []
+
+        provider_name = provider_override or self.base_config.provider
+        model_name = model_override or self.base_config.model
+        fallbacks = list(fallbacks_override)
+
+        if provider_override and self.base_config.provider not in fallbacks and self.base_config.provider != provider_override:
+            fallbacks.append(self.base_config.provider)
+
+        return provider_name, model_name, fallbacks
+
+    def _build_provider_for_spec(self, provider_id: str, model_override: str | None = None) -> AIProvider | None:
+        cache_key = (provider_id, model_override or "", getattr(self.base_config, "api_base_url", ""))
+        is_mock = provider_id == "mock" or provider_id.startswith("mock") or provider_id.startswith("provider_")
+        if not is_mock:
+            with self._lock:
+                if cache_key in self._provider_cache:
+                    return self._provider_cache[cache_key]
+
+        # Resolve credentials
+        api_key = None
+        if self.credential_store:
+            try:
+                api_key = self.credential_store.get("dungx-ai-coding-agent", provider_id)
+            except Exception:
+                pass
+
+        if not api_key:
+            env_map = {
+                "openai": "OPENAI_API_KEY",
+                "anthropic": "ANTHROPIC_API_KEY",
+                "gemini": "GEMINI_API_KEY",
+                "antigravity": "GEMINI_API_KEY",
+                "deepseek": "DEEPSEEK_API_KEY",
+            }
+            if provider_id in env_map:
+                api_key = os.environ.get(env_map[provider_id])
+            if not api_key and provider_id == self.base_config.provider:
+                api_key = self.base_config.api_key
+
+        config_dict = dict(self.base_config.__dict__)
+        config_dict["provider"] = provider_id
+        if model_override:
+            config_dict["model"] = model_override
+        if api_key:
+            config_dict["api_key"] = api_key
+
+        try:
+            cfg = AgentConfig(**config_dict)
+            instance = self.provider_factory(cfg, api_key=api_key)
+            if not is_mock:
+                with self._lock:
+                    self._provider_cache[cache_key] = instance
+            return instance
+        except Exception as e:
+            LOGGER.warning("Could not instantiate provider '%s' (model '%s'): %s", provider_id, model_override, e)
+            return None
+
+    def get_provider_chain(self, role: SpecialistRole | str) -> list[AIProvider]:
+        """
+        Resolves the ordered chain of providers for a role: primary -> fallbacks -> global -> mock.
+        """
+        primary_id, primary_model, fallbacks = self.get_role_config(role)
+        chain: list[AIProvider] = []
+        seen_keys: set[str] = set()
+
+        # 1. Primary
+        p = self._build_provider_for_spec(primary_id, primary_model)
+        if p and primary_id not in seen_keys:
+            chain.append(p)
+            seen_keys.add(primary_id)
+
+        # 2. Fallbacks
+        for fb_id in fallbacks:
+            if fb_id and fb_id not in seen_keys:
+                fb_p = self._build_provider_for_spec(fb_id)
+                if fb_p:
+                    chain.append(fb_p)
+                    seen_keys.add(fb_id)
+
+        # 3. Global fallback
+        if self.base_config.provider not in seen_keys:
+            glob_p = self._build_provider_for_spec(self.base_config.provider, self.base_config.model)
+            if glob_p:
+                chain.append(glob_p)
+                seen_keys.add(self.base_config.provider)
+
+        # 4. If all fail or empty, fallback to MockProvider
+        if not chain:
+            chain.append(MockProvider())
+
+        return chain
+
+    def get_provider(self, role: SpecialistRole | str) -> AIProvider:
+        """
+        Returns the primary (or first available) provider for the given role.
+        """
+        chain = self.get_provider_chain(role)
+        return chain[0] if chain else MockProvider()
+
+    def execute_with_fallback(
+        self,
+        role: SpecialistRole | str,
+        action: Callable[[AIProvider], Any],
+        stage_name: str = "",
+    ) -> Any:
+        """
+        Executes action with the primary provider for role. If a transient / quota / network error occurs,
+        falls back to subsequent providers in the chain.
+        """
+        chain = self.get_provider_chain(role)
+        last_error: Exception | None = None
+
+        for provider in chain:
+            try:
+                LOGGER.debug("Executing stage '%s' for role '%s' with provider '%s'", stage_name, role, getattr(provider, "__class__", "").__name__)
+                return action(provider)
+            except (RateLimitError, QuotaExceededError, NetworkError, TimeoutError, ModelUnavailableError, AuthenticationError) as exc:
+                last_error = exc
+                LOGGER.warning(
+                    "Stage '%s' (role '%s') failed with provider '%s' (%s: %s). Attempting fallback...",
+                    stage_name, role, getattr(provider, "__class__", "").__name__, type(exc).__name__, exc,
+                )
+                continue
+            except ProviderError as exc:
+                last_error = exc
+                LOGGER.warning(
+                    "Stage '%s' (role '%s') encountered ProviderError with '%s' (%s). Attempting fallback...",
+                    stage_name, role, getattr(provider, "__class__", "").__name__, exc,
+                )
+                continue
+            except Exception as exc:
+                last_error = exc
+                LOGGER.warning(
+                    "Stage '%s' (role '%s') encountered unexpected exception with '%s' (%s).",
+                    stage_name, role, getattr(provider, "__class__", "").__name__, exc,
+                )
+                raise exc
+
+        if last_error:
+            raise last_error
+        raise ProviderError(f"No available provider could execute stage '{stage_name}' for role '{role}'")
