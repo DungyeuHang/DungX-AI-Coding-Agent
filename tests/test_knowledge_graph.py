@@ -31,8 +31,7 @@ from local_agent.models import (
 )
 from local_agent.orchestrator import Orchestrator
 from local_agent.planner import Planner
-from local_agent.storage import JsonFileStorage
-
+from local_agent.storage import JsonFileStorage, TaskStorage
 
 class TestKnowledgeGraphModels(unittest.TestCase):
     """Unit tests for Phase 4.13 data structures and serialization."""
@@ -212,6 +211,29 @@ class TestStorageAndQuarantine(unittest.TestCase):
         corrupt_files = list(Path(self.temp_dir).glob("knowledge_graph.json.corrupt.*"))
         self.assertGreaterEqual(len(corrupt_files), 1)
         self.assertIn("garbage", corrupt_files[0].read_text(encoding="utf-8"))
+
+    def test_legacy_task_storage_subclass_instantiation(self):
+        """Verifies that legacy TaskStorage subclasses without knowledge methods instantiate and work cleanly."""
+        class LegacyMockStorage(TaskStorage):
+            def save_task(self, task): pass
+            def load_task(self, task_id): pass
+            def list_tasks(self): return []
+            def save_checkpoint(self, checkpoint): pass
+            def load_checkpoint(self, checkpoint_id): pass
+            def save_scheduler_state(self, state): pass
+            def load_scheduler_state(self): pass
+            def save_provider_configs(self, configs): pass
+            def load_provider_configs(self): return []
+            def save_semantic_index(self, index): pass
+            def load_semantic_index(self): pass
+            def save_project_memory(self, memory): pass
+            def load_project_memory(self): pass
+
+        legacy_storage = LegacyMockStorage()
+        loaded = legacy_storage.load_knowledge_graph()
+        self.assertIsInstance(loaded, RepositoryKnowledgeGraph)
+        self.assertEqual(len(loaded.files), 0)
+        legacy_storage.save_knowledge_graph(loaded)
 
 
 class TestKnowledgeGraphManager(unittest.TestCase):
@@ -731,6 +753,70 @@ class TestCrossTaskKnowledgeRetention(unittest.TestCase):
         sym = orch.knowledge_manager.get_graph().symbols["auth.py::generate_jwt"]
         self.assertEqual(len(sym.verified_behaviors), 0)
         self.assertLess(sym.confidence, 1.0)
+
+
+class TestKnowledgeGraphConfiguration(unittest.TestCase):
+    """Unit tests for Phase 4.13 configuration parsing, overrides, and validation."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.project_root = Path(self.temp_dir) / "proj"
+        self.project_root.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_valid_positive_values_pass_validation(self):
+        config = AgentConfig(
+            project=self.project_root,
+            provider="mock",
+            knowledge_graph_enabled=True,
+            max_knowledge_context_chars=2000,
+            max_knowledge_symbols=1000,
+        )
+        config.validate()  # Should pass without raising ValueError
+
+    def test_zero_knowledge_chars_fails_validation(self):
+        config = AgentConfig(
+            project=self.project_root,
+            provider="mock",
+            max_knowledge_context_chars=0,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            config.validate()
+        self.assertIn("max_knowledge_context_chars must be positive", str(ctx.exception))
+
+    def test_zero_knowledge_symbols_fails_validation(self):
+        config = AgentConfig(
+            project=self.project_root,
+            provider="mock",
+            max_knowledge_symbols=0,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            config.validate()
+        self.assertIn("max_knowledge_symbols must be positive", str(ctx.exception))
+
+    def test_negative_values_fail_validation(self):
+        config = AgentConfig(
+            project=self.project_root,
+            provider="mock",
+            max_knowledge_context_chars=-10,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            config.validate()
+        self.assertIn("max_knowledge_context_chars must be positive", str(ctx.exception))
+
+    def test_from_environment_propagates_overrides(self):
+        config = AgentConfig.from_environment(
+            self.project_root,
+            provider="mock",
+            knowledge_graph_enabled=False,
+            max_knowledge_context_chars=3500,
+            max_knowledge_symbols=500,
+        )
+        self.assertFalse(config.knowledge_graph_enabled)
+        self.assertEqual(config.max_knowledge_context_chars, 3500)
+        self.assertEqual(config.max_knowledge_symbols, 500)
 
 
 if __name__ == "__main__":
