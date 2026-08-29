@@ -5,10 +5,18 @@ import logging
 import shlex
 import uuid
 from pathlib import Path
+from typing import Any
 
 import threading
 from .approval import ApprovalPolicyEngine, RISK_LEVEL_MAP
-from .coding_agent import CodingAgent, PatchValidationError, ScopeAmendmentGuard, UnsafeModificationError
+from .coding_agent import (
+    DEFAULT_MAX_IMPLEMENTATION_TOOL_STEPS,
+    CodingAgent,
+    InteractiveCodingAgent,
+    PatchValidationError,
+    ScopeAmendmentGuard,
+    UnsafeModificationError,
+)
 from .commands import CommandRunner
 from .config import AgentConfig
 from .context import ContextSelector
@@ -26,6 +34,7 @@ from .models import (
     DAGProposal,
     ExecutionResult,
     FailureAnalysis,
+    ImplementationResult,
     Plan,
     PlanAmendment,
     PlanProposal,
@@ -68,12 +77,41 @@ from .providers import (
 )
 from .repository import RepositoryIntelligence
 from .reviewer import DeliberativeReviewConsensus, Reviewer
+from .evidence import EvidenceLedger
+from .sandbox import CandidateWorkspace, CandidateWorkspaceError, ProspectiveValidator
+from .semantic_impact import (
+    ChangeImpactReport,
+    SemanticChangeImpactAnalyzer,
+    TIER_BROAD,
+    apply_knowledge_support,
+    confidence_at_least,
+)
 from .test_synthesizer import BehavioralVerifier, TestSynthesizer, VerificationGapAnalyzer
 from .tool_engine import IterationHistoryCompactor, ToolEngine, history_from_dict, history_to_dict
 from .tools import ToolRegistry
 from .validation import ValidationIntelligence
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _context_semantic_index(context: Any) -> Any | None:
+    """Return the project's :class:`SemanticIndex`, wherever it is stored.
+
+    :class:`~local_agent.models.ProjectContext` has no ``semantic_index``
+    attribute - :meth:`RepositoryIntelligence.scan` puts the index in
+    ``context.metadata["semantic_index"]``. Earlier call sites used
+    ``getattr(context, "semantic_index", None)``, which therefore always
+    evaluated to ``None`` and silently disabled the ``search_symbols`` tool.
+    The attribute is still checked first so a caller that supplies a
+    context-like object carrying one directly keeps working.
+    """
+    direct = getattr(context, "semantic_index", None)
+    if direct is not None:
+        return direct
+    metadata = getattr(context, "metadata", None)
+    if isinstance(metadata, dict):
+        return metadata.get("semantic_index")
+    return None
 
 
 class Orchestrator:
@@ -173,7 +211,7 @@ class Orchestrator:
                 self.config.project,
                 filesystem=self.filesystem,
                 command_runner=self.runner,
-                semantic_index=getattr(context, "semantic_index", None),
+                semantic_index=_context_semantic_index(context),
             )
             planning_policy = getattr(self.config, "tool_policy", None)
             if current_subtask:
@@ -257,6 +295,9 @@ class Orchestrator:
                     raw_tool_metrics = checkpoint.continuation_context.get("tool_metrics", [])
                     if raw_tool_metrics:
                         report.tool_metrics = [ToolExecutionMetrics.from_dict(m) if isinstance(m, dict) else m for m in raw_tool_metrics]
+                    raw_impl_result = checkpoint.continuation_context.get("implementation_result")
+                    if isinstance(raw_impl_result, dict):
+                        report.implementation_result = ImplementationResult.from_dict(raw_impl_result)
                     raw_task_plan = checkpoint.continuation_context.get("task_plan")
                     if raw_task_plan and isinstance(raw_task_plan, dict) and task.plan:
                         restored_tp = TaskPlan.from_dict(raw_task_plan)
@@ -321,6 +362,7 @@ class Orchestrator:
                         tool_history=current_tool_history,
                         report=report,
                         recovery_state=recovery_state,
+                        subtask=current_subtask,
                     )
                 except ProviderError as exc:
                     self._record_provider_failure(task, current_subtask, exc, f"{stage_name} provider request failed")
@@ -462,6 +504,16 @@ class Orchestrator:
 
                 # Phase 4.4: Targeted Validation Intelligence
                 targeted_commands = self.validation_intelligence.discover_targeted_commands(report.changed_files, context.repository_map)
+                # Phase 4.17: replace/augment the filename heuristics with
+                # graph-derived, explained targets, then let passing candidate
+                # evidence stand in for a rerun where that is provably safe.
+                # The mandatory full-suite run below is untouched by both.
+                targeted_commands = self._semantic_targeted_commands(
+                    report, context, targeted_commands, emit
+                )
+                targeted_commands = self._apply_evidence_reuse(
+                    report, targeted_commands, emit
+                )
                 if targeted_commands:
                     emit(f"[5/7] Running targeted validation ({len(targeted_commands)} command(s))...")
                     targeted_plan = ValidationPlan(
@@ -587,7 +639,7 @@ class Orchestrator:
                             self.config.project,
                             filesystem=self.filesystem,
                             command_runner=self.runner,
-                            semantic_index=getattr(context, "semantic_index", None),
+                            semantic_index=_context_semantic_index(context),
                         )
                         failure_policy = getattr(self.config, "tool_policy", None)
                         failure = self._execute_with_specialist(
@@ -674,7 +726,7 @@ class Orchestrator:
                         self.config.project,
                         filesystem=self.filesystem,
                         command_runner=self.runner,
-                        semantic_index=getattr(context, "semantic_index", None),
+                        semantic_index=_context_semantic_index(context),
                     )
                     review_policy = getattr(self.config, "tool_policy", None)
                     report.review = self._execute_with_specialist(
@@ -922,6 +974,202 @@ class Orchestrator:
             report=report,
         )
 
+    # -- Phase 4.17: semantic targeting and evidence reuse -----------------
+
+    def _semantic_targeted_commands(
+        self,
+        report: RunReport,
+        context: ProjectContext,
+        lexical_commands: list[CommandSpec],
+        emit: Any,
+    ) -> list[CommandSpec]:
+        """Select post-apply targeted commands from the impact graph.
+
+        Preference order:
+
+        1. The :class:`ChangeImpactReport` the candidate loop already produced.
+           It is the most accurate available, because the candidate workspace
+           supplied exact BASE contents for symbol-level diffing.
+        2. A fresh analysis against the authoritative tree. Without BASE
+           contents it cannot classify added-vs-modified symbols, so it records
+           a degradation, reports LOW confidence and recommends BROAD - it can
+           therefore only *add* targets, never justify narrowing.
+        3. The pre-existing lexical commands, always retained unless the
+           analysis reached at least the configured confidence threshold.
+
+        Returns the commands to run. On any failure it returns
+        ``lexical_commands`` unchanged, so a defect here degrades to Phase 4.4
+        behaviour rather than dropping validation.
+        """
+        if not getattr(self.config, "semantic_impact_analysis_enabled", False):
+            return lexical_commands
+        if not report.changed_files:
+            return lexical_commands
+
+        impact: ChangeImpactReport | None = None
+        implementation = getattr(report, "implementation_result", None)
+        raw = getattr(implementation, "impact_report", None) if implementation else None
+        if isinstance(raw, dict) and raw.get("changed_files"):
+            impact = ChangeImpactReport.from_dict(raw)
+        if impact is None:
+            try:
+                analyzer = SemanticChangeImpactAnalyzer(
+                    self.config.project,
+                    semantic_index=_context_semantic_index(context),
+                    max_impact_depth=getattr(self.config, "max_impact_depth", 3),
+                    max_affected_symbols=getattr(self.config, "max_affected_symbols", 200),
+                    max_affected_tests=getattr(self.config, "max_affected_tests", 8),
+                )
+                impact = analyzer.analyze(
+                    report.changed_files,
+                    validation_intelligence=self.validation_intelligence,
+                )
+            except (OSError, ValueError, RecursionError) as exc:
+                LOGGER.warning("Post-apply semantic impact analysis failed: %s", exc)
+                return lexical_commands
+
+        # Knowledge is supporting evidence only: it can add notes and widen the
+        # scope, never raise confidence or narrow validation.
+        if getattr(self.config, "knowledge_graph_enabled", False):
+            impact = apply_knowledge_support(
+                impact, getattr(self, "knowledge_manager", None), root=self.config.project
+            )
+
+        report.semantic_impact = impact.to_dict()
+
+        semantic_specs: list[CommandSpec] = []
+        seen: set[tuple[str, ...]] = set()
+        for target in impact.validation_targets:
+            if target.tier == TIER_BROAD:
+                continue
+            command = tuple(target.command)
+            if command in seen:
+                continue
+            if len(command) > 1 and not (self.config.project / command[-1]).is_file():
+                continue
+            seen.add(command)
+            semantic_specs.append(
+                CommandSpec(
+                    name=f"impact_{Path(target.path).stem or 'target'}",
+                    command=command,
+                    reason=target.selected_because,
+                    category="unit_test",
+                    risk="low",
+                    destructive=False,
+                )
+            )
+
+        threshold = getattr(self.config, "validation_confidence_threshold", "high")
+        narrow_allowed = (
+            confidence_at_least(impact.confidence, threshold)
+            and impact.recommended_scope == "targeted"
+            and bool(semantic_specs)
+        )
+        if narrow_allowed:
+            emit(
+                f"[5/7] Semantic impact: {impact.confidence.upper()} confidence, scope "
+                f"{impact.recommended_scope}; {len(semantic_specs)} targeted command(s) "
+                "selected from the dependency graph"
+            )
+            return semantic_specs
+
+        # Not confident enough to narrow: run the union. Uncertainty widens.
+        merged = list(semantic_specs)
+        for spec in lexical_commands:
+            if tuple(spec.command) not in seen:
+                seen.add(tuple(spec.command))
+                merged.append(spec)
+        if merged:
+            emit(
+                f"[5/7] Semantic impact: {impact.confidence.upper()} confidence, scope "
+                f"{impact.recommended_scope}; running {len(merged)} targeted command(s) "
+                "(graph-selected plus filename heuristics)"
+            )
+        return merged
+
+    def _apply_evidence_reuse(
+        self,
+        report: RunReport,
+        targeted_commands: list[CommandSpec],
+        emit: Any,
+    ) -> list[CommandSpec]:
+        """Drop targeted commands whose candidate evidence provably still holds.
+
+        A command is dropped only when :meth:`EvidenceLedger.find_reusable`
+        confirms *every* assumption: identical command vector, a recorded pass,
+        identical relevant file and symbol sets, an impact confidence meeting
+        the configured threshold, and a byte-identical content fingerprint over
+        those files recomputed against the authoritative tree right now.
+
+        This can never skip validation overall: the mandatory full-suite
+        ``validation_plan`` run happens immediately afterwards regardless. What
+        it removes is only the duplicated *targeted* execution of a command that
+        already ran, against byte-identical inputs, minutes earlier.
+        """
+        if not getattr(self.config, "reuse_candidate_validation_evidence", False):
+            return targeted_commands
+        implementation = getattr(report, "implementation_result", None)
+        raw_evidence = list(getattr(implementation, "validation_evidence", None) or [])
+        if not raw_evidence or not targeted_commands:
+            return targeted_commands
+
+        ledger = EvidenceLedger.from_dict({"entries": raw_evidence})
+        impact_dict = getattr(report, "semantic_impact", None) or {}
+        symbols = sorted(
+            {
+                str(symbol.get("qualified_name", ""))
+                for key in ("added_symbols", "removed_symbols", "modified_symbols")
+                for symbol in (impact_dict.get(key) or [])
+                if isinstance(symbol, dict) and symbol.get("qualified_name")
+            }
+        )
+        affected = set(impact_dict.get("affected_files") or [])
+        threshold = getattr(self.config, "validation_confidence_threshold", "high")
+
+        remaining: list[CommandSpec] = []
+        reused = 0
+        saved = 0.0
+        for spec in targeted_commands:
+            command = tuple(spec.command)
+            relevant = set(report.changed_files) | affected
+            tail = command[-1] if len(command) > 1 else ""
+            if tail.endswith(".py"):
+                relevant.add(tail.replace("\\", "/"))
+            decision = ledger.find_reusable(
+                command=command,
+                current_root=self.config.project,
+                relevant_files=sorted(relevant),
+                relevant_symbols=symbols,
+                min_confidence=threshold,
+                enabled=True,
+            )
+            if decision.reusable and decision.evidence is not None:
+                reused += 1
+                saved += decision.time_saved_seconds
+                report.validation_evidence.append(decision.evidence.to_dict())
+                LOGGER.info(
+                    "Reusing candidate validation evidence for '%s' (%s)",
+                    spec.display(), decision.reason,
+                )
+                continue
+            LOGGER.debug(
+                "Candidate evidence for '%s' not reusable: %s",
+                spec.display(), decision.reason,
+            )
+            remaining.append(spec)
+
+        if reused:
+            emit(
+                f"[5/7] Reused {reused} passing candidate validation result(s) "
+                f"({saved:.2f}s of command runtime avoided); the full validation "
+                "suite still runs"
+            )
+        if implementation is not None:
+            implementation.validation_evidence_reused = ledger.reuse_grants
+            implementation.validation_evidence_invalidated = ledger.reuse_denials
+            implementation.validation_time_saved_seconds = ledger.time_saved_seconds
+        return remaining
+
     def _execute_code_generation(
         self,
         task: Task,
@@ -933,6 +1181,7 @@ class Orchestrator:
         tool_history: list[tuple[ToolCall, ToolResult]] | None = None,
         report: RunReport | None = None,
         recovery_state: RecoveryState | None = None,
+        subtask: Subtask | None = None,
     ) -> tuple[list[FileOperation], list[tuple[ToolCall, ToolResult]]]:
         if failure and recovery_state:
             recovery_summary = IterationHistoryCompactor.build_cross_iteration_context(recovery_state, plan, report=report)
@@ -944,6 +1193,131 @@ class Orchestrator:
         capability = ProviderCapability.REPAIR if failure else ProviderCapability.IMPLEMENTATION
 
         def _action(provider: AIProvider) -> tuple[list[FileOperation], list[tuple[ToolCall, ToolResult]]]:
+            # Phase 4.15: interactive, tool-assisted implementation loop.
+            # Runs against self.config.project / self.filesystem, which the
+            # ParallelExecutionCoordinator rebinds to the isolated worktree path
+            # for worktree-backed workers, so all mutation stays in-worktree.
+            if getattr(self.config, "interactive_implementation", False):
+                registry = ToolRegistry(
+                    self.config.project,
+                    filesystem=self.filesystem,
+                    command_runner=self.runner,
+                    semantic_index=_context_semantic_index(context),
+                )
+                # Phase 4.16: when prospective validation is enabled the agent
+                # gets a disposable candidate tree. It is created here (one per
+                # implementation attempt, explicitly owned - no global sandbox)
+                # and torn down by the agent itself; the authoritative tree is
+                # never written by the candidate loop.
+                sandbox = None
+                if getattr(self.config, "prospective_validation_enabled", False):
+                    try:
+                        # Same protected-path set the authoritative CodingAgent
+                        # uses, so a candidate is rejected exactly as a real
+                        # apply would be.
+                        candidate_protected = set(self._git_changed_paths() or [])
+                        sandbox = CandidateWorkspace(
+                            self.config.project,
+                            protected_paths=candidate_protected or None,
+                            command_timeout_seconds=getattr(
+                                self.config, "candidate_validation_timeout_seconds", 120
+                            ),
+                            semantic_index=_context_semantic_index(context),
+                        )
+                    except CandidateWorkspaceError as exc:
+                        LOGGER.warning(
+                            "Prospective validation unavailable, falling back to "
+                            "pre-mutation checks only: %s", exc,
+                        )
+                        sandbox = None
+
+                # Phase 4.17: the validator carries the semantic-impact settings.
+                # When semantic_impact_analysis_enabled is False this is exactly
+                # the Phase 4.16 default validator, so modes A/B/C are unchanged.
+                validator = ProspectiveValidator(
+                    semantic_impact_enabled=getattr(
+                        self.config, "semantic_impact_analysis_enabled", False
+                    ),
+                    max_impact_depth=getattr(self.config, "max_impact_depth", 3),
+                    max_affected_symbols=getattr(self.config, "max_affected_symbols", 200),
+                    max_affected_tests=getattr(self.config, "max_affected_tests", 8),
+                )
+                agent = InteractiveCodingAgent(
+                    filesystem=self.filesystem,
+                    registry=registry,
+                    policy=getattr(self.config, "tool_policy", None),
+                    max_tool_steps=getattr(
+                        self.config,
+                        "max_implementation_tool_steps",
+                        DEFAULT_MAX_IMPLEMENTATION_TOOL_STEPS,
+                    ),
+                    sandbox=sandbox,
+                    validator=validator,
+                    max_candidate_iterations=getattr(
+                        self.config, "max_candidate_iterations", 2
+                    ),
+                )
+
+                raw_contracts = context.metadata.get("upstream_contracts")
+                upstream_contracts = [
+                    SubtaskContract.from_dict(c) if isinstance(c, dict) else c
+                    for c in raw_contracts
+                ] if raw_contracts else None
+
+                active_subtask = subtask or next(
+                    (
+                        s for s in (task.plan.subtasks if task.plan else [])
+                        if s.subtask_id == getattr(task, "current_subtask_id", None)
+                    ),
+                    None,
+                )
+
+                impl_result = agent.execute(
+                    provider=provider,
+                    task_objective=task.objective if hasattr(task, "objective") else str(task),
+                    plan=plan,
+                    context=context,
+                    subtask=active_subtask,
+                    upstream_contracts=upstream_contracts,
+                    failure=failure,
+                    review=review,
+                    initial_history=tool_history,
+                    report=report,
+                )
+
+                restored_history = (
+                    history_from_dict(impl_result.tool_history)
+                    if impl_result.tool_history
+                    else list(tool_history or [])
+                )
+
+                if report is not None:
+                    report.implementation_result = impl_result
+                    if impl_result.metrics is not None:
+                        report.tool_metrics.append(impl_result.metrics)
+                    if impl_result.tool_history:
+                        report.tool_history = restored_history
+
+                if impl_result.scope_violations:
+                    LOGGER.info(
+                        "Interactive implementation proposed %d out-of-plan path(s): %s",
+                        len(impl_result.scope_violations),
+                        ", ".join(impl_result.scope_violations),
+                    )
+
+                if not impl_result.success or impl_result.file_operations is None:
+                    # Surfaced as a ProviderError so existing specialist fallback,
+                    # repair and pause machinery handles it. The structured result
+                    # stays on the report for checkpointing and diagnostics.
+                    raise ProviderError(
+                        f"Interactive implementation failed "
+                        f"[{impl_result.failure_category}/{impl_result.termination_reason}]: "
+                        f"{impl_result.error_message or 'No file operations produced'}"
+                    )
+
+                return impl_result.file_operations, restored_history
+
+            # Legacy single-shot path (when interactive_implementation is disabled)
             try:
                 provider_caps = getattr(provider, "capabilities", None)
             except Exception:
@@ -967,7 +1341,7 @@ class Orchestrator:
                     self.config.project,
                     filesystem=self.filesystem,
                     command_runner=self.runner,
-                    semantic_index=getattr(context, "semantic_index", None),
+                    semantic_index=_context_semantic_index(context),
                 )
                 policy = getattr(self.config, "tool_policy", None)
                 engine = ToolEngine(provider=provider, registry=registry, policy=policy)
@@ -1151,6 +1525,8 @@ class Orchestrator:
                 continuation_context["dag_amendments"] = [a.to_dict() for a in getattr(task.plan, "amendments", []) if hasattr(a, "to_dict")]
             if getattr(report, "review_consensus", None):
                 continuation_context["review_consensus"] = [r.to_dict() if hasattr(r, "to_dict") else r for r in report.review_consensus]
+            if getattr(report, "implementation_result", None):
+                continuation_context["implementation_result"] = report.implementation_result.to_dict()
             if hasattr(self, "router"):
                 continuation_context["specialist_routing_state"] = {
                     "planning": list(self.router.get_role_config(SpecialistRole.PLANNING)),
@@ -1262,6 +1638,7 @@ class Orchestrator:
         recovery_state: RecoveryState | None = None
         review_consensus: list[ReviewConsensusRecord] = []
         specialist_routing_state: dict[str, Any] = {}
+        implementation_result: ImplementationResult | None = None
 
         # Attempt to load from latest checkpoint if available
         if task.latest_checkpoint_id:
@@ -1284,6 +1661,9 @@ class Orchestrator:
                     raw_consensus = checkpoint.continuation_context.get("review_consensus", [])
                     if raw_consensus:
                         review_consensus = [ReviewConsensusRecord.from_dict(r) if isinstance(r, dict) else r for r in raw_consensus]
+                    raw_impl = checkpoint.continuation_context.get("implementation_result")
+                    if isinstance(raw_impl, dict):
+                        implementation_result = ImplementationResult.from_dict(raw_impl)
                     specialist_routing_state = checkpoint.continuation_context.get("specialist_routing_state", {})
             except FileNotFoundError:
                 pass # Checkpoint might be missing if task is new or corrupted
@@ -1320,5 +1700,6 @@ class Orchestrator:
             recovery_state=recovery_state,
             review_consensus=review_consensus,
             specialist_routing_state=specialist_routing_state,
+            implementation_result=implementation_result,
         )
 

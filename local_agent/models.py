@@ -1093,6 +1093,294 @@ class WorktreeSession:
         )
 
 
+class ImplementationTerminationReason:
+    """Canonical termination reasons produced by the interactive implementation agent.
+
+    Values mirror ToolEngine/ToolExecutionPolicy reasons so downstream repair machinery
+    can key off a single vocabulary regardless of which path produced the result.
+    """
+    COMPLETED = "completed"
+    SINGLE_SHOT_FALLBACK = "single_shot_fallback"
+    MAX_STEPS_EXCEEDED = "max_steps_exceeded"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    CONSECUTIVE_REPEATS_EXCEEDED = "consecutive_repeats_exceeded"
+    INVALID_PROVIDER_RESPONSE = "invalid_provider_response"
+    NO_OPERATIONS = "no_operations"
+    SCOPE_VIOLATION = "scope_violation"
+    PROVIDER_ERROR = "provider_error"
+    ERROR = "error"
+
+    # --- Phase 4.16: prospective (candidate tree) validation outcomes ---
+    #: The proposed edits were applied to an isolated candidate tree and real
+    #: validation commands executed against that tree succeeded.
+    CANDIDATE_VALIDATION_PASSED = "candidate_validation_passed"
+    #: Real validation against the candidate tree failed and no refinement
+    #: budget remained.
+    CANDIDATE_VALIDATION_FAILED = "candidate_validation_failed"
+    #: The candidate refinement budget was consumed without a passing candidate.
+    CANDIDATE_BUDGET_EXHAUSTED = "candidate_budget_exhausted"
+    #: The proposed operations could not be applied to the candidate tree at all
+    #: (scope violation, protected path, traversal, unusable patch).
+    CANDIDATE_INVALID_OPERATIONS = "candidate_invalid_operations"
+    #: The candidate tree itself could not be materialised.
+    CANDIDATE_SETUP_FAILED = "candidate_setup_failed"
+
+    #: Reasons that indicate the loop stopped without usable file operations.
+    FAILURE_REASONS = frozenset({
+        MAX_STEPS_EXCEEDED,
+        BUDGET_EXHAUSTED,
+        CONSECUTIVE_REPEATS_EXCEEDED,
+        INVALID_PROVIDER_RESPONSE,
+        NO_OPERATIONS,
+        PROVIDER_ERROR,
+        ERROR,
+        CANDIDATE_VALIDATION_FAILED,
+        CANDIDATE_BUDGET_EXHAUSTED,
+        CANDIDATE_INVALID_OPERATIONS,
+        CANDIDATE_SETUP_FAILED,
+    })
+
+    #: Coarse failure categories consumable by orchestrator/repair machinery.
+    CATEGORIES = {
+        MAX_STEPS_EXCEEDED: "budget_exhaustion",
+        BUDGET_EXHAUSTED: "budget_exhaustion",
+        CONSECUTIVE_REPEATS_EXCEEDED: "loop_detected",
+        INVALID_PROVIDER_RESPONSE: "provider_failure",
+        PROVIDER_ERROR: "provider_failure",
+        NO_OPERATIONS: "incomplete_implementation",
+        SCOPE_VIOLATION: "scope_violation",
+        ERROR: "internal_error",
+        COMPLETED: "none",
+        SINGLE_SHOT_FALLBACK: "none",
+        CANDIDATE_VALIDATION_PASSED: "none",
+        CANDIDATE_VALIDATION_FAILED: "candidate_validation_failure",
+        CANDIDATE_BUDGET_EXHAUSTED: "budget_exhaustion",
+        CANDIDATE_INVALID_OPERATIONS: "invalid_operations",
+        CANDIDATE_SETUP_FAILED: "internal_error",
+    }
+
+    @classmethod
+    def categorize(cls, reason: str | None) -> str:
+        return cls.CATEGORIES.get(reason or "", "unknown")
+
+
+@dataclass
+class ImplementationResult:
+    """Structured result returned by the interactive implementation agent."""
+    success: bool = False
+    file_operations: list[FileOperation] | None = None
+    summary: str = ""
+    files_inspected: list[str] = field(default_factory=list)
+    files_modified: list[str] = field(default_factory=list)
+    tool_steps_used: int = 0
+    elapsed_time_seconds: float = 0.0
+    provider: str | None = None
+    model: str | None = None
+    termination_reason: str | None = None
+    used_fallback: bool = False
+    scope_violations: list[str] = field(default_factory=list)
+    tool_history: list[dict[str, Any]] = field(default_factory=list)
+    metrics: ToolExecutionMetrics | None = None
+    error_message: str | None = None
+    # --- Phase 4.15 implementation-level telemetry ---
+    #: Number of tool calls that returned is_error=True (bad args, denied path, failed probe).
+    tool_call_failures: int = 0
+    #: Number of successful tool calls.
+    tool_call_successes: int = 0
+    #: Number of run_command_sandbox probe invocations (targeted validation attempts).
+    validation_attempts: int = 0
+    #: Number of probe invocations that failed (non-zero exit).
+    validation_failures: int = 0
+    #: Number of times the loop recovered after an errored tool result.
+    recovery_attempts: int = 0
+    #: Circuit breaker trips observed during the loop.
+    circuit_breaker_events: int = 0
+    #: Coarse failure category derived from termination_reason.
+    failure_category: str = "none"
+    # --- Phase 4.16 prospective (candidate tree) validation telemetry ---
+    #: Whether the candidate sandbox loop ran at all for this implementation.
+    prospective_validation_used: bool = False
+    #: Number of candidate trees built (BASE + operations) during the loop.
+    candidate_iterations: int = 0
+    #: Number of times real validation was executed against a candidate tree.
+    candidate_validation_attempts: int = 0
+    #: Candidate validations where every executed command exited zero.
+    candidate_validation_successes: int = 0
+    #: Candidate validations where at least one executed command failed.
+    candidate_validation_failures: int = 0
+    #: Refinement rounds triggered specifically by a failed candidate validation.
+    candidate_recovery_attempts: int = 0
+    #: Candidate-relative paths mutated by the final candidate build.
+    candidate_files_changed: list[str] = field(default_factory=list)
+    #: Wall-clock seconds spent materialising, rebuilding and validating candidates.
+    candidate_elapsed_seconds: float = 0.0
+    #: Candidate trees that could not be fully removed (Windows file locks etc.).
+    candidate_cleanup_failures: int = 0
+    #: Total real validation commands actually executed against candidate trees.
+    validation_commands_run: int = 0
+    #: Wall-clock seconds spent inside real candidate validation commands.
+    validation_runtime_seconds: float = 0.0
+    #: Whether the final candidate passed real validation.
+    final_candidate_success: bool = False
+    #: Deterministic, resumable description of the last candidate (no filesystem
+    #: snapshot): base root, operation digest, iteration index, validation state.
+    candidate_descriptor: dict[str, Any] = field(default_factory=dict)
+    #: Structured report of the last candidate validation run.
+    candidate_validation_report: dict[str, Any] | None = None
+    # --- Phase 4.17 semantic change-impact + evidence telemetry ---
+    #: Whether semantic (graph-based) impact analysis ran for this implementation.
+    semantic_impact_used: bool = False
+    #: Impact confidence of the final candidate analysis ("high"/"medium"/"low").
+    impact_confidence: str = ""
+    #: Adaptive validation scope the analysis recommended.
+    impact_recommended_scope: str = ""
+    #: Distinct symbols the change added, removed or modified.
+    impact_changed_symbols: int = 0
+    #: Modules reachable from the change through reverse dependencies.
+    impact_affected_symbols: int = 0
+    #: Test files the analyzer examined for an association.
+    impact_tests_considered: int = 0
+    #: Validation targets actually selected, after ranking and bounding.
+    impact_tests_selected: int = 0
+    #: Targets selected from graph evidence rather than filename heuristics.
+    impact_semantic_targets: int = 0
+    #: Wall-clock seconds spent building the graph and analysing impact.
+    impact_analysis_seconds: float = 0.0
+    #: Compact serialised ChangeImpactReport for the final candidate.
+    impact_report: dict[str, Any] | None = None
+    #: Post-apply validations satisfied by reusing candidate evidence.
+    validation_evidence_reused: int = 0
+    #: Reuse requests refused because an assumption no longer held.
+    validation_evidence_invalidated: int = 0
+    #: Command runtime avoided by evidence reuse.
+    validation_time_saved_seconds: float = 0.0
+    #: Bounded evidence history across candidate rebuild/revalidate cycles.
+    validation_evidence: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def is_recoverable_failure(self) -> bool:
+        """Whether the orchestrator's repair machinery could plausibly retry this."""
+        return (
+            not self.success
+            and self.termination_reason in ImplementationTerminationReason.FAILURE_REASONS
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "file_operations": [op.__dict__ if hasattr(op, "__dict__") else op for op in (self.file_operations or [])] if self.file_operations is not None else None,
+            "summary": self.summary,
+            "files_inspected": list(self.files_inspected),
+            "files_modified": list(self.files_modified),
+            "tool_steps_used": self.tool_steps_used,
+            "elapsed_time_seconds": self.elapsed_time_seconds,
+            "provider": self.provider,
+            "model": self.model,
+            "termination_reason": self.termination_reason,
+            "used_fallback": self.used_fallback,
+            "scope_violations": list(self.scope_violations),
+            "tool_history": self.tool_history,
+            "metrics": self.metrics.to_dict() if hasattr(self.metrics, "to_dict") else self.metrics,
+            "error_message": self.error_message,
+            "tool_call_failures": self.tool_call_failures,
+            "tool_call_successes": self.tool_call_successes,
+            "validation_attempts": self.validation_attempts,
+            "validation_failures": self.validation_failures,
+            "recovery_attempts": self.recovery_attempts,
+            "circuit_breaker_events": self.circuit_breaker_events,
+            "failure_category": self.failure_category,
+            "prospective_validation_used": self.prospective_validation_used,
+            "candidate_iterations": self.candidate_iterations,
+            "candidate_validation_attempts": self.candidate_validation_attempts,
+            "candidate_validation_successes": self.candidate_validation_successes,
+            "candidate_validation_failures": self.candidate_validation_failures,
+            "candidate_recovery_attempts": self.candidate_recovery_attempts,
+            "candidate_files_changed": list(self.candidate_files_changed),
+            "candidate_elapsed_seconds": self.candidate_elapsed_seconds,
+            "candidate_cleanup_failures": self.candidate_cleanup_failures,
+            "validation_commands_run": self.validation_commands_run,
+            "validation_runtime_seconds": self.validation_runtime_seconds,
+            "final_candidate_success": self.final_candidate_success,
+            "candidate_descriptor": dict(self.candidate_descriptor),
+            "candidate_validation_report": self.candidate_validation_report,
+            "semantic_impact_used": self.semantic_impact_used,
+            "impact_confidence": self.impact_confidence,
+            "impact_recommended_scope": self.impact_recommended_scope,
+            "impact_changed_symbols": self.impact_changed_symbols,
+            "impact_affected_symbols": self.impact_affected_symbols,
+            "impact_tests_considered": self.impact_tests_considered,
+            "impact_tests_selected": self.impact_tests_selected,
+            "impact_semantic_targets": self.impact_semantic_targets,
+            "impact_analysis_seconds": round(self.impact_analysis_seconds, 4),
+            "impact_report": self.impact_report,
+            "validation_evidence_reused": self.validation_evidence_reused,
+            "validation_evidence_invalidated": self.validation_evidence_invalidated,
+            "validation_time_saved_seconds": round(self.validation_time_saved_seconds, 4),
+            "validation_evidence": list(self.validation_evidence),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        if not isinstance(data, dict):
+            return cls()
+        file_ops_data = data.get("file_operations")
+        file_ops = [FileOperation(**op) if isinstance(op, dict) else op for op in file_ops_data] if file_ops_data is not None else None
+        metrics_data = data.get("metrics")
+        metrics = ToolExecutionMetrics.from_dict(metrics_data) if isinstance(metrics_data, dict) else (metrics_data if isinstance(metrics_data, ToolExecutionMetrics) else None)
+        return cls(
+            success=bool(data.get("success", False)),
+            file_operations=file_ops,
+            summary=str(data.get("summary", "")),
+            files_inspected=list(data.get("files_inspected", [])),
+            files_modified=list(data.get("files_modified", [])),
+            tool_steps_used=int(data.get("tool_steps_used", 0)),
+            elapsed_time_seconds=float(data.get("elapsed_time_seconds", 0.0)),
+            provider=data.get("provider"),
+            model=data.get("model"),
+            termination_reason=data.get("termination_reason"),
+            used_fallback=bool(data.get("used_fallback", False)),
+            scope_violations=list(data.get("scope_violations", [])),
+            tool_history=list(data.get("tool_history", [])),
+            metrics=metrics,
+            error_message=data.get("error_message"),
+            tool_call_failures=int(data.get("tool_call_failures", 0)),
+            tool_call_successes=int(data.get("tool_call_successes", 0)),
+            validation_attempts=int(data.get("validation_attempts", 0)),
+            validation_failures=int(data.get("validation_failures", 0)),
+            recovery_attempts=int(data.get("recovery_attempts", 0)),
+            circuit_breaker_events=int(data.get("circuit_breaker_events", 0)),
+            failure_category=str(data.get("failure_category", "none")),
+            prospective_validation_used=bool(data.get("prospective_validation_used", False)),
+            candidate_iterations=int(data.get("candidate_iterations", 0)),
+            candidate_validation_attempts=int(data.get("candidate_validation_attempts", 0)),
+            candidate_validation_successes=int(data.get("candidate_validation_successes", 0)),
+            candidate_validation_failures=int(data.get("candidate_validation_failures", 0)),
+            candidate_recovery_attempts=int(data.get("candidate_recovery_attempts", 0)),
+            candidate_files_changed=list(data.get("candidate_files_changed", [])),
+            candidate_elapsed_seconds=float(data.get("candidate_elapsed_seconds", 0.0)),
+            candidate_cleanup_failures=int(data.get("candidate_cleanup_failures", 0)),
+            validation_commands_run=int(data.get("validation_commands_run", 0)),
+            validation_runtime_seconds=float(data.get("validation_runtime_seconds", 0.0)),
+            final_candidate_success=bool(data.get("final_candidate_success", False)),
+            candidate_descriptor=dict(data.get("candidate_descriptor") or {}),
+            candidate_validation_report=data.get("candidate_validation_report"),
+            semantic_impact_used=bool(data.get("semantic_impact_used", False)),
+            impact_confidence=str(data.get("impact_confidence", "")),
+            impact_recommended_scope=str(data.get("impact_recommended_scope", "")),
+            impact_changed_symbols=int(data.get("impact_changed_symbols", 0) or 0),
+            impact_affected_symbols=int(data.get("impact_affected_symbols", 0) or 0),
+            impact_tests_considered=int(data.get("impact_tests_considered", 0) or 0),
+            impact_tests_selected=int(data.get("impact_tests_selected", 0) or 0),
+            impact_semantic_targets=int(data.get("impact_semantic_targets", 0) or 0),
+            impact_analysis_seconds=float(data.get("impact_analysis_seconds", 0.0) or 0.0),
+            impact_report=data.get("impact_report"),
+            validation_evidence_reused=int(data.get("validation_evidence_reused", 0) or 0),
+            validation_evidence_invalidated=int(data.get("validation_evidence_invalidated", 0) or 0),
+            validation_time_saved_seconds=float(data.get("validation_time_saved_seconds", 0.0) or 0.0),
+            validation_evidence=list(data.get("validation_evidence") or []),
+        )
+
+
 @dataclass
 class Subtask:
     subtask_id: str
@@ -1970,6 +2258,11 @@ class RunReport:
     verification_gap: VerificationGap | None = None
     specialist_routing_state: dict[str, Any] = field(default_factory=dict)
     review_consensus: list[ReviewConsensusRecord] = field(default_factory=list)
+    implementation_result: ImplementationResult | None = None
+    # Phase 4.17: serialised ChangeImpactReport for the applied change, and the
+    # bounded validation-evidence ledger backing post-apply reuse decisions.
+    semantic_impact: dict[str, Any] | None = None
+    validation_evidence: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ProviderError(RuntimeError):

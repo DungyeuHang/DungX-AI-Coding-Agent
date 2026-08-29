@@ -92,6 +92,23 @@ class AgentConfig:
     max_knowledge_symbols: int = 1000
     parallel_worktree_execution: bool = False
     serialize_overlapping_subtasks: bool = True
+    # Phase 4.15: interactive, tool-assisted implementation loop
+    interactive_implementation: bool = False
+    max_implementation_tool_steps: int = 15
+    # Phase 4.16: staged overlay sandbox + prospective candidate validation
+    prospective_validation_enabled: bool = False
+    max_candidate_iterations: int = 2
+    candidate_validation_timeout_seconds: int = 120
+    # Phase 4.17: semantic change-impact validation + evidence reuse
+    semantic_impact_analysis_enabled: bool = False
+    max_impact_depth: int = 3
+    max_affected_symbols: int = 200
+    max_affected_tests: int = 8
+    # Minimum impact confidence required before candidate evidence may stand in
+    # for a post-apply rerun. Raising it makes reuse rarer and validation more
+    # expensive; it can never make validation less thorough.
+    validation_confidence_threshold: Literal["low", "medium", "high"] = "high"
+    reuse_candidate_validation_evidence: bool = False
 
     @property
     def tool_policy(self) -> Any:
@@ -176,6 +193,17 @@ class AgentConfig:
             "max_knowledge_symbols": "AGENT_MAX_KNOWLEDGE_SYMBOLS",
             "parallel_worktree_execution": "AGENT_PARALLEL_WORKTREES",
             "serialize_overlapping_subtasks": "AGENT_SERIALIZE_OVERLAPPING_SUBTASKS",
+            "interactive_implementation": "AGENT_INTERACTIVE_IMPLEMENTATION",
+            "max_implementation_tool_steps": "AGENT_MAX_IMPLEMENTATION_TOOL_STEPS",
+            "prospective_validation_enabled": "AGENT_PROSPECTIVE_VALIDATION",
+            "max_candidate_iterations": "AGENT_MAX_CANDIDATE_ITERATIONS",
+            "candidate_validation_timeout_seconds": "AGENT_CANDIDATE_VALIDATION_TIMEOUT",
+            "semantic_impact_analysis_enabled": "AGENT_SEMANTIC_IMPACT_ANALYSIS",
+            "max_impact_depth": "AGENT_MAX_IMPACT_DEPTH",
+            "max_affected_symbols": "AGENT_MAX_AFFECTED_SYMBOLS",
+            "max_affected_tests": "AGENT_MAX_AFFECTED_TESTS",
+            "validation_confidence_threshold": "AGENT_VALIDATION_CONFIDENCE_THRESHOLD",
+            "reuse_candidate_validation_evidence": "AGENT_REUSE_CANDIDATE_EVIDENCE",
         }
 
         def value(name: str, default: object) -> object:
@@ -329,6 +357,17 @@ class AgentConfig:
             max_knowledge_symbols=_positive_int(value("max_knowledge_symbols", 1000), "max_knowledge_symbols"),
             parallel_worktree_execution=_bool(value("parallel_worktree_execution", False)),
             serialize_overlapping_subtasks=_bool(value("serialize_overlapping_subtasks", True)),
+            interactive_implementation=_bool(value("interactive_implementation", False)),
+            max_implementation_tool_steps=_positive_int(value("max_implementation_tool_steps", 15), "max_implementation_tool_steps"),
+            prospective_validation_enabled=_bool(value("prospective_validation_enabled", False)),
+            max_candidate_iterations=_positive_int(value("max_candidate_iterations", 2), "max_candidate_iterations"),
+            candidate_validation_timeout_seconds=_positive_int(value("candidate_validation_timeout_seconds", 120), "candidate_validation_timeout_seconds"),
+            semantic_impact_analysis_enabled=_bool(value("semantic_impact_analysis_enabled", False)),
+            max_impact_depth=_positive_int(value("max_impact_depth", 3), "max_impact_depth"),
+            max_affected_symbols=_positive_int(value("max_affected_symbols", 200), "max_affected_symbols"),
+            max_affected_tests=_positive_int(value("max_affected_tests", 8), "max_affected_tests"),
+            validation_confidence_threshold=str(value("validation_confidence_threshold", "high")).lower(),
+            reuse_candidate_validation_evidence=_bool(value("reuse_candidate_validation_evidence", False)),
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -359,7 +398,7 @@ class AgentConfig:
             raise ValueError("max_parallel_subtasks must be at least 1")
         if self.max_parallel_subtasks > 4:
             raise ValueError("max_parallel_subtasks cannot exceed 4")
-        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats", "max_knowledge_context_chars", "max_knowledge_symbols"):
+        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats", "max_knowledge_context_chars", "max_knowledge_symbols", "max_implementation_tool_steps", "max_candidate_iterations", "candidate_validation_timeout_seconds", "max_impact_depth", "max_affected_symbols", "max_affected_tests"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
         if self.provider_max_retries < 0:
@@ -370,6 +409,8 @@ class AgentConfig:
             raise ValueError("max_plan_amendments cannot be negative")
         if self.max_scope_growth_factor < 1.0:
             raise ValueError("max_scope_growth_factor must be at least 1.0")
+        if self.validation_confidence_threshold not in {"low", "medium", "high"}:
+            raise ValueError("validation_confidence_threshold must be 'low', 'medium', or 'high'")
         # Validate tool policy creation
         _ = self.tool_policy
 
@@ -391,6 +432,16 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--knowledge-graph", type=_bool, default=None, help="enable persistent repository knowledge graph (true/false)")
     parser.add_argument("--parallel-worktrees", type=_bool, default=None, help="enable parallel DAG execution in isolated Git worktrees (true/false)")
     parser.add_argument("--serialize-overlapping-subtasks", type=_bool, default=None, help="serialize execution of subtasks with predicted file overlap (true/false)")
+    parser.add_argument("--interactive-implementation", type=_bool, default=None, help="enable interactive tool-assisted implementation loop (true/false)")
+    parser.add_argument("--max-implementation-tool-steps", type=int, default=None, help="maximum tool steps for the interactive implementation loop")
+    parser.add_argument("--prospective-validation", type=_bool, default=None, help="validate proposed edits in an isolated candidate tree before finalizing (true/false)")
+    parser.add_argument("--max-candidate-iterations", type=int, default=None, help="maximum candidate build/validate iterations per implementation")
+    parser.add_argument("--semantic-impact-analysis", type=_bool, default=None, help="select validation targets from the import/call graph instead of filename heuristics (true/false)")
+    parser.add_argument("--max-impact-depth", type=int, default=None, help="maximum reverse-dependency depth walked during impact analysis")
+    parser.add_argument("--max-affected-symbols", type=int, default=None, help="maximum affected symbols/modules retained by impact analysis")
+    parser.add_argument("--max-affected-tests", type=int, default=None, help="maximum validation targets selected by impact analysis")
+    parser.add_argument("--validation-confidence-threshold", choices=("low", "medium", "high"), default=None, help="minimum impact confidence required to reuse candidate validation evidence")
+    parser.add_argument("--reuse-candidate-evidence", type=_bool, default=None, help="reuse passing candidate validation evidence post-apply when assumptions still hold (true/false)")
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
@@ -429,7 +480,17 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "knowledge_graph_enabled": getattr(args, "knowledge_graph", None),
             "parallel_worktree_execution": getattr(args, "parallel_worktrees", None),
             "serialize_overlapping_subtasks": getattr(args, "serialize_overlapping_subtasks", None),
-            "validation_commands": args.validation,
+            "interactive_implementation": getattr(args, "interactive_implementation", None),
+            "max_implementation_tool_steps": getattr(args, "max_implementation_tool_steps", None),
+            "prospective_validation_enabled": getattr(args, "prospective_validation", None),
+            "max_candidate_iterations": getattr(args, "max_candidate_iterations", None),
+            "semantic_impact_analysis_enabled": getattr(args, "semantic_impact_analysis", None),
+            "max_impact_depth": getattr(args, "max_impact_depth", None),
+            "max_affected_symbols": getattr(args, "max_affected_symbols", None),
+            "max_affected_tests": getattr(args, "max_affected_tests", None),
+            "validation_confidence_threshold": getattr(args, "validation_confidence_threshold", None),
+            "reuse_candidate_validation_evidence": getattr(args, "reuse_candidate_evidence", None),
+            "validation_commands": getattr(args, "validation", None),
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,
             "approval": args.approval,
