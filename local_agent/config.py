@@ -117,6 +117,32 @@ class AgentConfig:
     #: user's policy wants reuse to expire regardless of content match, e.g.
     #: to bound how long a stale toolchain assumption could go unnoticed.
     evidence_max_age_seconds: int = 0
+    # Phase 4.19: empirical validation intelligence telemetry + shadow calibration.
+    #: Records a bounded, cross-task ``ValidationDecisionRecord`` for every
+    #: semantic validation decision and links it to its later outcome. Pure
+    #: observability: enabling this cannot change what validation runs.
+    validation_telemetry_enabled: bool = False
+    #: Additionally computes a hypothetical calibrated confidence/scope for
+    #: comparison and records it on the telemetry record. Requires
+    #: ``validation_telemetry_enabled``. There is currently no code path that
+    #: applies this to the real decision - see README - so this only changes
+    #: how much analysis is recorded, never what validation runs.
+    validation_calibration_enabled: bool = False
+    #: Reserved for a future live-calibration mode. Only shadow mode
+    #: (computing a hypothetical decision without applying it) is implemented
+    #: in this build, so this flag is currently always treated as True.
+    validation_calibration_shadow_mode: bool = True
+    #: Minimum resolved observations an evidence type needs before calibration
+    #: may raise its confidence above the fixed baseline. Lowering a
+    #: confidence estimate never requires this minimum, since that direction
+    #: can only ever widen validation.
+    validation_calibration_min_samples: int = 20
+    #: Maximum absolute confidence-score adjustment (0..1 scale) calibration
+    #: may propose in either direction.
+    validation_calibration_max_adjustment: float = 0.15
+    #: Maximum number of decision records and calibration observations
+    #: retained by the telemetry store (each bounded independently).
+    validation_metrics_retention: int = 500
 
     @property
     def tool_policy(self) -> Any:
@@ -213,6 +239,12 @@ class AgentConfig:
             "validation_confidence_threshold": "AGENT_VALIDATION_CONFIDENCE_THRESHOLD",
             "reuse_candidate_validation_evidence": "AGENT_REUSE_CANDIDATE_EVIDENCE",
             "evidence_max_age_seconds": "AGENT_EVIDENCE_MAX_AGE_SECONDS",
+            "validation_telemetry_enabled": "AGENT_VALIDATION_TELEMETRY_ENABLED",
+            "validation_calibration_enabled": "AGENT_VALIDATION_CALIBRATION_ENABLED",
+            "validation_calibration_shadow_mode": "AGENT_VALIDATION_CALIBRATION_SHADOW_MODE",
+            "validation_calibration_min_samples": "AGENT_VALIDATION_CALIBRATION_MIN_SAMPLES",
+            "validation_calibration_max_adjustment": "AGENT_VALIDATION_CALIBRATION_MAX_ADJUSTMENT",
+            "validation_metrics_retention": "AGENT_VALIDATION_METRICS_RETENTION",
         }
 
         def value(name: str, default: object) -> object:
@@ -378,6 +410,20 @@ class AgentConfig:
             validation_confidence_threshold=str(value("validation_confidence_threshold", "high")).lower(),
             reuse_candidate_validation_evidence=_bool(value("reuse_candidate_validation_evidence", False)),
             evidence_max_age_seconds=int(value("evidence_max_age_seconds", 0) or 0),
+            validation_telemetry_enabled=_bool(value("validation_telemetry_enabled", False)),
+            validation_calibration_enabled=_bool(value("validation_calibration_enabled", False)),
+            validation_calibration_shadow_mode=_bool(
+                value("validation_calibration_shadow_mode", True)
+            ),
+            validation_calibration_min_samples=_positive_int(
+                value("validation_calibration_min_samples", 20), "validation_calibration_min_samples"
+            ),
+            validation_calibration_max_adjustment=float(
+                value("validation_calibration_max_adjustment", 0.15)
+            ),
+            validation_metrics_retention=_positive_int(
+                value("validation_metrics_retention", 500), "validation_metrics_retention"
+            ),
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -423,6 +469,12 @@ class AgentConfig:
             raise ValueError("validation_confidence_threshold must be 'low', 'medium', or 'high'")
         if self.evidence_max_age_seconds < 0:
             raise ValueError("evidence_max_age_seconds cannot be negative")
+        if self.validation_calibration_min_samples < 1:
+            raise ValueError("validation_calibration_min_samples must be at least 1")
+        if not (0.0 <= self.validation_calibration_max_adjustment <= 1.0):
+            raise ValueError("validation_calibration_max_adjustment must be between 0.0 and 1.0")
+        if self.validation_metrics_retention < 1:
+            raise ValueError("validation_metrics_retention must be positive")
         # Validate tool policy creation
         _ = self.tool_policy
 
@@ -455,6 +507,11 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--validation-confidence-threshold", choices=("low", "medium", "high"), default=None, help="minimum impact confidence required to reuse candidate validation evidence")
     parser.add_argument("--reuse-candidate-evidence", type=_bool, default=None, help="reuse passing candidate validation evidence post-apply when assumptions still hold (true/false)")
     parser.add_argument("--evidence-max-age-seconds", type=int, default=None, help="reject reuse of validation evidence older than this many seconds (0 = no age limit)")
+    parser.add_argument("--validation-telemetry", type=_bool, default=None, help="record bounded, cross-task validation decision telemetry (true/false)")
+    parser.add_argument("--validation-calibration", type=_bool, default=None, help="additionally compute a shadow (never-applied) calibrated decision for comparison (true/false)")
+    parser.add_argument("--validation-calibration-min-samples", type=int, default=None, help="minimum resolved observations before calibration may raise confidence for an evidence type")
+    parser.add_argument("--validation-calibration-max-adjustment", type=float, default=None, help="maximum absolute confidence-score adjustment calibration may propose (0..1)")
+    parser.add_argument("--validation-metrics-retention", type=int, default=None, help="maximum decision/observation records retained by the telemetry store")
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
@@ -504,6 +561,15 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "validation_confidence_threshold": getattr(args, "validation_confidence_threshold", None),
             "reuse_candidate_validation_evidence": getattr(args, "reuse_candidate_evidence", None),
             "evidence_max_age_seconds": getattr(args, "evidence_max_age_seconds", None),
+            "validation_telemetry_enabled": getattr(args, "validation_telemetry", None),
+            "validation_calibration_enabled": getattr(args, "validation_calibration", None),
+            "validation_calibration_min_samples": getattr(
+                args, "validation_calibration_min_samples", None
+            ),
+            "validation_calibration_max_adjustment": getattr(
+                args, "validation_calibration_max_adjustment", None
+            ),
+            "validation_metrics_retention": getattr(args, "validation_metrics_retention", None),
             "validation_commands": getattr(args, "validation", None),
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,

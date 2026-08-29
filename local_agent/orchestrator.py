@@ -86,7 +86,14 @@ from .semantic_impact import (
     apply_knowledge_support,
 )
 from .test_synthesizer import BehavioralVerifier, TestSynthesizer, VerificationGapAnalyzer
-from .validation_decision import ValidationDecisionEngine
+from .validation_decision import ReuseAttempt, ValidationDecision, ValidationDecisionEngine
+from .validation_telemetry import (
+    ValidationTelemetryManager,
+    build_decision_record,
+    classify_outcome,
+    confidence_score as _telemetry_confidence_score,
+    ShadowCalibrationEngine,
+)
 from .tool_engine import IterationHistoryCompactor, ToolEngine, history_from_dict, history_to_dict
 from .tools import ToolRegistry
 from .validation import ValidationIntelligence
@@ -138,6 +145,16 @@ class Orchestrator:
         policies = [ApprovalPolicy.from_dict(p) for p in config.approval_policies]
         self.approval_engine = ApprovalPolicyEngine(policies)
         self.knowledge_manager = KnowledgeGraphManager(storage, config.project) if getattr(config, "knowledge_graph_enabled", True) else None
+        self.telemetry_manager = (
+            ValidationTelemetryManager(
+                storage,
+                config.project,
+                max_decisions=getattr(config, "validation_metrics_retention", 500),
+                max_observations=getattr(config, "validation_metrics_retention", 500),
+            )
+            if getattr(config, "validation_telemetry_enabled", False)
+            else None
+        )
 
     def analyze(self):
         return self.analyzer.analyze()
@@ -514,6 +531,12 @@ class Orchestrator:
                 targeted_commands = self._apply_evidence_reuse(
                     report, targeted_commands, emit
                 )
+                report.validation_decision_id = self._record_validation_decision(
+                    report, targeted_commands, report.validation_reuse_attempts
+                )
+                targeted_ran = bool(targeted_commands)
+                targeted_failed = False
+                targeted_duration = 0.0
                 if targeted_commands:
                     emit(f"[5/7] Running targeted validation ({len(targeted_commands)} command(s))...")
                     targeted_plan = ValidationPlan(
@@ -531,9 +554,15 @@ class Orchestrator:
                     task.execution_history.extend([{"type": "execution", "subtask_id": sub_id, "execution": exec.to_dict()} for exec in targeted_executions])
                     self.storage.save_task(task)
                     failed = next((result for result in targeted_executions if not result.succeeded), None)
+                    targeted_failed = failed is not None
+                    targeted_duration = sum(e.duration_seconds for e in targeted_executions)
 
                 # Final full-suite validation (mandatory authority if targeted passed or none found)
+                broad_ran = False
+                broad_failed = False
+                broad_duration = 0.0
                 if failed is None:
+                    broad_ran = True
                     full_executions = self._validate(validation_plan)
                     executions.extend(full_executions)
                     report.executions.extend(full_executions)
@@ -541,6 +570,18 @@ class Orchestrator:
                     task.execution_history.extend([{"type": "execution", "subtask_id": sub_id, "execution": exec.to_dict()} for exec in full_executions])
                     self.storage.save_task(task)
                     failed = next((result for result in full_executions if not result.succeeded), None)
+                    broad_failed = failed is not None
+                    broad_duration = sum(e.duration_seconds for e in full_executions)
+
+                self._finalize_validation_decision(
+                    report,
+                    targeted_ran=targeted_ran,
+                    targeted_failed=targeted_failed,
+                    broad_ran=broad_ran,
+                    broad_failed=broad_failed,
+                    targeted_duration=targeted_duration,
+                    broad_duration=broad_duration,
+                )
 
                 # Phase 4.11: Autonomous Verification Gap Analysis & Behavioral Test Synthesis
                 if failed is None and report.changed_files:
@@ -1107,7 +1148,13 @@ class Orchestrator:
         ``validation_plan`` run happens immediately afterwards regardless. What
         it removes is only the duplicated *targeted* execution of a command that
         already ran, against provably-identical inputs, minutes earlier.
+
+        Phase 4.19: also records every reuse verdict (granted or denied) onto
+        ``report.validation_reuse_attempts``, always a list (empty when reuse
+        is disabled or there was nothing to attempt), so telemetry can build a
+        reuse-reason tally without this method's return type changing.
         """
+        report.validation_reuse_attempts = []
         if not getattr(self.config, "reuse_candidate_validation_evidence", False):
             return targeted_commands
         implementation = getattr(report, "implementation_result", None)
@@ -1152,7 +1199,108 @@ class Orchestrator:
             implementation.validation_evidence_reused = ledger.reuse_grants
             implementation.validation_evidence_invalidated = ledger.reuse_denials
             implementation.validation_time_saved_seconds = ledger.time_saved_seconds
+        report.validation_reuse_attempts = attempts
         return remaining
+
+    # -- Phase 4.19: empirical validation intelligence telemetry -----------
+
+    def _record_validation_decision(
+        self,
+        report: RunReport,
+        selected_commands: list[CommandSpec],
+        reuse_attempts: list[ReuseAttempt],
+    ) -> str:
+        """Record one :class:`ValidationDecisionRecord` for this run's decision.
+
+        A pure observability step: nothing computed here is consulted by the
+        validation path above it, which has already been decided by the time
+        this runs. Returns the new record's id, or ``""`` when telemetry is
+        disabled, no semantic decision was made this run (``report.semantic_impact``
+        empty - e.g. ``semantic_impact_analysis_enabled`` is off), or recording
+        fails for any reason; a telemetry defect must never interrupt a real
+        validation run.
+        """
+        if self.telemetry_manager is None:
+            return ""
+        impact_dict = getattr(report, "semantic_impact", None)
+        if not impact_dict:
+            return ""
+        try:
+            impact = ChangeImpactReport.from_dict(impact_dict)
+            decision = ValidationDecision(
+                scope=impact.recommended_scope,
+                confidence_level=impact.confidence,
+                confidence_score=_telemetry_confidence_score(impact.confidence),
+                selected_commands=list(selected_commands),
+                uncertainty_sources=list(impact.evidence.degradations),
+                reuse_attempts=list(reuse_attempts),
+                time_saved_seconds=sum(
+                    a.time_saved_seconds for a in reuse_attempts if a.reusable
+                ),
+            )
+            reuse_reasons: dict[str, int] = {}
+            for attempt in reuse_attempts:
+                reuse_reasons[attempt.reason] = reuse_reasons.get(attempt.reason, 0) + 1
+            record = build_decision_record(
+                impact, decision, root=self.config.project, reuse_reasons=reuse_reasons
+            )
+            record.policy_fingerprint = self._decision_policy_fingerprint()
+            record.analyzer_version = SEMANTIC_ANALYZER_SCHEMA_VERSION
+            if getattr(self.config, "validation_calibration_enabled", False):
+                shadow_engine = ShadowCalibrationEngine(
+                    min_samples=getattr(self.config, "validation_calibration_min_samples", 20),
+                    max_adjustment=getattr(
+                        self.config, "validation_calibration_max_adjustment", 0.15
+                    ),
+                )
+                observations = self.telemetry_manager.observations()
+                record.shadow = shadow_engine.evaluate(impact, decision, observations)
+            self.telemetry_manager.record_decision(record)
+            return record.decision_id
+        except Exception as exc:  # noqa: BLE001 - telemetry must never break validation
+            LOGGER.warning("Validation decision telemetry recording failed: %s", exc)
+            return ""
+
+    def _finalize_validation_decision(
+        self,
+        report: RunReport,
+        *,
+        targeted_ran: bool,
+        targeted_failed: bool,
+        broad_ran: bool,
+        broad_failed: bool,
+        targeted_duration: float,
+        broad_duration: float,
+    ) -> None:
+        """Link the decision recorded above to what actually happened.
+
+        See :func:`local_agent.validation_telemetry.classify_outcome` for the
+        outcome/decision-quality distinction this computes.
+        """
+        if self.telemetry_manager is None:
+            return
+        decision_id = getattr(report, "validation_decision_id", "")
+        if not decision_id:
+            return
+        impact_dict = getattr(report, "semantic_impact", None) or {}
+        scope = str(impact_dict.get("recommended_scope", "broad"))
+        try:
+            outcome, quality = classify_outcome(
+                scope=scope,
+                targeted_ran=targeted_ran,
+                targeted_failed=targeted_failed,
+                broad_ran=broad_ran,
+                broad_failed=broad_failed,
+            )
+            self.telemetry_manager.finalize_decision(
+                decision_id,
+                outcome=outcome,
+                decision_quality=quality,
+                broad_duration_seconds=broad_duration,
+                targeted_duration_seconds=targeted_duration,
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry must never break validation
+            LOGGER.warning("Validation decision outcome linking failed: %s", exc)
 
     def _execute_code_generation(
         self,

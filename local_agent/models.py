@@ -2263,6 +2263,17 @@ class RunReport:
     # bounded validation-evidence ledger backing post-apply reuse decisions.
     semantic_impact: dict[str, Any] | None = None
     validation_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Phase 4.19: id of this run's ValidationDecisionRecord in the (separately
+    # persisted) telemetry store, empty when telemetry is disabled or no
+    # semantic decision was made. RunReport itself is a transient, in-process
+    # object with no to_dict/from_dict, so this adds no checkpoint/task
+    # serialization surface.
+    validation_decision_id: str = ""
+    # Phase 4.19: the reuse verdicts _apply_evidence_reuse just computed, kept
+    # here (rather than changing that method's return type) so the several
+    # existing Phase 4.18 tests that call it directly and compare its return
+    # value to a plain command list are unaffected.
+    validation_reuse_attempts: list[Any] = field(default_factory=list, repr=False)
 
 
 class ProviderError(RuntimeError):

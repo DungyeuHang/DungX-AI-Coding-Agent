@@ -357,7 +357,150 @@ resolved even when their arguments are literals, since the former can do
 anything and the latter would need the `package=` argument resolved too.
 Confidence values in `CONFIDENCE_BY_EVIDENCE_TYPE` are a fixed table set by
 inspection, not calibrated against real-world false-positive/negative rates -
-see "recommended next phase" below.
+see "Empirical validation intelligence" below.
+
+## Empirical validation intelligence (Phase 4.19)
+
+Phase 4.17/4.18 gave every validation run a *decision* (scope, confidence,
+selected commands, reuse verdicts). Nothing recorded whether that decision was
+subsequently borne out. Phase 4.19 adds that observability layer -
+`local_agent/validation_telemetry.py` - without changing what any validation
+run actually does: it is instrumentation, not a new decision-making path.
+
+**Terminology, used deliberately over more ambitious-sounding alternatives:**
+this is **empirical calibration** and **telemetry**, not "self-learning" or
+"AI-powered validation". The confidence table in `dependency_resolution.py` is
+still the fixed, reviewed table Phase 4.18 shipped; nothing in this phase
+changes it or feeds back into it automatically.
+
+### Validation decision records
+
+Every semantic validation decision (when `validation_telemetry_enabled` is on)
+produces one bounded `ValidationDecisionRecord`: a repository-id digest (not a
+raw path), a content fingerprint over the relevant files, the changed
+files/symbols (each list capped at 50 entries), the evidence-type labels
+behind the decision, the scope/confidence chosen, how many commands were
+reused vs. rerun and why (a small tally over the existing
+`local_agent.evidence.REASON_*` vocabulary, never raw text), and the policy/
+analyzer version in effect. No source code, stdout, or stderr is ever stored -
+the same privacy bar Phase 4.17/4.18 already established for
+`ValidationEvidence`. Records persist in their own bounded, cross-task store
+(`validation_telemetry.json`, capped by `validation_metrics_retention`),
+completely separate from `Task`/`Checkpoint` - an old checkpoint or task is
+unaffected by this phase in every way, because nothing was added to either.
+
+### Outcome linking: validation outcome vs. decision quality
+
+`classify_outcome()` is the one place Phase 4.19 makes precise the difference
+between "did the run pass" and "was picking that scope defensible":
+
+| Scope chosen | Targeted result | Mandatory broad/full-suite result | Decision quality |
+|---|---|---|---|
+| targeted | passed | passed | `consistent_no_contradiction` (not proof of sufficiency - no narrower alternative to compare against) |
+| targeted | passed | **failed** | `targeted_missed_defect` - the escape signal this phase exists to surface |
+| targeted | **failed** | (not reached) | `targeted_caught_defect` - a positive signal about the decision even though the run failed |
+| expanded/broad | - | passed | `broad_not_proven_necessary` - passing proves nothing about whether the broader scope was needed |
+| any | - | failed (other cases) | `validation_failed_no_scope_judgement` |
+
+A `CalibrationObservation` is derived from every finalized record
+(`later_broader_validation_found_defect=True` exactly for the escape-signal
+row above) and appended to the same bounded store.
+
+### Reliability estimation
+
+`compute_reliability()` turns the observation history into a per-evidence-type
+`EvidenceTypeReliability`: trials, successes, failures, a plain point estimate,
+and a **Wilson lower-bound** confidence-interval estimate
+(`wilson_lower_bound`). The lower bound, not the point estimate, is what
+calibration ever consults - two observations that both passed yields a lower
+bound well under 1.0, not 100% reliable, by construction.
+
+### Calibration signal and the safety floor
+
+`compute_calibration_signal()` is bidirectional and asymmetric on purpose:
+
+- **Downward** (widens validation): triggered by even a single recorded
+  `targeted_missed_defect` for a relevant evidence type, regardless of sample
+  size. Widening is always safe, so it needs no minimum-sample gate.
+- **Upward** (would narrow validation, shadow-only - see below): requires
+  *every* evidence type in the decision to have at least
+  `validation_calibration_min_samples` resolved trials **and** zero recorded
+  escapes; the adjustment is capped by `validation_calibration_max_adjustment`
+  and the result is always clamped to `[0, 1]`.
+- **Hard gate**: `impact_is_degraded()` - a recorded degradation, an unresolved
+  dependent symbol, or a genuine `dependency_resolution` evidence type whose
+  fixed confidence is `0.0` (currently only `dynamic_import_unresolved`) -
+  unconditionally blocks any upward adjustment, no matter how good the
+  historical statistics look. A dynamic import cannot become "safe" merely
+  because past runs happened to pass.
+
+### Shadow mode
+
+`ShadowCalibrationEngine.evaluate()` computes what a calibrated confidence
+*would* have recommended - `would_narrow`, `would_broaden`, `confidence_delta`,
+`shadow_scope`, `safety_override` (true when the degraded-evidence gate
+suppressed an upward move the raw statistics would otherwise have allowed) -
+and stores it on the record for comparison. **This is the only mode
+implemented.** There is no code path, gated or otherwise, that applies a
+shadow decision to real validation; `validation_calibration_shadow_mode`
+exists for a future live mode and is currently always treated as `True`.
+Enabling `validation_calibration_enabled` changes how much is *recorded*, never
+what runs.
+
+### `ValidationIntelligenceHealth`
+
+`compute_health()` is a read-only diagnostic summary over the store: scope
+distribution, broad-validation rate, reuse hit rate, reuse-rejection-reason
+tally, per-evidence-type reliability, a false-confidence-incident count
+(occurrences of `targeted_missed_defect`), and a `calibration_status` of
+`no_observations` / `insufficient_data` / `shadow_only` - there is currently no
+status beyond `shadow_only`, since no live mode exists. Nothing consults this
+automatically; it exists to be read.
+
+### Concurrency and storage bounds
+
+`ValidationTelemetryManager` mirrors `KnowledgeGraphManager`'s pattern (one
+manager per `Orchestrator`, same storage/root), with one addition: a
+process-wide lock keyed by resolved project path serializes each manager's
+read-modify-write cycle against the underlying JSON file, so parallel
+worktree orchestrators (Phase 4.14, threads within one process) cannot lose
+each other's decision records. This is stronger than the pre-existing
+knowledge-graph persistence, which has no such lock. Cross-*process*
+concurrency remains out of scope, consistent with the rest of
+`local_agent/storage.py`. Both the decision list and the observation list are
+independently bounded by `validation_metrics_retention` (oldest evicted
+first); a malformed stored entry is skipped and counted, never allowed to
+raise or silently corrupt an aggregate.
+
+### Configuration
+
+| Setting | Default | Effect |
+|---|---|---|
+| `validation_telemetry_enabled` | `False` | Record a `ValidationDecisionRecord` per semantic decision. Pure observability. |
+| `validation_calibration_enabled` | `False` | Additionally compute the shadow comparison. Requires telemetry; never changes real validation. |
+| `validation_calibration_shadow_mode` | `True` | Reserved; only shadow mode exists in this build. |
+| `validation_calibration_min_samples` | `20` | Minimum resolved trials before calibration may raise a confidence estimate. |
+| `validation_calibration_max_adjustment` | `0.15` | Maximum absolute confidence-score move calibration may propose, either direction. |
+| `validation_metrics_retention` | `500` | Cap on stored decision records and on stored observations (independent bounds). |
+
+### Limitations
+
+- No real fleet data exists yet - every number in this phase's own test suite
+  is synthetic/small-scale by necessity. `calibration_status` will read
+  `insufficient_data` or `no_observations` on any repository that has not
+  accumulated real history.
+- Decision records are per-iteration. A cross-iteration repair/abandon
+  lifecycle (did a later iteration in the *same* task fix what an earlier
+  targeted decision missed) is not linked - each iteration's decision and
+  outcome stand alone.
+- `ShadowComparison`'s `would_narrow`/`would_broaden` isolate the
+  confidence-derived component of scope only; they do not re-run the other
+  escalation rules in `recommend_validation_scope` (fan-out, removed public
+  symbols, traversal bounds), so a shadow "would narrow" result does not claim
+  the fully-escalated real scope would have been narrower too.
+- No live (non-shadow) calibration mode exists. Promoting shadow to live is
+  future work, gated on accumulating enough real observations to make
+  `calibration_status` read anything other than `insufficient_data`.
 
 ## Safety and current limitations
 
