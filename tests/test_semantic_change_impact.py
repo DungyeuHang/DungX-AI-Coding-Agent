@@ -252,16 +252,21 @@ TEST_UNRELATED_PY = textwrap.dedent(
 
 # References ``compute_widget_total`` by bare name without importing pkg.core,
 # which is exactly the ``call_graph_match`` situation: the name is distinctive
-# enough to be evidence, but no import edge corroborates it.
-# A dynamic import is the realistic reason a real test can reference a symbol
-# with no statically resolvable import edge to the module defining it.
+# enough to be evidence, but no import edge corroborates it. A *computed*
+# dynamic import - the module name is a variable, not a literal - is the
+# realistic reason a real test ends up in this position: Phase 4.18 resolves a
+# literal ``importlib.import_module("pkg.core")`` into a real edge (which would
+# turn this into a stronger ``direct_symbol_match``), so the argument here is
+# deliberately not a literal.
 TEST_REFERENCE_ONLY_PY = textwrap.dedent(
     """
     import importlib
 
+    _MODULE_NAME = "pkg.core"
+
 
     def test_reference():
-        module = importlib.import_module("pkg.core")
+        module = importlib.import_module(_MODULE_NAME)
         assert module.compute_widget_total([1, 2]) == 3
     """
 ).lstrip()
@@ -411,13 +416,94 @@ class TestAstPythonIndexer(unittest.TestCase):
         facts = self.indexer.analyze("from .core import *\n")
         self.assertTrue(facts.has_dynamic_imports)
 
-    def test_importlib_call_flags_dynamic(self):
-        facts = self.indexer.analyze("import importlib\nimportlib.import_module('x')\n")
-        self.assertTrue(facts.has_dynamic_imports)
+    def test_importlib_call_with_literal_argument_is_resolved_not_flagged(self):
+        # Phase 4.18: a literal string argument is exactly as knowable as a
+        # static import, so it resolves into a real (dynamic-flagged) import
+        # record instead of degrading confidence for something we do know.
+        facts = self.indexer.analyze("import importlib\nimportlib.import_module('pkg.x')\n")
+        self.assertFalse(facts.has_dynamic_imports)
+        self.assertIn(
+            ImportRecord(module="pkg.x", level=0, name=None, asname=None, dynamic=True),
+            facts.imports,
+        )
 
-    def test_dunder_import_flags_dynamic(self):
+    def test_dunder_import_with_literal_argument_is_resolved_not_flagged(self):
         facts = self.indexer.analyze("__import__('os')\n")
+        self.assertFalse(facts.has_dynamic_imports)
+        self.assertIn(
+            ImportRecord(module="os", level=0, name=None, asname=None, dynamic=True),
+            facts.imports,
+        )
+
+    @staticmethod
+    def _dynamic_resolved(facts) -> list:
+        return [record for record in facts.imports if record.dynamic]
+
+    def test_importlib_call_with_variable_argument_still_flags_dynamic(self):
+        # A computed argument genuinely cannot be resolved without running the
+        # program, so this must still degrade rather than guess.
+        facts = self.indexer.analyze(
+            "import importlib\nname = 'x'\nimportlib.import_module(name)\n"
+        )
         self.assertTrue(facts.has_dynamic_imports)
+        self.assertEqual(self._dynamic_resolved(facts), [])
+
+    def test_importlib_call_with_relative_literal_still_flags_dynamic(self):
+        # A package-relative dynamic import needs its ``package=`` argument
+        # resolved too; declining that is the conservative, correct choice.
+        facts = self.indexer.analyze(
+            "import importlib\nimportlib.import_module('.sub', package='pkg')\n"
+        )
+        self.assertTrue(facts.has_dynamic_imports)
+        self.assertEqual(self._dynamic_resolved(facts), [])
+
+    def test_importlib_call_with_fstring_argument_still_flags_dynamic(self):
+        facts = self.indexer.analyze(
+            "import importlib\nimportlib.import_module(f'pkg.{name}')\n"
+        )
+        self.assertTrue(facts.has_dynamic_imports)
+        self.assertEqual(self._dynamic_resolved(facts), [])
+
+    def test_importlib_call_with_non_identifier_literal_still_flags_dynamic(self):
+        # Almost certainly not a module path; decline rather than guess.
+        facts = self.indexer.analyze(
+            "import importlib\nimportlib.import_module('not a module/path')\n"
+        )
+        self.assertTrue(facts.has_dynamic_imports)
+        self.assertEqual(self._dynamic_resolved(facts), [])
+
+    def test_exec_with_literal_argument_still_flags_dynamic(self):
+        # exec/eval can do anything regardless of whether the argument is a
+        # literal - a literal string of *code* tells us nothing about imports.
+        facts = self.indexer.analyze("exec('import os')\n")
+        self.assertTrue(facts.has_dynamic_imports)
+        self.assertEqual(self._dynamic_resolved(facts), [])
+
+    def test_base_class_reference_is_tagged(self):
+        facts = self.indexer.analyze("class A(Base):\n    pass\n")
+        self.assertIn("Base", facts.base_class_references)
+        self.assertIn("Base", facts.references)
+
+    def test_decorator_reference_is_tagged_for_class_and_function(self):
+        facts = self.indexer.analyze(
+            "@class_deco\nclass A:\n    @method_deco\n    def m(self):\n        pass\n"
+        )
+        self.assertIn("class_deco", facts.decorator_references)
+        self.assertIn("method_deco", facts.decorator_references)
+
+    def test_parameter_and_return_annotations_are_tagged(self):
+        facts = self.indexer.analyze("def f(x: Foo) -> Bar:\n    return x\n")
+        self.assertIn("Foo", facts.annotation_references)
+        self.assertIn("Bar", facts.annotation_references)
+
+    def test_variable_annotation_is_tagged(self):
+        facts = self.indexer.analyze("x: SomeType = None\n")
+        self.assertIn("SomeType", facts.annotation_references)
+
+    def test_ordinary_call_argument_is_not_tagged_as_annotation(self):
+        facts = self.indexer.analyze("def f():\n    return helper(NotAnAnnotation)\n")
+        self.assertNotIn("NotAnAnnotation", facts.annotation_references)
+        self.assertIn("NotAnAnnotation", facts.references)
 
     def test_plain_module_has_no_dynamic_flag(self):
         facts = self.indexer.analyze(HELPERS_PY)

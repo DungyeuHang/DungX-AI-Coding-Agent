@@ -35,8 +35,15 @@ from typing import Sequence
 
 from ..models import SymbolDefinition, SymbolLocation
 
-#: Callables whose presence means imports cannot be resolved statically.
-_DYNAMIC_IMPORT_NAMES = frozenset({"__import__", "import_module", "load_module", "exec", "eval"})
+#: Callables that name-resolve a module by string; a *literal* string argument
+#: can be resolved just like a static import (see ``_try_resolve_dynamic_call``).
+#: ``load_module`` is the legacy ``imp`` equivalent and is treated the same way.
+_MODULE_RESOLVING_CALLS = frozenset({"__import__", "import_module", "load_module"})
+#: Calls whose argument can be an arbitrary program, not just a module name -
+#: even a literal string argument tells us nothing about *what modules it uses*,
+#: so these can never be resolved and always degrade confidence.
+_OPAQUE_EXECUTION_CALLS = frozenset({"exec", "eval"})
+_DYNAMIC_IMPORT_NAMES = _MODULE_RESOLVING_CALLS | _OPAQUE_EXECUTION_CALLS
 
 
 @dataclass(frozen=True)
@@ -48,12 +55,19 @@ class ImportRecord:
     ``from a.b import c``     -> ImportRecord("a.b", 0, "c", None)
     ``from . import c``       -> ImportRecord("", 1, "c", None)
     ``from ..x import c as d``-> ImportRecord("x", 2, "c", "d")
+    ``importlib.import_module("a.b")`` -> ImportRecord("a.b", 0, None, None, dynamic=True)
     """
 
     module: str
     level: int = 0
     name: str | None = None
     asname: str | None = None
+    #: True when this edge came from a resolved *dynamic* call
+    #: (``importlib.import_module("literal")``, ``__import__("literal")``)
+    #: rather than a static ``import``/``from`` statement. Carried through so
+    #: downstream provenance can say "resolved from a dynamic import call"
+    #: instead of claiming the same certainty as a plain import statement.
+    dynamic: bool = False
 
     @property
     def local_name(self) -> str:
@@ -76,12 +90,26 @@ class PythonFileFacts:
     imports: list[ImportRecord] = field(default_factory=list)
     #: Every identifier referenced in a load context anywhere in the module.
     references: frozenset[str] = frozenset()
-    #: True when the module performs imports that cannot be statically resolved.
+    #: True when the module performs imports that cannot be statically resolved:
+    #: a star import, ``exec``/``eval`` at all, or a dynamic module-loading call
+    #: (``importlib.import_module``, ``__import__``, ``imp.load_module``) whose
+    #: argument is not a literal string. A dynamic call *with* a literal string
+    #: argument is resolved into a normal (dynamic-flagged) entry in ``imports``
+    #: instead - see :data:`_MODULE_RESOLVING_CALLS` - so it does NOT set this.
     has_dynamic_imports: bool = False
     #: Non-empty when the file could not be parsed; symbols/imports are then empty.
     parse_error: str = ""
     #: Module-level ``__all__`` entries, when declared as a literal list/tuple.
     exported_names: tuple[str, ...] = ()
+    #: Identifiers referenced specifically as a base class in a ``class X(Y):``
+    #: statement. A subset of ``references`` kept separately so a dependency on
+    #: ``Y`` can be explained as *inheritance*, not a generic name match.
+    base_class_references: frozenset[str] = frozenset()
+    #: Identifiers referenced specifically as a decorator (``@deco``).
+    decorator_references: frozenset[str] = frozenset()
+    #: Identifiers referenced specifically in a type annotation (parameter,
+    #: return type, or ``x: SomeType`` variable annotation).
+    annotation_references: frozenset[str] = frozenset()
 
     @property
     def module_import_names(self) -> list[str]:
@@ -185,6 +213,9 @@ class AstPythonIndexer:
             references=frozenset(collector.references),
             has_dynamic_imports=collector.has_dynamic_imports,
             exported_names=tuple(collector.exported_names),
+            base_class_references=frozenset(collector.base_class_references),
+            decorator_references=frozenset(collector.decorator_references),
+            annotation_references=frozenset(collector.annotation_references),
         )
 
 
@@ -199,6 +230,9 @@ class _FactCollector:
         self.references: set[str] = set()
         self.has_dynamic_imports = False
         self.exported_names: list[str] = []
+        self.base_class_references: set[str] = set()
+        self.decorator_references: set[str] = set()
+        self.annotation_references: set[str] = set()
 
     # -- entry point -------------------------------------------------------
 
@@ -211,6 +245,7 @@ class _FactCollector:
             self._collect_reference(node)
             self._collect_import(node)
             self._collect_dunder_all(node)
+            self._collect_reference_kind(node)
 
     # -- definitions -------------------------------------------------------
 
@@ -360,7 +395,23 @@ class _FactCollector:
                 called = func.id
             elif isinstance(func, ast.Attribute):
                 called = func.attr
-            if called in _DYNAMIC_IMPORT_NAMES:
+            if called in _MODULE_RESOLVING_CALLS:
+                literal = _literal_module_argument(node)
+                if literal is not None:
+                    # A resolvable literal is exactly as knowable as a static
+                    # import: reuse the same edge machinery, just labelled
+                    # ``dynamic`` so provenance can say where it came from.
+                    self.imports.append(
+                        ImportRecord(module=literal, level=0, name=None, asname=None, dynamic=True)
+                    )
+                else:
+                    # A computed/variable argument, or a relative ("."-leading)
+                    # dynamic import: genuinely cannot know the target without
+                    # running the program, so this stays a real degradation.
+                    self.has_dynamic_imports = True
+            elif called in _OPAQUE_EXECUTION_CALLS:
+                # ``exec``/``eval`` can do anything a literal string can't tell
+                # us about, even when the argument itself is a literal.
                 self.has_dynamic_imports = True
 
     def _collect_dunder_all(self, node: ast.AST) -> None:
@@ -373,3 +424,66 @@ class _FactCollector:
                 for element in node.value.elts:
                     if isinstance(element, ast.Constant) and isinstance(element.value, str):
                         self.exported_names.append(element.value)
+
+    def _collect_reference_kind(self, node: ast.AST) -> None:
+        """Tag a subset of references by *where* they were used.
+
+        These are strict subsets of the generic ``references`` set collected by
+        :meth:`_collect_reference` above; nothing here changes which names are
+        "referenced", only which ones can be explained as an inheritance,
+        decorator, or annotation dependency rather than an ordinary name use.
+        """
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                _collect_names(base, self.base_class_references)
+            for decorator in node.decorator_list:
+                _collect_names(decorator, self.decorator_references)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                _collect_names(decorator, self.decorator_references)
+            args = node.args
+            all_args = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+            if args.vararg is not None:
+                all_args.append(args.vararg)
+            if args.kwarg is not None:
+                all_args.append(args.kwarg)
+            for argument in all_args:
+                if argument.annotation is not None:
+                    _collect_names(argument.annotation, self.annotation_references)
+            if node.returns is not None:
+                _collect_names(node.returns, self.annotation_references)
+        elif isinstance(node, ast.AnnAssign) and node.annotation is not None:
+            _collect_names(node.annotation, self.annotation_references)
+
+
+def _collect_names(expr: ast.expr, into: set[str]) -> None:
+    """Every ``Name``/``Attribute`` identifier within one expression subtree."""
+    for node in ast.walk(expr):
+        if isinstance(node, ast.Name):
+            into.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            into.add(node.attr)
+
+
+def _literal_module_argument(call: ast.Call) -> str | None:
+    """The dotted module string a dynamic-import call resolves to, if knowable.
+
+    Returns ``None`` - meaning "cannot be resolved statically" - for anything
+    other than a plain string constant: an f-string, a variable, string
+    concatenation, or a leading-dot (package-relative) string, which would need
+    the call's ``package=`` keyword resolved too and is deliberately not
+    attempted. A non-identifier-shaped string is also declined, since it is
+    almost certainly runtime-computed content rather than a module path.
+    """
+    if not call.args:
+        return None
+    first = call.args[0]
+    if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+        return None
+    value = first.value.strip()
+    if not value or value.startswith("."):
+        return None
+    parts = value.split(".")
+    if not all(part.isidentifier() for part in parts):
+        return None
+    return value
