@@ -109,6 +109,14 @@ class AgentConfig:
     # expensive; it can never make validation less thorough.
     validation_confidence_threshold: Literal["low", "medium", "high"] = "high"
     reuse_candidate_validation_evidence: bool = False
+    # Phase 4.18: evidence-identity hardening for the reuse decision above.
+    #: Maximum age, in seconds, a reused evidence entry may have. ``0`` means
+    #: "no age limit" - the exact Phase 4.17 behaviour - since a repository
+    #: whose content fingerprint has not changed is not made less trustworthy
+    #: merely by the passage of time; this exists for the (opt-in) case where a
+    #: user's policy wants reuse to expire regardless of content match, e.g.
+    #: to bound how long a stale toolchain assumption could go unnoticed.
+    evidence_max_age_seconds: int = 0
 
     @property
     def tool_policy(self) -> Any:
@@ -204,6 +212,7 @@ class AgentConfig:
             "max_affected_tests": "AGENT_MAX_AFFECTED_TESTS",
             "validation_confidence_threshold": "AGENT_VALIDATION_CONFIDENCE_THRESHOLD",
             "reuse_candidate_validation_evidence": "AGENT_REUSE_CANDIDATE_EVIDENCE",
+            "evidence_max_age_seconds": "AGENT_EVIDENCE_MAX_AGE_SECONDS",
         }
 
         def value(name: str, default: object) -> object:
@@ -368,6 +377,7 @@ class AgentConfig:
             max_affected_tests=_positive_int(value("max_affected_tests", 8), "max_affected_tests"),
             validation_confidence_threshold=str(value("validation_confidence_threshold", "high")).lower(),
             reuse_candidate_validation_evidence=_bool(value("reuse_candidate_validation_evidence", False)),
+            evidence_max_age_seconds=int(value("evidence_max_age_seconds", 0) or 0),
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -411,6 +421,8 @@ class AgentConfig:
             raise ValueError("max_scope_growth_factor must be at least 1.0")
         if self.validation_confidence_threshold not in {"low", "medium", "high"}:
             raise ValueError("validation_confidence_threshold must be 'low', 'medium', or 'high'")
+        if self.evidence_max_age_seconds < 0:
+            raise ValueError("evidence_max_age_seconds cannot be negative")
         # Validate tool policy creation
         _ = self.tool_policy
 
@@ -442,6 +454,7 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--max-affected-tests", type=int, default=None, help="maximum validation targets selected by impact analysis")
     parser.add_argument("--validation-confidence-threshold", choices=("low", "medium", "high"), default=None, help="minimum impact confidence required to reuse candidate validation evidence")
     parser.add_argument("--reuse-candidate-evidence", type=_bool, default=None, help="reuse passing candidate validation evidence post-apply when assumptions still hold (true/false)")
+    parser.add_argument("--evidence-max-age-seconds", type=int, default=None, help="reject reuse of validation evidence older than this many seconds (0 = no age limit)")
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
@@ -490,6 +503,7 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "max_affected_tests": getattr(args, "max_affected_tests", None),
             "validation_confidence_threshold": getattr(args, "validation_confidence_threshold", None),
             "reuse_candidate_validation_evidence": getattr(args, "reuse_candidate_evidence", None),
+            "evidence_max_age_seconds": getattr(args, "evidence_max_age_seconds", None),
             "validation_commands": getattr(args, "validation", None),
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,

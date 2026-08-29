@@ -1,4 +1,4 @@
-"""Phase 4.17: structured validation evidence, and safe reuse of it.
+"""Phase 4.17/4.18: structured validation evidence, and safe reuse of it.
 
 Phase 4.16 runs real validation commands against an isolated candidate tree
 before anything is written to the authoritative tree. When that candidate is
@@ -16,13 +16,30 @@ assumption still holds:
 * the evidence recorded a *pass* - a failure is never reused to skip a rerun,
 * the relevant file set is identical,
 * the relevant symbol set is identical,
-* the content fingerprint over those files is byte-identical, and
-* the impact confidence attached to the evidence meets the caller's threshold.
+* the content fingerprint over those files is byte-identical,
+* the impact confidence attached to the evidence meets the caller's threshold,
+* (Phase 4.18, opt-in per call) the evidence is not older than a caller-given
+  age limit,
+* (Phase 4.18, opt-in per call) the decision-relevant configuration has not
+  changed since the evidence was recorded,
+* (Phase 4.18, opt-in per call) the command still resolves to the same
+  underlying executable, and
+* (Phase 4.18, opt-in per call) this evidence was produced by the same
+  analyzer schema version as is running now.
 
 If any one of those fails, the decision is ``reusable=False`` with a specific
 machine-readable ``reason`` and the caller reruns. There is deliberately no
 "probably fine" path: a false reuse would silently skip validation, which is
 the single worst failure this system can have.
+
+The four Phase 4.18 checks are opt-in *per call* (``None`` skips a check
+entirely) so existing callers that do not pass them see byte-identical
+behaviour to Phase 4.17. Once a caller does pass one, it is checked strictly:
+evidence recorded before that check existed always has an empty stored value
+for it, which never equals a real value the caller supplies, so upgrading a
+caller to check policy/environment/version fingerprints automatically and
+correctly invalidates every pre-upgrade evidence entry rather than silently
+matching them. That is a deliberate fail-closed default, not an oversight.
 
 Why a *content* fingerprint and not a path or mtime
 ---------------------------------------------------
@@ -45,9 +62,10 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 #: Default number of evidence entries retained. Old entries are dropped
 #: oldest-first, so history is bounded rather than unbounded.
@@ -70,6 +88,13 @@ REASON_FILES_CHANGED = "relevant_file_set_changed"
 REASON_SYMBOLS_CHANGED = "relevant_symbol_set_changed"
 REASON_CONFIDENCE_TOO_LOW = "confidence_below_threshold"
 REASON_REUSE_DISABLED = "reuse_disabled"
+#: Phase 4.18 additions. Names read "REJECTED_..." in spirit; the constant
+#: values keep the existing ``..._mismatch``/adjective shape already used
+#: above so serialized reasons stay stylistically consistent.
+REASON_STALE = "evidence_too_old"
+REASON_POLICY_MISMATCH = "policy_configuration_changed"
+REASON_ENVIRONMENT_MISMATCH = "execution_environment_changed"
+REASON_ANALYZER_VERSION_MISMATCH = "analyzer_schema_version_changed"
 REASON_OK = "assumptions_still_hold"
 
 
@@ -109,6 +134,64 @@ def compute_state_fingerprint(root: str | Path, paths: Iterable[str]) -> str:
     return digest.hexdigest()
 
 
+def compute_policy_fingerprint(values: Mapping[str, Any]) -> str:
+    """Deterministic digest of the decision-relevant configuration in effect.
+
+    A caller passes exactly the settings that could change *what* validation
+    scope/targets were chosen (e.g. ``max_impact_depth``,
+    ``max_affected_tests``, ``validation_confidence_threshold``) as a plain
+    mapping. This function only guarantees the same mapping always yields the
+    same digest and a different mapping (almost certainly) yields a different
+    one - it has no opinion on which keys matter, so evolving the policy is a
+    matter of changing what the caller puts in the mapping, not this function.
+    """
+    digest = hashlib.sha256()
+    for key in sorted(str(k) for k in values):
+        digest.update(key.encode("utf-8", "replace"))
+        digest.update(b"\0")
+        digest.update(repr(values[key]).encode("utf-8", "replace"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def compute_executable_fingerprint(command: Sequence[str]) -> str:
+    """Digest of what a *logical* command actually resolves to, right now.
+
+    ``command`` is the logical command (e.g. ``("pytest", "tests/test_x.py")``)
+    - the same value stored on the evidence and compared for equality
+    elsewhere. This looks past it to the concrete executable
+    :func:`local_agent.commands.resolve_executable` would run and the running
+    interpreter's version, so a Python upgrade or a swapped virtualenv between
+    when evidence was recorded and a later reuse attempt changes this digest
+    even though the logical command string did not.
+    """
+    from .commands import resolve_executable
+
+    argv, _ = resolve_executable(tuple(str(token) for token in command))
+    resolved_head = argv[0] if argv else ""
+    payload = f"{resolved_head}\0{sys.version_info[0]}.{sys.version_info[1]}\0{sys.platform}"
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+
+
+def age_seconds(timestamp: str, *, now: datetime.datetime | None = None) -> float | None:
+    """Seconds between ``timestamp`` (an ISO-8601 string) and ``now``.
+
+    Returns ``None`` for anything unparseable, including an empty string, so a
+    caller checking staleness can fail closed (treat "cannot tell" as stale)
+    instead of accidentally treating unparseable input as age zero.
+    """
+    if not timestamp:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    current = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    return max(0.0, (current - parsed).total_seconds())
+
+
 @dataclass
 class ValidationEvidence:
     """One recorded validation command execution and why it was run."""
@@ -135,6 +218,18 @@ class ValidationEvidence:
     skipped_reason: str = ""
     #: Content fingerprint of ``impacted_files`` at execution time.
     fingerprint: str = ""
+    #: Phase 4.18: digest of the decision-relevant configuration in effect when
+    #: this command ran (see ``compute_policy_fingerprint``). Empty for
+    #: evidence recorded before this field existed.
+    policy_fingerprint: str = ""
+    #: Phase 4.18: digest of the actual resolved executable + interpreter
+    #: identity the command ran under (see ``compute_executable_fingerprint``).
+    #: Distinct from ``command`` itself, which is the *logical* command and
+    #: deliberately stable across a ``python`` -> ``sys.executable`` fallback.
+    executable_fingerprint: str = ""
+    #: Phase 4.18: the semantic-impact analyzer schema version that produced
+    #: the confidence/tier this evidence relied on.
+    analyzer_version: str = ""
 
     @property
     def passed(self) -> bool:
@@ -162,6 +257,9 @@ class ValidationEvidence:
             "environment_root": self.environment_root,
             "skipped_reason": self.skipped_reason,
             "fingerprint": self.fingerprint,
+            "policy_fingerprint": self.policy_fingerprint,
+            "executable_fingerprint": self.executable_fingerprint,
+            "analyzer_version": self.analyzer_version,
         }
 
     @classmethod
@@ -187,6 +285,9 @@ class ValidationEvidence:
             environment_root=str(data.get("environment_root", "")),
             skipped_reason=str(data.get("skipped_reason", "")),
             fingerprint=str(data.get("fingerprint", "")),
+            policy_fingerprint=str(data.get("policy_fingerprint", "")),
+            executable_fingerprint=str(data.get("executable_fingerprint", "")),
+            analyzer_version=str(data.get("analyzer_version", "")),
         )
 
 
@@ -252,6 +353,9 @@ class EvidenceLedger:
         environment_root: str = "",
         skipped_reason: str = "",
         fingerprint: str = "",
+        policy_fingerprint: str = "",
+        executable_fingerprint: str = "",
+        analyzer_version: str = "",
     ) -> ValidationEvidence:
         """Append one entry, trimming outputs and evicting the oldest if needed."""
         entry = ValidationEvidence(
@@ -272,6 +376,9 @@ class EvidenceLedger:
             environment_root=str(environment_root),
             skipped_reason=skipped_reason,
             fingerprint=fingerprint,
+            policy_fingerprint=policy_fingerprint,
+            executable_fingerprint=executable_fingerprint,
+            analyzer_version=analyzer_version,
         )
         self._entries.append(entry)
         if len(self._entries) > self.max_entries:
@@ -304,6 +411,10 @@ class EvidenceLedger:
         relevant_symbols: Iterable[str] = (),
         min_confidence: str = "medium",
         enabled: bool = True,
+        max_age_seconds: float | None = None,
+        policy_fingerprint: str | None = None,
+        executable_fingerprint: str | None = None,
+        analyzer_version: str | None = None,
     ) -> EvidenceReuseDecision:
         """Decide whether a previously recorded result may stand in for a rerun.
 
@@ -311,6 +422,14 @@ class EvidenceLedger:
         is inferred from the fact that a candidate previously passed. The most
         recent matching entry is preferred, so a later iteration's evidence
         supersedes an earlier one for the same command.
+
+        The four Phase 4.18 keyword-only checks (``max_age_seconds`` and the
+        three ``*_fingerprint``/``analyzer_version`` identity checks) are each
+        skipped entirely when left ``None`` - existing callers see exactly
+        Phase 4.17 behaviour. Passed explicitly, each is strict: an evidence
+        entry recorded before that check existed has an empty stored value,
+        which can never equal a real one, so such evidence is correctly
+        rejected rather than silently grandfathered in.
         """
         from .semantic_impact import confidence_at_least
 
@@ -328,6 +447,24 @@ class EvidenceLedger:
             return EvidenceReuseDecision(False, REASON_COMMAND_MISMATCH
                                          if self._entries else REASON_NO_EVIDENCE)
 
+        def _identity_ok(entry: ValidationEvidence) -> bool:
+            if policy_fingerprint is not None and entry.policy_fingerprint != policy_fingerprint:
+                return False
+            if (
+                executable_fingerprint is not None
+                and entry.executable_fingerprint != executable_fingerprint
+            ):
+                return False
+            if analyzer_version is not None and entry.analyzer_version != analyzer_version:
+                return False
+            return True
+
+        def _fresh_enough(entry: ValidationEvidence) -> bool:
+            if max_age_seconds is None:
+                return True
+            age = age_seconds(entry.timestamp)
+            return age is not None and age <= max_age_seconds
+
         # Newest first: the latest candidate iteration is the authoritative one.
         for entry in reversed(matching):
             if not entry.passed:
@@ -337,6 +474,10 @@ class EvidenceLedger:
             if sorted(entry.impacted_symbols) != symbols:
                 continue
             if not confidence_at_least(entry.confidence, min_confidence):
+                continue
+            if not _fresh_enough(entry):
+                continue
+            if not _identity_ok(entry):
                 continue
             current = compute_state_fingerprint(current_root, files)
             if current != entry.fingerprint:
@@ -348,7 +489,8 @@ class EvidenceLedger:
             )
 
         # Nothing was reusable: report the most specific reason, checked against
-        # the newest matching entry so the message describes the real blocker.
+        # the newest matching entry in the same order as the loop above, so the
+        # message describes the actual blocker for the most recent attempt.
         newest = matching[-1]
         self.reuse_denials += 1
         if not newest.passed:
@@ -359,6 +501,17 @@ class EvidenceLedger:
             return EvidenceReuseDecision(False, REASON_SYMBOLS_CHANGED, newest)
         if not confidence_at_least(newest.confidence, min_confidence):
             return EvidenceReuseDecision(False, REASON_CONFIDENCE_TOO_LOW, newest)
+        if not _fresh_enough(newest):
+            return EvidenceReuseDecision(False, REASON_STALE, newest)
+        if policy_fingerprint is not None and newest.policy_fingerprint != policy_fingerprint:
+            return EvidenceReuseDecision(False, REASON_POLICY_MISMATCH, newest)
+        if (
+            executable_fingerprint is not None
+            and newest.executable_fingerprint != executable_fingerprint
+        ):
+            return EvidenceReuseDecision(False, REASON_ENVIRONMENT_MISMATCH, newest)
+        if analyzer_version is not None and newest.analyzer_version != analyzer_version:
+            return EvidenceReuseDecision(False, REASON_ANALYZER_VERSION_MISMATCH, newest)
         return EvidenceReuseDecision(False, REASON_FINGERPRINT_MISMATCH, newest)
 
     # -- serialisation -----------------------------------------------------

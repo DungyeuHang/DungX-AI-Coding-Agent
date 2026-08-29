@@ -52,6 +52,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from .dependency_resolution import (
+    ANNOTATION,
+    ATTRIBUTE_RESOLUTION,
+    DECORATOR,
+    DYNAMIC_IMPORT_RESOLVED,
+    INHERITANCE,
+    REEXPORT,
+    DependencyEvidence,
+    make_evidence,
+    resolve_alias_reference,
+)
 from .indexing.ast_python_indexer import (
     AstPythonIndexer,
     ImportRecord,
@@ -63,6 +74,17 @@ from .models import FileIndex, SemanticIndex, SymbolDefinition
 from .sandbox import EXCLUDED_DIRECTORY_NAMES
 
 LOGGER = logging.getLogger(__name__)
+
+#: Phase 4.18: bumped whenever a change here could alter a *previously
+#: recorded* confidence/tier/scope conclusion for the same inputs (a new
+#: evidence type, a changed confidence table, a changed scope policy). Not
+#: bumped for additive fields that do not change existing conclusions (a new
+#: dataclass field with a safe default, a new optional evidence tag). Recorded
+#: on every :class:`~local_agent.evidence.ValidationEvidence` entry and
+#: consulted, opt-in, by :meth:`~local_agent.evidence.EvidenceLedger.find_reusable`
+#: so a build that changed how confidence is computed cannot silently reuse a
+#: conclusion an older build reached under different rules.
+SEMANTIC_ANALYZER_SCHEMA_VERSION = "4.18.0"
 
 # -- vocabulary ---------------------------------------------------------------
 
@@ -300,6 +322,11 @@ class ValidationTarget:
     matched_symbols: list[str] = field(default_factory=list)
     matched_files: list[str] = field(default_factory=list)
     depth: int = 0
+    #: Phase 4.18: fine-grained, provenance-typed evidence explaining *why* this
+    #: target was associated, layered on top of (never replacing) ``tier``. Can
+    #: be empty even for a semantic tier - e.g. a plain bare-name match records
+    #: no additional evidence beyond the tier itself, which already explains it.
+    dependency_evidence: tuple["DependencyEvidence", ...] = ()
 
     @property
     def weight(self) -> int:
@@ -323,6 +350,7 @@ class ValidationTarget:
             "matched_symbols": list(self.matched_symbols),
             "matched_files": list(self.matched_files),
             "depth": self.depth,
+            "dependency_evidence": [e.to_dict() for e in self.dependency_evidence],
         }
 
     @classmethod
@@ -337,6 +365,9 @@ class ValidationTarget:
             matched_symbols=[str(s) for s in (data.get("matched_symbols") or [])],
             matched_files=[str(s) for s in (data.get("matched_files") or [])],
             depth=int(data.get("depth", 0) or 0),
+            dependency_evidence=tuple(
+                DependencyEvidence.from_dict(e) for e in (data.get("dependency_evidence") or [])
+            ),
         )
 
 
@@ -657,6 +688,11 @@ class SemanticGraph:
         self.imported_symbol_origins: dict[str, dict[str, tuple[str, str]]] = {}
         #: file -> dotted import strings that resolved to nothing in this repo.
         self.unresolved_imports: dict[str, set[str]] = {}
+        #: file -> target files reached only through a resolved *dynamic* call
+        #: (``importlib.import_module("literal")``), never a static import
+        #: statement. Subset of ``file_imports[file]``; used purely for
+        #: provenance (Phase 4.18) - it changes no traversal or scope decision.
+        self.dynamic_resolved_edges: dict[str, set[str]] = {}
         self.parse_failures: dict[str, str] = {}
         self.semantic_index: SemanticIndex = SemanticIndex()
         self.truncated_at_max_files = False
@@ -799,6 +835,7 @@ class SemanticGraph:
             imports: set[str] = set()
             unresolved: set[str] = set()
             origins: dict[str, tuple[str, str]] = {}
+            dynamic_targets: set[str] = set()
             for record in facts.imports:
                 self.total_imports += 1
                 target, symbol = self._resolve_import(relative, record)
@@ -813,6 +850,8 @@ class SemanticGraph:
                     # would create a trivial cycle in the traversal.
                     continue
                 imports.add(target)
+                if record.dynamic:
+                    dynamic_targets.add(target)
                 if symbol:
                     origins[record.local_name or symbol] = (target, symbol)
             self.file_imports[relative] = imports
@@ -820,6 +859,8 @@ class SemanticGraph:
                 self.unresolved_imports[relative] = unresolved
             if origins:
                 self.imported_symbol_origins[relative] = origins
+            if dynamic_targets:
+                self.dynamic_resolved_edges[relative] = dynamic_targets
             for target in imports:
                 self.reverse_deps.setdefault(target, set()).add(relative)
 
@@ -1404,6 +1445,12 @@ class SemanticChangeImpactAnalyzer:
         changed_names = report.changed_symbol_names
         affected_set = set(report.affected_files)
         affected_depths = {s.file: s.depth for s in report.affected_symbols}
+        # Phase 4.18: precomputed once so per-test evidence construction below
+        # can attribute an inheritance/decorator/annotation/dynamic-import hit
+        # to the specific changed file(s) that actually define the name.
+        name_to_changed_files: dict[str, set[str]] = {}
+        for symbol in report.changed_symbols:
+            name_to_changed_files.setdefault(symbol.name, set()).add(symbol.file)
 
         candidates = graph.test_files()
         report.tests_considered = len(candidates)
@@ -1428,10 +1475,33 @@ class SemanticChangeImpactAnalyzer:
         for test_path in candidates:
             imports = graph.file_imports.get(test_path, set())
             imported_changed = sorted(imports & changed_set)
-            referenced = sorted(changed_names & graph.references_of(test_path))
+            references = graph.references_of(test_path)
+
+            # Phase 4.18: resolve local aliases (``from x import y as z``) back
+            # to the definition they actually name, so an aliased reference
+            # counts as evidence for the *original* symbol it refers to instead
+            # of being invisible to the bare name-match below. Every reference
+            # not already a literal changed-symbol name is a candidate; most
+            # resolve to nothing (not an alias at all) and cost one dict lookup.
+            alias_evidence: dict[str, DependencyEvidence] = {}
+            for name in sorted(references - changed_names):
+                hit = resolve_alias_reference(
+                    source_file=test_path,
+                    reference=name,
+                    imported_symbol_origins=graph.imported_symbol_origins,
+                    changed_files=frozenset(changed_set),
+                    changed_symbol_names=frozenset(changed_names),
+                )
+                if hit is not None:
+                    alias_evidence[hit.target_symbol] = hit
+
+            referenced = sorted((changed_names & references) | set(alias_evidence))
             distinctive_referenced = sorted(
-                distinctive_names & graph.references_of(test_path)
+                (distinctive_names & references) | set(alias_evidence)
             )
+            extra_evidence = self._construct_evidence(
+                graph, test_path, distinctive_names, name_to_changed_files,
+            ) + tuple(alias_evidence.values())
 
             if test_path in changed_set:
                 targets[test_path] = ValidationTarget(
@@ -1460,6 +1530,7 @@ class SemanticChangeImpactAnalyzer:
                     ),
                     matched_symbols=referenced,
                     matched_files=imported_changed,
+                    dependency_evidence=extra_evidence,
                 )
                 continue
             if imported_changed:
@@ -1472,6 +1543,7 @@ class SemanticChangeImpactAnalyzer:
                         f"{', '.join(imported_changed)}"
                     ),
                     matched_files=imported_changed,
+                    dependency_evidence=extra_evidence,
                 )
                 continue
             if distinctive_referenced:
@@ -1485,6 +1557,7 @@ class SemanticChangeImpactAnalyzer:
                         "(name match only)"
                     ),
                     matched_symbols=distinctive_referenced,
+                    dependency_evidence=extra_evidence,
                 )
                 continue
             imported_affected = sorted(imports & affected_set)
@@ -1502,6 +1575,9 @@ class SemanticChangeImpactAnalyzer:
                     ),
                     matched_files=imported_affected,
                     depth=depth,
+                    dependency_evidence=self._reexport_evidence(
+                        graph, test_path, imported_affected, changed_set, changed_names
+                    ),
                 )
                 continue
             module_match = self._module_match(test_path, changed_set)
@@ -1556,6 +1632,102 @@ class SemanticChangeImpactAnalyzer:
                 )
             ]
         report.validation_targets = ranked
+
+    def _construct_evidence(
+        self,
+        graph: "SemanticGraph",
+        test_path: str,
+        distinctive_names: set[str],
+        name_to_changed_files: dict[str, set[str]],
+    ) -> tuple[DependencyEvidence, ...]:
+        """Phase 4.18: label *why* a distinctive reference is trustworthy.
+
+        Purely explanatory: it never changes which tier a target lands in
+        (that ladder is unchanged), only attaches a more specific reason when
+        one of these constructs - rather than an ordinary statement - is what
+        connects ``test_path`` to the change.
+        """
+        facts = graph.files.get(test_path)
+        if facts is None:
+            return ()
+        out: list[DependencyEvidence] = []
+
+        def _tag(names: frozenset[str], evidence_type: str, phrase: str) -> None:
+            for name in sorted(distinctive_names & names):
+                for target_file in sorted(name_to_changed_files.get(name, ())):
+                    out.append(
+                        make_evidence(
+                            source_file=test_path,
+                            target_file=target_file,
+                            evidence_type=evidence_type,
+                            target_symbol=name,
+                            source_reference=name,
+                            provenance=f"'{test_path}' {phrase} '{name}', changed in {target_file}",
+                        )
+                    )
+
+        _tag(facts.base_class_references, INHERITANCE, "inherits from")
+        _tag(facts.decorator_references, DECORATOR, "is decorated with")
+        _tag(facts.annotation_references, ANNOTATION, "type-annotates with")
+        _tag(facts.attribute_references, ATTRIBUTE_RESOLUTION, "accesses an attribute named")
+
+        for target_file in sorted(graph.dynamic_resolved_edges.get(test_path, ())):
+            out.append(
+                make_evidence(
+                    source_file=test_path,
+                    target_file=target_file,
+                    evidence_type=DYNAMIC_IMPORT_RESOLVED,
+                    provenance=(
+                        f"'{test_path}' loads {target_file} through a dynamic "
+                        "import call whose module string was a resolvable literal"
+                    ),
+                )
+            )
+        return tuple(out)
+
+    def _reexport_evidence(
+        self,
+        graph: "SemanticGraph",
+        test_path: str,
+        imported_affected: list[str],
+        changed_set: set[str],
+        changed_names: set[str],
+    ) -> tuple[DependencyEvidence, ...]:
+        """Label a ``reverse_dependency_match`` that passes through a re-export.
+
+        ``imported_affected`` are files ``test_path`` imports that are
+        themselves downstream of the change. When one of them lists the
+        changed symbol in its own ``__all__``, the edge is a deliberate
+        re-export rather than an incidental transitive import, which is worth
+        saying explicitly - it is materially stronger evidence than "some file
+        two hops away happens to import something".
+        """
+        out: list[DependencyEvidence] = []
+        for intermediate in imported_affected:
+            facts = graph.files.get(intermediate)
+            if facts is None:
+                continue
+            reexported = set(facts.exported_names) & changed_names
+            if not reexported:
+                continue
+            origin = next(
+                (source for source in sorted(changed_set) if source != intermediate), intermediate
+            )
+            for name in sorted(reexported):
+                out.append(
+                    make_evidence(
+                        source_file=test_path,
+                        target_file=intermediate,
+                        evidence_type=REEXPORT,
+                        target_symbol=name,
+                        provenance=(
+                            f"'{intermediate}' re-exports '{name}' via __all__, and "
+                            f"'{test_path}' imports {intermediate}"
+                        ),
+                        resolution_notes=(f"originating change traced toward {origin}",),
+                    )
+                )
+        return tuple(out)
 
     def _module_match(self, test_path: str, changed_files: set[str]) -> str | None:
         """``local_agent/impact.py`` <-> ``tests/test_impact.py`` naming link."""

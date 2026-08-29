@@ -237,6 +237,7 @@ duplicated work, not validation.
 | `max_affected_tests` | `AGENT_MAX_AFFECTED_TESTS` | `8` |
 | `validation_confidence_threshold` | `AGENT_VALIDATION_CONFIDENCE_THRESHOLD` | `high` |
 | `reuse_candidate_validation_evidence` | `AGENT_REUSE_CANDIDATE_EVIDENCE` | `false` |
+| `evidence_max_age_seconds` | `AGENT_EVIDENCE_MAX_AGE_SECONDS` | `0` (no age limit) |
 
 Both features are off by default, so existing single-shot, interactive and
 prospective-validation modes behave exactly as before.
@@ -250,9 +251,113 @@ read as "no impact". Symbol nesting is tracked one level deep (`Class.method`),
 matching the existing indexer's single-name `parent` field, so a definition inside
 a function is not indexed. Call-graph evidence is name-based, not a resolved call
 graph: it proves a test mentions a changed symbol name, not that it invokes that
-definition, which is why it ranks below a resolved import edge. Dynamic imports,
-`__getattr__` indirection and generated code cannot be resolved statically and are
-recorded as degradations.
+definition, which is why it ranks below a resolved import edge (see Phase 4.18
+below for the cases this now resolves more precisely). `__getattr__` indirection
+and generated code still cannot be resolved statically and are recorded as
+degradations.
+
+## Semantic dependency resolution & evidence calibration (Phase 4.18)
+
+Phase 4.17's evidence tiers were name-based: an import alias, a base class, a
+decorator or a type annotation all collapsed into one undifferentiated
+"reference". `dependency_resolution.py` adds a provenance-typed layer on top
+(never a replacement) that explains *which construct* produced a piece of
+evidence, and `validation_decision.py` centralizes the scope/reuse decision
+that used to be duplicated between the candidate-time and post-apply code
+paths.
+
+### What is newly resolved
+
+- **Import aliases** (`from x import y as z`) are resolved back to the
+  original definition via the existing `SemanticGraph.imported_symbol_origins`
+  table (already built by Phase 4.17, but previously unused for this), so an
+  aliased reference now upgrades from `direct_import_match` to
+  `direct_symbol_match` instead of under-reporting its own strength. Re-export
+  chains (`a` re-imports from `b`, `c` imports from `a`) are followed up to a
+  bounded number of hops with a visited-set guard against cycles.
+- **Module aliases** (`import x as m`, then `m.symbol()`) needed no new
+  resolution: the attribute name is captured directly regardless of the module
+  alias, which Phase 4.17 already did correctly. A regression test locks this in.
+- **Inheritance, decorators and annotations** get their own evidence type
+  (`inheritance_match`, `decorator_match`, `annotation_match`) by tracking base
+  classes, decorator expressions and parameter/return/variable annotations
+  separately during the AST walk, rather than folding them into the generic
+  reference set.
+- **`__all__` re-exports** are labelled `reexport_match` when a dependent is
+  reached through a file that explicitly re-exports the changed symbol,
+  distinguishing a deliberate public re-export from an incidental transitive
+  import.
+- **Dynamic imports with a resolvable literal** (`importlib.import_module("pkg.x")`,
+  `__import__("pkg.x")`) are resolved into a real import edge instead of being
+  treated as unresolvable. A computed argument (a variable, an f-string, a
+  package-relative literal) is unchanged from Phase 4.17: still a genuine
+  degradation, because it genuinely cannot be known statically. This is the
+  proportional policy Phase 4.17's report flagged as a follow-up: resolvability,
+  not file location (`tests/` vs elsewhere), decides whether a dynamic
+  construct counts as uncertainty. A resolvable literal in a test file no
+  longer degrades confidence; a computed import in a test file still does,
+  exactly as it would in production code.
+
+Every evidence type has a fixed, reviewable confidence value in
+`CONFIDENCE_BY_EVIDENCE_TYPE` (`direct_symbol_match` highest,
+`dynamic_import_unresolved` zero) - a lookup table, not a learned or adjustable
+score. This layer is purely additive: it can attach more explanation and, in
+the alias case, upgrade a tier the ladder already supported, but it never
+introduces a new way to reach a narrower scope than
+`recommend_validation_scope` already permits.
+
+### Evidence identity hardening
+
+`EvidenceLedger.find_reusable` gained four additional opt-in checks, each
+skipped entirely when the caller passes `None` (byte-identical Phase 4.17
+behaviour) and strict when a caller passes a real value:
+
+- `max_age_seconds` - rejects evidence older than a caller-given limit
+  (`REASON_STALE`); an unparseable/missing timestamp fails closed as stale.
+- `policy_fingerprint` - a digest of the settings that feed the decision
+  (`max_impact_depth`, `max_affected_tests`, `validation_confidence_threshold`,
+  `knowledge_graph_enabled`); a mismatch is `REASON_POLICY_MISMATCH`.
+- `executable_fingerprint` - a digest of what the *logical* command actually
+  resolves to right now (via `commands.resolve_executable`) plus the
+  interpreter version; a mismatch is `REASON_ENVIRONMENT_MISMATCH`.
+- `analyzer_version` - `SEMANTIC_ANALYZER_SCHEMA_VERSION`; a mismatch is
+  `REASON_ANALYZER_VERSION_MISMATCH`.
+
+Evidence recorded before these fields existed has an empty stored value for
+each, which can never equal a real one a caller supplies - upgrading a caller
+to check them therefore correctly invalidates every pre-upgrade evidence entry
+rather than silently grandfathering it in. The orchestrator's post-apply reuse
+path passes all four; nothing else in the codebase currently opts in to them
+(reuse itself remains off by default).
+
+### `ValidationDecisionEngine`
+
+`local_agent/validation_decision.py` is the one place the "which commands run,
+and which of those are satisfied by reused evidence" decision is made.
+`Orchestrator._semantic_targeted_commands` and `._apply_evidence_reuse`
+(previously two independent, hand-written implementations of overlapping
+logic) now both delegate to it. `ValidationDecisionEngine.decide()` returns a
+`ValidationDecision`: scope, a numeric confidence score alongside the existing
+level, the selected commands, one `ReuseAttempt` per considered command
+(reusable or not, with its reason), the scope reasons, and the uncertainty
+sources - fully serialisable for checkpointing. `apply_reuse()` is exposed
+separately so a caller with its own already-selected command list (for example
+one that also merged in lexical-heuristic commands the impact report never
+produced) can still route reuse through the same engine without re-deriving
+targets.
+
+### Limitations
+
+Attribute-based evidence (`service.calculate_total()`) still proves nothing
+about what `service` actually is - a same-named method on an unrelated class
+produces the same weak `attribute_resolution` evidence, deliberately ranked
+below every edge backed by a real import. `exec`/`eval` and a package-relative
+dynamic import (`importlib.import_module(".sub", package=...)`) are not
+resolved even when their arguments are literals, since the former can do
+anything and the latter would need the `package=` argument resolved too.
+Confidence values in `CONFIDENCE_BY_EVIDENCE_TYPE` are a fixed table set by
+inspection, not calibrated against real-world false-positive/negative rates -
+see "recommended next phase" below.
 
 ## Safety and current limitations
 

@@ -77,16 +77,16 @@ from .providers import (
 )
 from .repository import RepositoryIntelligence
 from .reviewer import DeliberativeReviewConsensus, Reviewer
-from .evidence import EvidenceLedger
+from .evidence import EvidenceLedger, compute_executable_fingerprint, compute_policy_fingerprint
 from .sandbox import CandidateWorkspace, CandidateWorkspaceError, ProspectiveValidator
 from .semantic_impact import (
+    SEMANTIC_ANALYZER_SCHEMA_VERSION,
     ChangeImpactReport,
     SemanticChangeImpactAnalyzer,
-    TIER_BROAD,
     apply_knowledge_support,
-    confidence_at_least,
 )
 from .test_synthesizer import BehavioralVerifier, TestSynthesizer, VerificationGapAnalyzer
+from .validation_decision import ValidationDecisionEngine
 from .tool_engine import IterationHistoryCompactor, ToolEngine, history_from_dict, history_to_dict
 from .tools import ToolRegistry
 from .validation import ValidationIntelligence
@@ -974,7 +974,37 @@ class Orchestrator:
             report=report,
         )
 
-    # -- Phase 4.17: semantic targeting and evidence reuse -----------------
+    # -- Phase 4.17/4.18: semantic targeting and evidence reuse -------------
+
+    def _decision_policy_fingerprint(self) -> str:
+        """Digest of the configuration that could change a scope/reuse decision.
+
+        Deliberately narrow: only settings that feed
+        :class:`~local_agent.validation_decision.ValidationDecisionEngine`
+        belong here. Changing any of them between when evidence was recorded
+        and a later reuse attempt means that attempt was evaluated under
+        different rules and must not silently reuse a conclusion reached under
+        the old ones.
+        """
+        return compute_policy_fingerprint({
+            "max_impact_depth": getattr(self.config, "max_impact_depth", 3),
+            "max_affected_symbols": getattr(self.config, "max_affected_symbols", 200),
+            "max_affected_tests": getattr(self.config, "max_affected_tests", 8),
+            "validation_confidence_threshold": getattr(
+                self.config, "validation_confidence_threshold", "high"
+            ),
+            "knowledge_graph_enabled": getattr(self.config, "knowledge_graph_enabled", False),
+        })
+
+    def _decision_engine(self, *, reuse_enabled: bool) -> ValidationDecisionEngine:
+        max_age = getattr(self.config, "evidence_max_age_seconds", 0) or 0
+        return ValidationDecisionEngine(
+            min_confidence=getattr(self.config, "validation_confidence_threshold", "high"),
+            reuse_enabled=reuse_enabled,
+            max_age_seconds=float(max_age) if max_age > 0 else None,
+            policy_fingerprint=self._decision_policy_fingerprint() if reuse_enabled else None,
+            analyzer_version=SEMANTIC_ANALYZER_SCHEMA_VERSION if reuse_enabled else None,
+        )
 
     def _semantic_targeted_commands(
         self,
@@ -996,6 +1026,12 @@ class Orchestrator:
            therefore only *add* targets, never justify narrowing.
         3. The pre-existing lexical commands, always retained unless the
            analysis reached at least the configured confidence threshold.
+
+        The actual narrow-vs-union decision is
+        :class:`~local_agent.validation_decision.ValidationDecisionEngine`'s -
+        this method's job is only to obtain the impact report and hand it over,
+        so that decision is made in exactly one place for both this post-apply
+        path and the Phase 4.16 candidate-time path.
 
         Returns the commands to run. On any failure it returns
         ``lexical_commands`` unchanged, so a defect here degrades to Phase 4.4
@@ -1037,55 +1073,16 @@ class Orchestrator:
 
         report.semantic_impact = impact.to_dict()
 
-        semantic_specs: list[CommandSpec] = []
-        seen: set[tuple[str, ...]] = set()
-        for target in impact.validation_targets:
-            if target.tier == TIER_BROAD:
-                continue
-            command = tuple(target.command)
-            if command in seen:
-                continue
-            if len(command) > 1 and not (self.config.project / command[-1]).is_file():
-                continue
-            seen.add(command)
-            semantic_specs.append(
-                CommandSpec(
-                    name=f"impact_{Path(target.path).stem or 'target'}",
-                    command=command,
-                    reason=target.selected_because,
-                    category="unit_test",
-                    risk="low",
-                    destructive=False,
-                )
-            )
-
-        threshold = getattr(self.config, "validation_confidence_threshold", "high")
-        narrow_allowed = (
-            confidence_at_least(impact.confidence, threshold)
-            and impact.recommended_scope == "targeted"
-            and bool(semantic_specs)
+        decision = self._decision_engine(reuse_enabled=False).decide(
+            impact, current_root=self.config.project, lexical_commands=lexical_commands,
         )
-        if narrow_allowed:
+        if decision.selected_commands:
             emit(
-                f"[5/7] Semantic impact: {impact.confidence.upper()} confidence, scope "
-                f"{impact.recommended_scope}; {len(semantic_specs)} targeted command(s) "
-                "selected from the dependency graph"
+                f"[5/7] Semantic impact: {decision.confidence_level.upper()} confidence, "
+                f"scope {decision.scope}; {len(decision.selected_commands)} targeted "
+                "command(s) selected"
             )
-            return semantic_specs
-
-        # Not confident enough to narrow: run the union. Uncertainty widens.
-        merged = list(semantic_specs)
-        for spec in lexical_commands:
-            if tuple(spec.command) not in seen:
-                seen.add(tuple(spec.command))
-                merged.append(spec)
-        if merged:
-            emit(
-                f"[5/7] Semantic impact: {impact.confidence.upper()} confidence, scope "
-                f"{impact.recommended_scope}; running {len(merged)} targeted command(s) "
-                "(graph-selected plus filename heuristics)"
-            )
-        return merged
+        return decision.selected_commands
 
     def _apply_evidence_reuse(
         self,
@@ -1095,16 +1092,21 @@ class Orchestrator:
     ) -> list[CommandSpec]:
         """Drop targeted commands whose candidate evidence provably still holds.
 
-        A command is dropped only when :meth:`EvidenceLedger.find_reusable`
+        A command is dropped only when
+        :meth:`~local_agent.validation_decision.ValidationDecisionEngine.apply_reuse`
+        (via :meth:`~local_agent.evidence.EvidenceLedger.find_reusable`)
         confirms *every* assumption: identical command vector, a recorded pass,
         identical relevant file and symbol sets, an impact confidence meeting
-        the configured threshold, and a byte-identical content fingerprint over
-        those files recomputed against the authoritative tree right now.
+        the configured threshold, a policy fingerprint matching the
+        configuration currently in effect, an executable fingerprint matching
+        what the command would actually run under right now, a matching
+        analyzer schema version, and a byte-identical content fingerprint over
+        the relevant files recomputed against the authoritative tree right now.
 
         This can never skip validation overall: the mandatory full-suite
         ``validation_plan`` run happens immediately afterwards regardless. What
         it removes is only the duplicated *targeted* execution of a command that
-        already ran, against byte-identical inputs, minutes earlier.
+        already ran, against provably-identical inputs, minutes earlier.
         """
         if not getattr(self.config, "reuse_candidate_validation_evidence", False):
             return targeted_commands
@@ -1115,49 +1117,30 @@ class Orchestrator:
 
         ledger = EvidenceLedger.from_dict({"entries": raw_evidence})
         impact_dict = getattr(report, "semantic_impact", None) or {}
-        symbols = sorted(
-            {
-                str(symbol.get("qualified_name", ""))
-                for key in ("added_symbols", "removed_symbols", "modified_symbols")
-                for symbol in (impact_dict.get(key) or [])
-                if isinstance(symbol, dict) and symbol.get("qualified_name")
-            }
-        )
-        affected = set(impact_dict.get("affected_files") or [])
-        threshold = getattr(self.config, "validation_confidence_threshold", "high")
+        impact = ChangeImpactReport.from_dict(impact_dict) if impact_dict else ChangeImpactReport()
+        if not impact.changed_files:
+            impact.changed_files = list(report.changed_files)
 
-        remaining: list[CommandSpec] = []
-        reused = 0
-        saved = 0.0
-        base_relevant = set(report.changed_files) | affected
-        for spec in targeted_commands:
-            command = tuple(spec.command)
-            relevant = set(base_relevant)
-            tail = command[-1] if len(command) > 1 else ""
-            if tail.endswith(".py"):
-                relevant.add(tail.replace("\\", "/"))
-            decision = ledger.find_reusable(
-                command=command,
-                current_root=self.config.project,
-                relevant_files=sorted(relevant),
-                relevant_symbols=symbols,
-                min_confidence=threshold,
-                enabled=True,
-            )
-            if decision.reusable and decision.evidence is not None:
-                reused += 1
-                saved += decision.time_saved_seconds
-                report.validation_evidence.append(decision.evidence.to_dict())
+        remaining, attempts, saved = self._decision_engine(reuse_enabled=True).apply_reuse(
+            targeted_commands,
+            impact,
+            self.config.project,
+            ledger,
+            executable_fingerprint_of=compute_executable_fingerprint,
+        )
+        reused = sum(1 for attempt in attempts if attempt.reusable)
+        for attempt in attempts:
+            if attempt.reusable and attempt.evidence is not None:
+                report.validation_evidence.append(attempt.evidence)
                 LOGGER.info(
                     "Reusing candidate validation evidence for '%s' (%s)",
-                    spec.display(), decision.reason,
+                    " ".join(attempt.command), attempt.reason,
                 )
-                continue
-            LOGGER.debug(
-                "Candidate evidence for '%s' not reusable: %s",
-                spec.display(), decision.reason,
-            )
-            remaining.append(spec)
+            elif not attempt.reusable:
+                LOGGER.debug(
+                    "Candidate evidence for '%s' not reusable: %s",
+                    " ".join(attempt.command), attempt.reason,
+                )
 
         if reused:
             emit(

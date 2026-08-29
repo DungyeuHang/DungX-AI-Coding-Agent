@@ -110,6 +110,11 @@ class PythonFileFacts:
     #: Identifiers referenced specifically in a type annotation (parameter,
     #: return type, or ``x: SomeType`` variable annotation).
     annotation_references: frozenset[str] = frozenset()
+    #: Identifiers referenced through ``obj.name`` attribute access - a subset
+    #: of ``references``, kept separately because it is weaker evidence: it
+    #: proves nothing about what ``obj`` actually is (see ``ATTRIBUTE_RESOLUTION``
+    #: in :mod:`local_agent.dependency_resolution`).
+    attribute_references: frozenset[str] = frozenset()
 
     @property
     def module_import_names(self) -> list[str]:
@@ -216,6 +221,7 @@ class AstPythonIndexer:
             base_class_references=frozenset(collector.base_class_references),
             decorator_references=frozenset(collector.decorator_references),
             annotation_references=frozenset(collector.annotation_references),
+            attribute_references=frozenset(collector.attribute_references),
         )
 
 
@@ -233,6 +239,7 @@ class _FactCollector:
         self.base_class_references: set[str] = set()
         self.decorator_references: set[str] = set()
         self.annotation_references: set[str] = set()
+        self.attribute_references: set[str] = set()
 
     # -- entry point -------------------------------------------------------
 
@@ -367,6 +374,7 @@ class _FactCollector:
             # ``mod.symbol`` -> record ``symbol`` so a qualified call still
             # counts as a reference to the changed symbol.
             self.references.add(node.attr)
+            self.attribute_references.add(node.attr)
 
     def _collect_import(self, node: ast.AST) -> None:
         if isinstance(node, ast.Import):
