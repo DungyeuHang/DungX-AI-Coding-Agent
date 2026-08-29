@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from local_agent.coding_agent import CodingAgent, InteractiveCodingAgent
+from local_agent.commands import CommandRunner, resolve_executable
 from local_agent.config import AgentConfig, add_common_arguments, config_from_args
 from local_agent.evidence import (
     DEFAULT_MAX_EVIDENCE_ENTRIES,
@@ -55,6 +56,7 @@ from local_agent.indexing.ast_python_indexer import (
     qualified_name,
 )
 from local_agent.models import (
+    CommandSpec,
     FileOperation,
     ImplementationResult,
     Plan,
@@ -65,7 +67,12 @@ from local_agent.models import (
     SemanticIndex,
 )
 from local_agent.providers import AIProvider
-from local_agent.sandbox import CandidateWorkspace, ProspectiveValidator
+from local_agent.sandbox import (
+    CandidateCommandResult,
+    CandidateValidationReport,
+    CandidateWorkspace,
+    ProspectiveValidator,
+)
 from local_agent.semantic_impact import (
     AMBIGUOUS_SYMBOL_DEFINITION_FILES,
     CHANGE_ADDED,
@@ -97,8 +104,10 @@ from local_agent.semantic_impact import (
     confidence_at_least,
     diff_python_symbols,
     escalate_scope,
+    escapes_root,
     looks_like_test_path,
     module_name_for,
+    normalize_relative,
     recommend_validation_scope,
 )
 from local_agent.storage import JsonFileStorage
@@ -242,15 +251,18 @@ TEST_UNRELATED_PY = textwrap.dedent(
 ).lstrip()
 
 # References ``compute_widget_total`` by bare name without importing pkg.core,
-# which is exactly the ``call_graph_match`` situation.
+# which is exactly the ``call_graph_match`` situation: the name is distinctive
+# enough to be evidence, but no import edge corroborates it.
+# A dynamic import is the realistic reason a real test can reference a symbol
+# with no statically resolvable import edge to the module defining it.
 TEST_REFERENCE_ONLY_PY = textwrap.dedent(
     """
-    def compute_widget_total_stub(values):
-        return sum(values)
+    import importlib
 
 
     def test_reference():
-        assert compute_widget_total_stub([1, 2]) == 3
+        module = importlib.import_module("pkg.core")
+        assert module.compute_widget_total([1, 2]) == 3
     """
 ).lstrip()
 
@@ -1871,7 +1883,7 @@ class TestProspectiveValidatorIntegration(ProjectCase):
 
     def test_base_contents_returns_pre_change_text(self):
         ws = self.workspace().setup()
-        ws.rebuild([FileOperation("update", "pkg/widget.py", "def render():\n    return 'x'\n")], self.plan("pkg/widget.py"))
+        ws.rebuild([FileOperation("modify", "pkg/widget.py", "def render():\n    return 'x'\n")], self.plan("pkg/widget.py"))
         contents = ws.base_contents(["pkg/widget.py"])
         self.assertEqual(contents["pkg/widget.py"], WIDGET_PY)
 
@@ -1887,7 +1899,7 @@ class TestProspectiveValidatorIntegration(ProjectCase):
     def test_semantic_targeting_produces_explained_commands(self):
         ws = self.workspace().setup()
         changed = ws.rebuild(
-            [FileOperation("update", "pkg/core.py", CORE_PY.replace("return 41", "return 40"))],
+            [FileOperation("modify", "pkg/core.py", CORE_PY.replace("return 41", "return 40"))],
             self.plan("pkg/core.py"),
         )
         validator = ProspectiveValidator(semantic_impact_enabled=True)
@@ -1899,7 +1911,7 @@ class TestProspectiveValidatorIntegration(ProjectCase):
     def test_semantic_targeting_runs_real_subprocesses(self):
         ws = self.workspace().setup()
         changed = ws.rebuild(
-            [FileOperation("update", "pkg/core.py", CORE_PY.replace("return _bootstrap() + 1", "return _bootstrap() + 2"))],
+            [FileOperation("modify", "pkg/core.py", CORE_PY.replace("return _bootstrap() + 1", "return _bootstrap() + 2"))],
             self.plan("pkg/core.py"),
         )
         validator = ProspectiveValidator(semantic_impact_enabled=True, enable_static_analysis=False)
@@ -1912,7 +1924,7 @@ class TestProspectiveValidatorIntegration(ProjectCase):
     def test_correct_change_passes_real_validation(self):
         ws = self.workspace().setup()
         changed = ws.rebuild(
-            [FileOperation("update", "pkg/widget.py", "def render():\n    return 'widget2'\n")],
+            [FileOperation("modify", "pkg/widget.py", "def render():\n    return 'widget2'\n")],
             self.plan("pkg/widget.py"),
         )
         validator = ProspectiveValidator(semantic_impact_enabled=True, enable_static_analysis=False)
@@ -1922,7 +1934,7 @@ class TestProspectiveValidatorIntegration(ProjectCase):
     def test_disabled_semantic_analysis_keeps_phase_416_behaviour(self):
         ws = self.workspace().setup()
         changed = ws.rebuild(
-            [FileOperation("update", "pkg/core.py", CORE_PY.replace("return 41", "return 40"))],
+            [FileOperation("modify", "pkg/core.py", CORE_PY.replace("return 41", "return 40"))],
             self.plan("pkg/core.py"),
         )
         validator = ProspectiveValidator(semantic_impact_enabled=False)
@@ -1940,7 +1952,7 @@ class TestProspectiveValidatorIntegration(ProjectCase):
         before = self.snapshot()
         ws = self.workspace().setup()
         changed = ws.rebuild(
-            [FileOperation("update", "pkg/core.py", CORE_PY.replace("return 41", "return 40"))],
+            [FileOperation("modify", "pkg/core.py", CORE_PY.replace("return 41", "return 40"))],
             self.plan("pkg/core.py"),
         )
         ProspectiveValidator(semantic_impact_enabled=True).validate(ws, changed, None)
@@ -1967,7 +1979,7 @@ class TestProspectiveValidatorIntegration(ProjectCase):
     def test_impact_analysis_failure_falls_back_to_lexical_not_to_nothing(self):
         ws = self.workspace().setup()
         changed = ws.rebuild(
-            [FileOperation("update", "pkg/widget.py", "def render():\n    return 'w2'\n")],
+            [FileOperation("modify", "pkg/widget.py", "def render():\n    return 'w2'\n")],
             self.plan("pkg/widget.py"),
         )
         validator = ProspectiveValidator(semantic_impact_enabled=True, enable_static_analysis=False)
@@ -2141,6 +2153,380 @@ class TestAdversarialInputs(ProjectCase):
 
 
 # ===========================================================================
+# 16b. Regression tests for defects found while completing Phase 4.17
+# ===========================================================================
+
+
+class TestContainerSymbolGranularity(unittest.TestCase):
+    """A class's hash must cover only the lines it owns directly.
+
+    Regression: the class span originally included its methods' bodies, so a
+    one-method edit reported both ``A.m`` *and* ``A`` as modified. That inflated
+    the changed-symbol set, which in turn inflated the reference-matching surface
+    and the reported public-API impact.
+    """
+
+    def diff(self, base: str, new: str):
+        changes, error = diff_python_symbols(base, new, "m.py")
+        self.assertEqual(error, "")
+        return {(c.qualified_name, c.change) for c in changes}
+
+    def test_method_body_edit_reports_only_the_method(self):
+        base = "class A:\n    def m(self):\n        return 1\n"
+        new = "class A:\n    def m(self):\n        return 2\n"
+        self.assertEqual(self.diff(base, new), {("A.m", CHANGE_MODIFIED)})
+
+    def test_class_attribute_edit_reports_only_the_class(self):
+        base = "class A:\n    LIMIT = 1\n\n    def m(self):\n        return 1\n"
+        new = "class A:\n    LIMIT = 2\n\n    def m(self):\n        return 1\n"
+        self.assertEqual(self.diff(base, new), {("A", CHANGE_MODIFIED)})
+
+    def test_base_class_change_reports_only_the_class(self):
+        base = "class A(dict):\n    def m(self):\n        return 1\n"
+        new = "class A(list):\n    def m(self):\n        return 1\n"
+        self.assertEqual(self.diff(base, new), {("A", CHANGE_MODIFIED)})
+
+    def test_editing_both_class_and_method_reports_both(self):
+        base = "class A:\n    LIMIT = 1\n\n    def m(self):\n        return 1\n"
+        new = "class A:\n    LIMIT = 2\n\n    def m(self):\n        return 2\n"
+        self.assertEqual(
+            self.diff(base, new), {("A", CHANGE_MODIFIED), ("A.m", CHANGE_MODIFIED)}
+        )
+
+    def test_adding_a_method_does_not_mark_the_class_modified(self):
+        base = "class A:\n    def m(self):\n        return 1\n"
+        new = "class A:\n    def m(self):\n        return 1\n\n    def n(self):\n        return 2\n"
+        self.assertEqual(self.diff(base, new), {("A.n", CHANGE_ADDED)})
+
+    def test_removing_a_method_does_not_mark_the_class_modified(self):
+        base = "class A:\n    def m(self):\n        return 1\n\n    def n(self):\n        return 2\n"
+        new = "class A:\n    def m(self):\n        return 1\n"
+        self.assertEqual(self.diff(base, new), {("A.n", CHANGE_REMOVED)})
+
+    def test_method_decorator_edit_is_attributed_to_the_method(self):
+        # ``ast`` puts lineno on the ``def``, not the decorator, so without a
+        # decorator-inclusive extent this would be attributed to the class.
+        base = "class A:\n    @property\n    def m(self):\n        return 1\n"
+        new = "class A:\n    @staticmethod\n    def m(self):\n        return 1\n"
+        self.assertEqual(self.diff(base, new), {("A.m", CHANGE_MODIFIED)})
+
+    def test_class_decorator_edit_is_attributed_to_the_class(self):
+        base = "@final\nclass A:\n    def m(self):\n        return 1\n"
+        new = "@runtime\nclass A:\n    def m(self):\n        return 1\n"
+        self.assertEqual(self.diff(base, new), {("A", CHANGE_MODIFIED)})
+
+    def test_nested_class_method_edit_is_attributed_to_that_method(self):
+        base = "class Outer:\n    class Inner:\n        def m(self):\n            return 1\n"
+        new = "class Outer:\n    class Inner:\n        def m(self):\n            return 2\n"
+        self.assertEqual(self.diff(base, new), {("Inner.m", CHANGE_MODIFIED)})
+
+    def test_type_checking_guard_edit_is_attributed_to_the_class(self):
+        base = "class A:\n    if FLAG:\n        def m(self):\n            return 1\n"
+        new = "class A:\n    if OTHER:\n        def m(self):\n            return 1\n"
+        self.assertEqual(self.diff(base, new), {("A", CHANGE_MODIFIED)})
+
+    def test_reformatting_inside_a_method_is_still_not_a_change(self):
+        base = "class A:\n    def m(self):\n        return 1\n"
+        new = "class A:\n\n    def m(self):\n\n        return 1\n   \n"
+        self.assertEqual(self.diff(base, new), set())
+
+    def test_symbol_location_still_points_at_the_def_line_not_the_decorator(self):
+        # The decorator-inclusive extent is used only for hashing; SymbolLocation
+        # keeps the ``def`` line, which is what existing consumers expect.
+        source = "@deco\ndef f():\n    return 1\n"
+        facts = AstPythonIndexer().analyze(source)
+        symbol = facts.symbols[0]
+        self.assertEqual(symbol.location.start_line, 2)
+        self.assertTrue(
+            source.splitlines()[symbol.location.start_line - 1].startswith("def f")
+        )
+
+    def test_module_level_function_decorator_edit_is_detected(self):
+        base = "@deco_one\ndef f():\n    return 1\n"
+        new = "@deco_two\ndef f():\n    return 1\n"
+        self.assertEqual(self.diff(base, new), {("f", CHANGE_MODIFIED)})
+
+
+class TestPathNormalisationSafety(unittest.TestCase):
+    """Regression: ``lstrip('./')`` mangled leading dots and ``..`` segments.
+
+    Rewriting ``../../../etc/passwd`` into ``etc/passwd`` turned an out-of-tree
+    path into a plausible in-tree one, and ``.github/x.yml`` lost its directory.
+    """
+
+    def test_traversal_segments_are_preserved(self):
+        self.assertEqual(normalize_relative("../../../etc/passwd"), "../../../etc/passwd")
+
+    def test_dot_directory_is_preserved(self):
+        self.assertEqual(
+            normalize_relative(".github/workflows/ci.yml"), ".github/workflows/ci.yml"
+        )
+
+    def test_leading_dot_slash_is_folded(self):
+        self.assertEqual(normalize_relative("./pkg/core.py"), "pkg/core.py")
+
+    def test_repeated_leading_dot_slash_is_folded(self):
+        self.assertEqual(normalize_relative("././pkg/core.py"), "pkg/core.py")
+
+    def test_windows_separators_are_converted(self):
+        self.assertEqual(normalize_relative("pkg\\sub\\core.py"), "pkg/sub/core.py")
+
+    def test_escapes_root_detects_parent_segment(self):
+        self.assertTrue(escapes_root("../outside.py"))
+        self.assertTrue(escapes_root("pkg/../../outside.py"))
+
+    def test_escapes_root_detects_absolute_and_drive_paths(self):
+        self.assertTrue(escapes_root("/etc/passwd"))
+        self.assertTrue(escapes_root("C:/Windows/system32"))
+        self.assertTrue(escapes_root("C:\\Windows\\system32"))
+
+    def test_escapes_root_allows_ordinary_relative_paths(self):
+        self.assertFalse(escapes_root("pkg/core.py"))
+        self.assertFalse(escapes_root(".github/ci.yml"))
+
+    def test_dotdot_inside_a_filename_is_not_traversal(self):
+        self.assertFalse(escapes_root("pkg/we..ird.py"))
+
+
+class TestEscapingPathsAreNeverRead(ProjectCase):
+    """An escaping path must be rejected, not joined onto the root."""
+
+    def test_traversal_py_path_is_unsupported_and_not_analysed(self):
+        outside = self.root.parent / "p417_outside.py"
+        outside.write_text("def leaked():\n    return 1\n", encoding="utf-8")
+        self.addCleanup(outside.unlink, True)
+        relative = f"../{outside.name}"
+        report = self.analyzer().analyze([relative], base_contents={relative: None})
+        self.assertIn(relative, report.unsupported_files)
+        # Nothing outside the root was parsed.
+        self.assertEqual(report.added_symbols, [])
+        self.assertNotIn("leaked", report.changed_symbol_names)
+        self.assertEqual(report.recommended_scope, SCOPE_BROAD)
+
+    def test_absolute_path_is_unsupported(self):
+        absolute = (self.root / "pkg" / "core.py").as_posix()
+        report = self.analyzer().analyze([absolute], base_contents={absolute: None})
+        self.assertEqual(report.added_symbols, [])
+        self.assertEqual(report.recommended_scope, SCOPE_BROAD)
+
+
+class TestExecutableResolution(unittest.TestCase):
+    """Regression: a bare ``python``/``pytest`` name that is not on PATH made
+    every validation command return 127, which counts as *skipped*, which counts
+    as *succeeded* - so validation reported success having executed nothing."""
+
+    def test_python_falls_back_to_the_running_interpreter(self):
+        argv, note = resolve_executable(("python", "-c", "print(1)"))
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(argv[1:], ("-c", "print(1)"))
+        self.assertTrue(note)
+
+    def test_python3_also_falls_back(self):
+        argv, _ = resolve_executable(("python3", "-V"))
+        self.assertEqual(argv[0], sys.executable)
+
+    def test_pytest_falls_back_to_dash_m_pytest(self):
+        argv, note = resolve_executable(("pytest", "tests/test_x.py"))
+        if shutil.which("pytest") is not None:
+            self.assertEqual(argv, ("pytest", "tests/test_x.py"))
+            return
+        self.assertEqual(argv[:3], (sys.executable, "-m", "pytest"))
+        self.assertEqual(argv[3:], ("tests/test_x.py",))
+        self.assertIn("pytest", note)
+
+    def test_an_executable_present_on_path_is_left_alone(self):
+        argv, note = resolve_executable((sys.executable, "-V"))
+        self.assertEqual(argv, (sys.executable, "-V"))
+        self.assertEqual(note, "")
+
+    def test_genuinely_unknown_executable_is_not_rewritten(self):
+        argv, note = resolve_executable(("definitely-not-installed-xyz", "--help"))
+        self.assertEqual(argv, ("definitely-not-installed-xyz", "--help"))
+        self.assertEqual(note, "")
+
+    def test_empty_command_is_handled(self):
+        self.assertEqual(resolve_executable(()), ((), ""))
+
+    def test_runner_actually_executes_a_python_command(self):
+        root = Path(tempfile.mkdtemp(prefix="p417_run_"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        runner = CommandRunner(root, timeout_seconds=120)
+        result = runner.run(
+            CommandSpec(
+                name="probe",
+                command=("python", "-c", "print('probe-ok')"),
+                reason="regression probe",
+                category="unit_test",
+                risk="low",
+            )
+        )
+        self.assertEqual(result.exit_code, 0, result.stderr)
+        self.assertIn("probe-ok", result.stdout)
+
+    def test_missing_executable_still_reports_127(self):
+        root = Path(tempfile.mkdtemp(prefix="p417_run_"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        runner = CommandRunner(root, timeout_seconds=30)
+        result = runner.run(
+            CommandSpec(
+                name="probe",
+                command=("definitely-not-installed-xyz",),
+                reason="regression probe",
+                category="unit_test",
+                risk="low",
+            )
+        )
+        self.assertEqual(result.exit_code, 127)
+        self.assertIn("executable not found", result.stderr)
+
+
+class TestBaseSnapshotNewlineNormalisation(ProjectCase):
+    """Regression: BASE was decoded verbatim while the candidate side was read
+    with universal newlines, so on a CRLF checkout every line looked changed."""
+
+    def workspace(self) -> CandidateWorkspace:
+        workspace = CandidateWorkspace(self.root)
+        self.addCleanup(workspace.cleanup)
+        return workspace
+
+    def plan(self, *paths: str) -> Plan:
+        return Plan(
+            objective="o",
+            files_to_inspect=list(paths),
+            files_likely_to_change=list(paths),
+            files_likely_to_create=[],
+            steps=["edit"],
+            validation_strategy=["pytest"],
+            risks=[],
+        )
+
+    def test_crlf_base_file_is_reported_with_lf(self):
+        (self.root / "pkg" / "crlf.py").write_bytes(b"def f():\r\n    return 1\r\n")
+        ws = self.workspace().setup()
+        ws.rebuild(
+            [FileOperation("modify", "pkg/crlf.py", "def f():\n    return 2\n")],
+            self.plan("pkg/crlf.py"),
+        )
+        contents = ws.base_contents(["pkg/crlf.py"])
+        self.assertEqual(contents["pkg/crlf.py"], "def f():\n    return 1\n")
+
+    def test_crlf_only_rewrite_produces_no_symbol_changes(self):
+        # Rewriting the same source with different line endings must not be
+        # reported as a semantic change.
+        (self.root / "pkg" / "crlf.py").write_bytes(b"def f():\r\n    return 1\r\n")
+        ws = self.workspace().setup()
+        ws.rebuild(
+            [FileOperation("modify", "pkg/crlf.py", "def f():\n    return 1\n")],
+            self.plan("pkg/crlf.py"),
+        )
+        base = ws.base_contents(["pkg/crlf.py"])
+        report = SemanticChangeImpactAnalyzer(ws.root).analyze(
+            ["pkg/crlf.py"], base_contents=base
+        )
+        self.assertEqual(report.modified_symbols, [])
+        self.assertEqual(report.added_symbols, [])
+        self.assertEqual(report.removed_symbols, [])
+
+    def test_diff_is_empty_for_a_crlf_only_rewrite(self):
+        (self.root / "pkg" / "crlf.py").write_bytes(b"def f():\r\n    return 1\r\n")
+        ws = self.workspace().setup()
+        ws.rebuild(
+            [FileOperation("modify", "pkg/crlf.py", "def f():\n    return 1\n")],
+            self.plan("pkg/crlf.py"),
+        )
+        self.assertEqual(ws.diff().strip(), "")
+
+
+class TestNoTestEvidenceIsReportedHonestly(ProjectCase):
+    """``passed`` alone must not be read as "the tests passed"."""
+
+    def report_with(self, results: list[CandidateCommandResult]) -> CandidateValidationReport:
+        report = CandidateValidationReport(changed_files=["pkg/core.py"])
+        report.results = results
+        report.tiers_run = sorted({r.tier for r in results})
+        return report
+
+    def result(self, *, tier: str, skipped: bool, exit_code: int = 0):
+        return CandidateCommandResult(
+            name="c",
+            command=("pytest", "tests/test_core.py"),
+            tier=tier,
+            exit_code=exit_code,
+            skipped=skipped,
+            skip_reason="executable not found: pytest" if skipped else "",
+        )
+
+    def test_executed_test_command_counts_as_evidence(self):
+        report = self.report_with([self.result(tier="targeted_tests", skipped=False)])
+        self.assertTrue(report.has_test_evidence)
+
+    def test_skipped_test_command_is_not_evidence(self):
+        report = self.report_with([self.result(tier="targeted_tests", skipped=True)])
+        self.assertTrue(report.passed)
+        self.assertFalse(report.has_test_evidence)
+
+    def test_syntax_tier_alone_is_not_test_evidence(self):
+        report = self.report_with([self.result(tier="syntax", skipped=False)])
+        self.assertFalse(report.has_test_evidence)
+
+    def test_feedback_states_that_nothing_ran(self):
+        report = self.report_with([self.result(tier="targeted_tests", skipped=True)])
+        feedback = report.render_feedback()
+        self.assertIn("PASSED", feedback)
+        self.assertIn("no test command actually executed", feedback)
+
+    def test_feedback_omits_the_note_when_tests_really_ran(self):
+        report = self.report_with([self.result(tier="targeted_tests", skipped=False)])
+        self.assertNotIn("no test command actually executed", report.render_feedback())
+
+    def test_has_test_evidence_is_serialised(self):
+        report = self.report_with([self.result(tier="targeted_tests", skipped=True)])
+        self.assertIs(report.to_dict()["has_test_evidence"], False)
+
+    def test_corrupted_confidence_value_fails_safe(self):
+        # A checkpoint written by a future/older version could carry a confidence
+        # string this build does not know. It must deny reuse and widen scope,
+        # never be treated as strong evidence.
+        self.assertFalse(confidence_at_least("bogus", CONFIDENCE_LOW))
+        self.assertEqual(escalate_scope(SCOPE_TARGETED, "bogus"), SCOPE_BROAD)
+
+        ledger = EvidenceLedger()
+        ledger.record(
+            command=("pytest", "tests/test_core.py"),
+            status=STATUS_PASSED,
+            impacted_files=["pkg/core.py"],
+            confidence="bogus",
+            fingerprint=compute_state_fingerprint(self.root, ["pkg/core.py"]),
+        )
+        decision = ledger.find_reusable(
+            command=("pytest", "tests/test_core.py"),
+            current_root=self.root,
+            relevant_files=["pkg/core.py"],
+            min_confidence=CONFIDENCE_LOW,
+        )
+        self.assertFalse(decision.reusable)
+        self.assertEqual(decision.reason, REASON_CONFIDENCE_TOO_LOW)
+
+    def test_skipped_evidence_can_never_be_reused(self):
+        ledger = EvidenceLedger()
+        ledger.record(
+            command=("pytest", "tests/test_core.py"),
+            status=STATUS_SKIPPED,
+            impacted_files=["pkg/core.py"],
+            confidence=CONFIDENCE_HIGH,
+            fingerprint=compute_state_fingerprint(self.root, ["pkg/core.py"]),
+        )
+        decision = ledger.find_reusable(
+            command=("pytest", "tests/test_core.py"),
+            current_root=self.root,
+            relevant_files=["pkg/core.py"],
+            min_confidence=CONFIDENCE_LOW,
+        )
+        self.assertFalse(decision.reusable)
+        self.assertEqual(decision.reason, REASON_NOT_PASSED)
+
+
+# ===========================================================================
 # 17. True end-to-end pipeline (only the provider is mocked)
 # ===========================================================================
 
@@ -2232,8 +2618,8 @@ class TestEndToEndPipeline(ProjectCase):
 
     def test_full_loop_bad_candidate_then_good_candidate(self):
         # tests/test_core.py asserts Engine().start() == 42.
-        bad = [FileOperation("update", "pkg/core.py", CORE_PY.replace("return 41", "return 1"))]
-        good = [FileOperation("update", "pkg/core.py", CORE_PY.replace("return 41", "return 41"))]
+        bad = [FileOperation("modify", "pkg/core.py", CORE_PY.replace("return 41", "return 1"))]
+        good = [FileOperation("modify", "pkg/core.py", CORE_PY.replace("return 41", "return 41"))]
         agent, provider, _ = self.make_agent([bad, good], max_candidate_iterations=2)
         before = self.snapshot()
 
@@ -2274,7 +2660,7 @@ class TestEndToEndPipeline(ProjectCase):
         self.assertIsNotNone(result.file_operations)
 
     def test_evidence_is_reusable_after_applying_the_validated_operations(self):
-        good = [FileOperation("update", "pkg/widget.py", "def render():\n    return 'widget2'\n")]
+        good = [FileOperation("modify", "pkg/widget.py", "def render():\n    return 'widget2'\n")]
         agent, provider, filesystem = self.make_agent([good])
         result = agent.execute(
             provider=provider,
@@ -2307,7 +2693,7 @@ class TestEndToEndPipeline(ProjectCase):
         self.assertEqual(decision.reason, REASON_OK)
 
     def test_evidence_is_invalidated_when_the_applied_tree_diverges(self):
-        good = [FileOperation("update", "pkg/widget.py", "def render():\n    return 'widget2'\n")]
+        good = [FileOperation("modify", "pkg/widget.py", "def render():\n    return 'widget2'\n")]
         agent, provider, filesystem = self.make_agent([good])
         result = agent.execute(
             provider=provider,
@@ -2341,7 +2727,7 @@ class TestEndToEndPipeline(ProjectCase):
 
     def test_mode_c_without_semantic_analysis_still_works(self):
         """Phase 4.16 mode C must be unaffected by Phase 4.17."""
-        good = [FileOperation("update", "pkg/widget.py", "def render():\n    return 'widget2'\n")]
+        good = [FileOperation("modify", "pkg/widget.py", "def render():\n    return 'widget2'\n")]
         filesystem = ProjectFilesystem(self.root)
         workspace = CandidateWorkspace(self.root)
         self.workspaces.append(workspace)
@@ -2364,7 +2750,7 @@ class TestEndToEndPipeline(ProjectCase):
 
     def test_mode_b_without_prospective_validation_still_works(self):
         """Phase 4.15 mode B: no sandbox at all, so no impact analysis."""
-        good = [FileOperation("update", "pkg/widget.py", "def render():\n    return 'widget2'\n")]
+        good = [FileOperation("modify", "pkg/widget.py", "def render():\n    return 'widget2'\n")]
         filesystem = ProjectFilesystem(self.root)
         agent = InteractiveCodingAgent(
             filesystem=filesystem,

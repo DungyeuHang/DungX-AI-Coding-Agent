@@ -188,8 +188,36 @@ def module_name_for(relative_path: str) -> str | None:
 
 
 def normalize_relative(path: str) -> str:
-    """Repo-relative POSIX form, with Windows separators and ``./`` folded away."""
-    return Path(str(path).replace("\\", "/")).as_posix().lstrip("./") or str(path)
+    """Repo-relative POSIX form, with Windows separators and ``./`` folded away.
+
+    Traversal (``..``) and absolute components are deliberately **preserved**.
+    An escaping path must stay recognisable so :func:`escapes_root` can reject
+    it; silently rewriting ``../../../etc/passwd`` into the innocuous-looking
+    ``etc/passwd`` would turn an out-of-tree read into an in-tree one. Leading
+    dots are likewise preserved, so ``.github/workflows/ci.yml`` keeps its
+    directory instead of becoming ``github/workflows/ci.yml``.
+    """
+    text = str(path).replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    if not text:
+        return str(path)
+    return Path(text).as_posix()
+
+
+def escapes_root(relative: str) -> bool:
+    """Whether ``relative`` could resolve outside the tree it is joined to.
+
+    Absolute paths, drive-qualified paths and any ``..`` component all qualify.
+    Callers must treat such a path as *unsupported* rather than analysing it -
+    the analyzer only ever reads inside the root it was given.
+    """
+    text = str(relative).replace("\\", "/")
+    if not text or text.startswith("/"):
+        return True
+    if len(text) > 1 and text[1] == ":":
+        return True
+    return ".." in [part for part in text.split("/") if part]
 
 
 # -- structured results -------------------------------------------------------
@@ -1204,6 +1232,15 @@ class SemanticChangeImpactAnalyzer:
     ) -> None:
         indexer = AstPythonIndexer()
         for relative in changed_files:
+            if escapes_root(relative):
+                # Never join an escaping path onto the root: record it as
+                # unsupported (which forces LOW confidence and a BROAD scope)
+                # and read nothing.
+                report.unsupported_files.append(relative)
+                evidence.degradations.append(
+                    f"'{relative}' points outside the analysed tree and was not read"
+                )
+                continue
             if not is_python_path(relative):
                 report.unsupported_files.append(relative)
                 evidence.degradations.append(
@@ -1254,6 +1291,11 @@ class SemanticChangeImpactAnalyzer:
         report.public_api_symbols = sorted(set(report.public_api_symbols))
 
     def _read(self, relative: str) -> str | None:
+        # Defence in depth: callers already filter escaping paths, but this is
+        # the only place the analyzer touches the filesystem, so the guard lives
+        # here too rather than relying on every caller remembering it.
+        if escapes_root(relative):
+            return None
         candidate = self.root / relative
         try:
             if not candidate.is_file():
@@ -1271,7 +1313,10 @@ class SemanticChangeImpactAnalyzer:
         graph: SemanticGraph,
         changed_files: list[str],
     ) -> None:
-        seeds = [path for path in changed_files if is_python_path(path)]
+        seeds = [
+            path for path in changed_files
+            if is_python_path(path) and not escapes_root(path)
+        ]
         dependents, bounds_hit = graph.reverse_dependents(
             seeds,
             max_depth=self.max_impact_depth,
@@ -1352,7 +1397,10 @@ class SemanticChangeImpactAnalyzer:
            heuristics find, reused rather than reimplemented;
         7. ``broad_fallback``       - nothing associated; run the whole suite.
         """
-        changed_set = {path for path in changed_files if is_python_path(path)}
+        changed_set = {
+            path for path in changed_files
+            if is_python_path(path) and not escapes_root(path)
+        }
         changed_names = report.changed_symbol_names
         affected_set = set(report.affected_files)
         affected_depths = {s.file: s.depth for s in report.affected_symbols}
@@ -1547,6 +1595,12 @@ class SemanticChangeImpactAnalyzer:
             if len(command) < 2:
                 continue
             path = normalize_relative(command[-1])
+            if escapes_root(path):
+                # A lexical heuristic should never hand back an out-of-tree
+                # path, but a target is a command that will really be executed,
+                # so it is checked rather than assumed.
+                LOGGER.debug("Ignoring out-of-tree lexical validation target %r", path)
+                continue
             if path in targets:
                 # Already associated by stronger, semantic evidence.
                 continue

@@ -1129,9 +1129,10 @@ class Orchestrator:
         remaining: list[CommandSpec] = []
         reused = 0
         saved = 0.0
+        base_relevant = set(report.changed_files) | affected
         for spec in targeted_commands:
             command = tuple(spec.command)
-            relevant = set(report.changed_files) | affected
+            relevant = set(base_relevant)
             tail = command[-1] if len(command) > 1 else ""
             if tail.endswith(".py"):
                 relevant.add(tail.replace("\\", "/"))

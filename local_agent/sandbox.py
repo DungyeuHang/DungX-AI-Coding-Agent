@@ -77,6 +77,14 @@ CANDIDATE_DIR_PREFIX = "agentcand_"
 #: Exit code CommandRunner returns when the executable is not installed.
 _EXECUTABLE_MISSING_EXIT_CODE = 127
 
+#: Validation tier names, in the order :meth:`ProspectiveValidator.validate`
+#: runs them. Named constants rather than inline strings so that
+#: :attr:`CandidateValidationReport.has_test_evidence` cannot drift out of sync
+#: with the tier that actually produces test evidence.
+TIER_SYNTAX = "syntax"
+TIER_TARGETED_TESTS = "targeted_tests"
+TIER_STATIC_ANALYSIS = "static_analysis"
+
 
 class CandidateWorkspaceError(RuntimeError):
     """Raised when a candidate tree cannot be materialised or rebuilt."""
@@ -165,6 +173,26 @@ class CandidateValidationReport:
     def failures(self) -> list[CandidateCommandResult]:
         return [r for r in self.results if not r.succeeded]
 
+    @property
+    def executed_test_commands(self) -> list[CandidateCommandResult]:
+        """Targeted-test commands that genuinely ran (not skipped)."""
+        return [
+            r for r in self.results
+            if r.tier == TIER_TARGETED_TESTS and not r.skipped
+        ]
+
+    @property
+    def has_test_evidence(self) -> bool:
+        """Whether this report rests on at least one real test execution.
+
+        A skipped command counts as *succeeded* - a missing linter must not block
+        an implementation - which means ``passed`` alone cannot distinguish
+        "every selected test passed" from "the test runner was not installed, so
+        nothing ran". Callers that reason about how much post-apply validation is
+        still required must consult this instead of trusting ``passed``.
+        """
+        return bool(self.executed_test_commands)
+
     def render_feedback(self, max_chars_per_failure: int | None = None) -> str:
         """Structured, compact feedback suitable for feeding back to the model."""
         max_chars_per_failure = (
@@ -173,6 +201,13 @@ class CandidateValidationReport:
         lines: list[str] = []
         if self.passed:
             lines.append("Candidate validation PASSED against the proposed edits.")
+            if not self.has_test_evidence:
+                # Never let a pass imply test coverage it does not have.
+                lines.append(
+                    "NOTE: no test command actually executed (none was selected, or the "
+                    "runner is unavailable), so this pass is not evidence that behaviour "
+                    "is correct."
+                )
         else:
             lines.append(
                 "Candidate validation FAILED. Your proposed edits were applied to an "
@@ -220,6 +255,7 @@ class CandidateValidationReport:
             "results": [r.to_dict() for r in self.results],
             "impact_confidence": self.impact_confidence,
             "impact_scope": self.impact_scope,
+            "has_test_evidence": self.has_test_evidence,
         }
 
 
@@ -624,11 +660,25 @@ def _read_text_or_empty(path: Path) -> str:
         return ""
 
 
+def _to_universal_newlines(text: str) -> str:
+    """Normalise CRLF/CR to LF, exactly as :meth:`Path.read_text` does.
+
+    The BASE snapshot is kept as raw bytes, but every *candidate*-side read goes
+    through ``read_text``, which translates newlines. Decoding BASE verbatim
+    would therefore make the two sides incomparable on a CRLF checkout: the
+    unified diff in :meth:`CandidateWorkspace.diff` would report every line of
+    every file as changed, and symbol-level comparison would depend on
+    ``splitlines`` happening to hide the difference. Normalising here keeps both
+    sides in one text representation.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _decode_or_empty(data: bytes | None) -> str:
     if not data:
         return ""
     try:
-        return data.decode("utf-8")
+        return _to_universal_newlines(data.decode("utf-8"))
     except UnicodeDecodeError:
         return ""
 
@@ -639,7 +689,7 @@ def _decode_or_none(data: bytes | None) -> str | None:
     if data is None:
         return None
     try:
-        return data.decode("utf-8")
+        return _to_universal_newlines(data.decode("utf-8"))
     except UnicodeDecodeError:
         return None
 
@@ -757,12 +807,12 @@ class ProspectiveValidator:
             report.impact_summary = impact.summary()
 
         for tier_name, specs in (
-            ("syntax", self._syntax_commands(workspace, changed_files)),
+            (TIER_SYNTAX, self._syntax_commands(workspace, changed_files)),
             (
-                "targeted_tests",
+                TIER_TARGETED_TESTS,
                 self._targeted_commands(workspace, changed_files, repository_map, impact),
             ),
-            ("static_analysis", self._static_commands(workspace, repository_map)),
+            (TIER_STATIC_ANALYSIS, self._static_commands(workspace, repository_map)),
         ):
             if not specs:
                 continue

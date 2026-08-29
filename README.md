@@ -154,13 +154,105 @@ The `local_agent` package keeps each responsibility small:
   common secret files.
 - `git.py` provides read-only local status, diff, branch, and log inspection.
 - `commands.py` executes discovered commands without a shell and captures
-  command, exit code, output, and duration.
+  command, exit code, output, and duration. A bare `python`/`pytest` name that is
+  not on `PATH` is executed via the running interpreter (`sys.executable`), so a
+  missing console script cannot turn a test run into a silent no-op; the logical
+  command is preserved for display and evidence fingerprints.
 - `patching.py` validates and applies strict unified diffs in memory before any
   filesystem write.
 - `providers.py`, `planner.py`, `coding_agent.py`, `failure.py`, and
   `reviewer.py` implement the provider and development workflow.
 - `orchestrator.py` coordinates a bounded plan/implement/validate/repair/review
   loop.
+
+## Semantic change-impact validation (Phase 4.17)
+
+When `semantic_impact_analysis_enabled` is on, candidate validation selects which
+tests to run from the import/reference graph instead of from filenames alone.
+
+The pipeline is `changed files -> changed symbols -> import/reference graph ->
+affected modules -> ranked validation targets -> confidence -> validation scope`.
+It runs against the Phase 4.16 candidate tree, so it reasons about the proposed
+edit before anything is written to the real repository.
+
+- `indexing/ast_python_indexer.py` extracts symbols, imports, references and
+  per-symbol body hashes using the standard library `ast` module. It emits the
+  existing `SymbolDefinition` model rather than a parallel symbol model. A class
+  is hashed over only the lines it owns directly, so editing one method reports
+  that method, not its whole class.
+- `semantic_impact.py` diffs symbols between the candidate and the workspace's
+  frozen BASE snapshot, propagates impact backwards through reverse dependencies
+  under explicit depth/node bounds, and ranks each candidate test.
+- `evidence.py` records every executed command as structured evidence and decides
+  whether a post-apply rerun can be replaced by a candidate result.
+
+### Target ranking and confidence
+
+Each test is assigned its single strongest evidence tier and carries a sentence
+explaining that choice: `direct_symbol_match`, `direct_import_match`,
+`call_graph_match`, `reverse_dependency_match`, `module_match`, `filename_match`,
+then `broad_fallback`. The first four come from the graph; the rest are naming
+heuristics and are always ranked below graph evidence. A symbol name defined in
+more than three files is treated as ambiguous and stops counting as
+reference-only evidence, so a bare `run` or `to_dict` does not associate
+unrelated tests.
+
+Confidence is `high` only with direct import/symbol evidence and good graph
+coverage, `medium` for weaker graph evidence, and `low` for lexical-only
+evidence or when any degradation was recorded. Scope follows confidence:
+`targeted`, `expanded`, or `broad`.
+
+### Uncertainty only ever widens validation
+
+A parse failure, a non-Python file, a missing BASE snapshot, a star or dynamic
+import, a removed public symbol, high fan-out, or a traversal bound being hit all
+lower confidence, and lower confidence maps to a broader scope. `escalate_scope`
+is the only way a scope is reassigned and it is monotone, so there is no code
+path from "analysis failed" to "run fewer tests". A semantic analysis failure
+falls back to the pre-existing lexical selection, never to no validation.
+
+Because a skipped command counts as succeeded, `CandidateValidationReport.passed`
+alone cannot distinguish "the selected tests passed" from "the test runner is not
+installed". Use `has_test_evidence` for that; the model-facing feedback says so
+explicitly when nothing ran.
+
+### Candidate evidence reuse
+
+With `reuse_candidate_validation_evidence` on, a post-apply targeted command is
+dropped only when every assumption is re-verified against the authoritative tree:
+identical command vector, a recorded pass (never a failure or a skip), identical
+relevant file and symbol sets, an impact confidence meeting
+`validation_confidence_threshold`, and a byte-identical content fingerprint over
+those files. Any mismatch yields a machine-readable reason and the command reruns.
+The mandatory full validation run still happens regardless, so this removes
+duplicated work, not validation.
+
+### Configuration
+
+| Setting | Env | Default |
+| --- | --- | --- |
+| `semantic_impact_analysis_enabled` | `AGENT_SEMANTIC_IMPACT_ANALYSIS` | `false` |
+| `max_impact_depth` | `AGENT_MAX_IMPACT_DEPTH` | `3` |
+| `max_affected_symbols` | `AGENT_MAX_AFFECTED_SYMBOLS` | `200` |
+| `max_affected_tests` | `AGENT_MAX_AFFECTED_TESTS` | `8` |
+| `validation_confidence_threshold` | `AGENT_VALIDATION_CONFIDENCE_THRESHOLD` | `high` |
+| `reuse_candidate_validation_evidence` | `AGENT_REUSE_CANDIDATE_EVIDENCE` | `false` |
+
+Both features are off by default, so existing single-shot, interactive and
+prospective-validation modes behave exactly as before.
+
+### Limitations
+
+Graph analysis is Python-only, because `ast` is the only parser this repository
+can depend on being present. Non-Python changes are recorded as
+`unsupported_files`, which lowers confidence and broadens scope rather than being
+read as "no impact". Symbol nesting is tracked one level deep (`Class.method`),
+matching the existing indexer's single-name `parent` field, so a definition inside
+a function is not indexed. Call-graph evidence is name-based, not a resolved call
+graph: it proves a test mentions a changed symbol name, not that it invokes that
+definition, which is why it ranks below a resolved import edge. Dynamic imports,
+`__getattr__` indirection and generated code cannot be resolved statically and are
+recorded as degradations.
 
 ## Safety and current limitations
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 import ast
 import hashlib
 from dataclasses import dataclass, field
+from typing import Sequence
 
 from ..models import SymbolDefinition, SymbolLocation
 
@@ -93,6 +94,22 @@ class PythonFileFacts:
             if dotted:
                 seen.setdefault(dotted, None)
         return list(seen)
+
+
+def _definition_extent(node: ast.AST) -> tuple[int, int]:
+    """Full source span a definition owns, decorators included.
+
+    ``ast`` puts ``lineno`` on the ``def``/``class`` keyword, not on the first
+    decorator, so a decorator-only edit would otherwise be attributed to the
+    *enclosing* scope instead of to the decorated symbol.
+    """
+    start = int(getattr(node, "lineno", 1))
+    for decorator in getattr(node, "decorator_list", None) or []:
+        decorator_line = getattr(decorator, "lineno", None)
+        if decorator_line:
+            start = min(start, int(decorator_line))
+    end = int(getattr(node, "end_lineno", None) or getattr(node, "lineno", start))
+    return start, max(start, end)
 
 
 def qualified_name(symbol: SymbolDefinition) -> str:
@@ -207,7 +224,17 @@ class _FactCollector:
         """
         for node in body:
             if isinstance(node, ast.ClassDef):
-                self._record(node, kind="class", parent=parent)
+                # A class's hash covers only the lines it owns *directly*: the
+                # spans of its nested definitions are subtracted, so editing one
+                # method body reports ``A.m`` alone rather than both ``A.m`` and
+                # ``A``. Editing the class's decorators, bases or class-level
+                # attributes still reports ``A``, because those lines are its own.
+                self._record(
+                    node,
+                    kind="class",
+                    parent=parent,
+                    excluded_spans=self._definition_spans(node.body),
+                )
                 self._walk_body(node.body, parent=node.name)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 kind = "method" if parent else "function"
@@ -221,7 +248,38 @@ class _FactCollector:
                     self._walk_body(handler.body, parent)
                 self._walk_body(getattr(node, "finalbody", []), parent)
 
-    def _record(self, node: ast.AST, kind: str, parent: str | None) -> None:
+    def _definition_spans(self, body: list[ast.stmt]) -> list[tuple[int, int]]:
+        """Extents of the definitions :meth:`_walk_body` would record from ``body``.
+
+        Mirrors :meth:`_walk_body`'s traversal exactly - including its descent
+        into ``if``/``try`` blocks - so the set of subtracted spans is precisely
+        the set of separately-hashed child symbols. The ``if``/``try`` header
+        lines themselves are *not* subtracted: they belong to the enclosing
+        scope, so changing a ``if TYPE_CHECKING:`` guard does register as a
+        change to the class that contains it.
+        """
+        spans: list[tuple[int, int]] = []
+        for node in body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                spans.append(_definition_extent(node))
+            elif isinstance(node, (ast.If, ast.Try)):
+                spans.extend(self._definition_spans(node.body))
+                spans.extend(self._definition_spans(getattr(node, "orelse", [])))
+                for handler in getattr(node, "handlers", []):
+                    spans.extend(self._definition_spans(handler.body))
+                spans.extend(self._definition_spans(getattr(node, "finalbody", [])))
+        return spans
+
+    def _record(
+        self,
+        node: ast.AST,
+        kind: str,
+        parent: str | None,
+        excluded_spans: Sequence[tuple[int, int]] = (),
+    ) -> None:
+        # ``location`` deliberately keeps the ``def``/``class`` keyword line, which
+        # is what every existing consumer of SymbolLocation expects; the wider,
+        # decorator-inclusive extent is used only for hashing.
         start = int(getattr(node, "lineno", 1))
         end = int(getattr(node, "end_lineno", None) or start)
         symbol = SymbolDefinition(
@@ -231,18 +289,38 @@ class _FactCollector:
             parent=parent,
         )
         self.symbols.append(symbol)
-        self.symbol_hashes[qualified_name(symbol)] = self._body_hash(start, end)
+        hash_start, hash_end = _definition_extent(node)
+        self.symbol_hashes[qualified_name(symbol)] = self._body_hash(
+            hash_start, hash_end, excluded_spans
+        )
 
-    def _body_hash(self, start_line: int, end_line: int) -> str:
-        """Hash of the symbol's source text, whitespace-normalised per line.
+    def _body_hash(
+        self,
+        start_line: int,
+        end_line: int,
+        excluded_spans: Sequence[tuple[int, int]] = (),
+    ) -> str:
+        """Hash of the symbol's own source text, whitespace-normalised per line.
 
         Normalising trailing whitespace and blank lines means a pure
         reformatting edit does not register as a semantic symbol change, while
         any real edit to the body does. Leading indentation is preserved because
         in Python it is semantically significant.
+
+        ``excluded_spans`` are inclusive 1-based line ranges belonging to nested
+        symbols that are hashed separately; subtracting them is what gives the
+        symbol diff method-level rather than class-level granularity.
         """
-        segment = self._lines[max(0, start_line - 1):end_line]
-        normalised = "\n".join(line.rstrip() for line in segment if line.strip())
+        excluded: set[int] = set()
+        for span_start, span_end in excluded_spans:
+            excluded.update(range(span_start, span_end + 1))
+        first = max(1, int(start_line))
+        segment = self._lines[first - 1:end_line]
+        normalised = "\n".join(
+            line.rstrip()
+            for number, line in enumerate(segment, start=first)
+            if number not in excluded and line.strip()
+        )
         return hashlib.sha256(normalised.encode("utf-8", "replace")).hexdigest()[:32]
 
     # -- references / imports ---------------------------------------------
