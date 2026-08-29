@@ -14,6 +14,7 @@ from .models import (
     ProviderCapability, ProviderRuntimeState, ProviderConfig, RegisteredProvider,
     SchedulerState, Subtask, SubtaskStatus, Task, TaskPlan, TaskPlanAmendment, TaskStatus,
 )
+from .coordinator import ParallelExecutionCoordinator
 from .orchestrator import Orchestrator
 from .providers import (
     AIProvider, AuthenticationError, ProviderError,
@@ -93,6 +94,17 @@ class Scheduler:
         self.storage.save_scheduler_state(self.state)
         self._running_subtasks: set[str] = set() # New for Phase 3.21: Track subtasks currently in execution
         self.planner = None # To be initialized with a selected provider
+        self.coordinator = ParallelExecutionCoordinator(
+            self.base_config,
+            self.storage,
+            self,
+            self._repo_lock,
+            self._memory_lock,
+        )
+        try:
+            self.coordinator.worktree_manager.cleanup_stale_worktrees()
+        except Exception:
+            pass
 
     def run_once(self, progress=None) -> None:
         def emit(message: str) -> None:
@@ -183,6 +195,47 @@ class Scheduler:
             runnable_task.next_retry_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=DEFAULT_RETRY_BACKOFF_SECONDS)
             self.storage.save_task(runnable_task)
             return
+
+        # Phase 4.14: Parallel Worktree DAG Execution when enabled
+        if getattr(self.base_config, "parallel_worktree_execution", False):
+            runnable_subtasks = self._find_runnable_subtasks(runnable_task)
+            if not runnable_subtasks:
+                self._check_and_complete_task(runnable_task)
+                emit(f"No runnable subtasks for task {runnable_task.task_id}.")
+                return
+
+            if len(runnable_subtasks) > 1:
+                emit(f"Parallel worktree execution enabled: {len(runnable_subtasks)} ready subtasks found.")
+                runnable_task.status = TaskStatus.RUNNING
+                runnable_task.assigned_to = "scheduler"
+                self.storage.save_task(runnable_task)
+
+                try:
+                    predicted_map = self.coordinator.predict_file_conflicts(runnable_subtasks)
+                    batches = self.coordinator.partition_parallel_batches(
+                        runnable_subtasks,
+                        predicted_map,
+                        serialize_overlapping=getattr(self.base_config, "serialize_overlapping_subtasks", True),
+                    )
+                    integration_branch = getattr(runnable_task, "integration_branch", None) or f"agent-task/{runnable_task.task_id}"
+                    if self.coordinator.git.is_repository() and not self.coordinator.git.branch():
+                        self.coordinator.git.create_branch(integration_branch)
+
+                    for batch in batches:
+                        emit(f"Executing parallel batch of {len(batch)} subtask(s)...")
+                        results = self.coordinator.execute_parallel_batch(runnable_task, batch, progress=progress)
+                        completed_in_batch = [s for s, rep, err in results if s.status == SubtaskStatus.COMPLETED or (rep and getattr(rep, "completed", False))]
+                        if completed_in_batch:
+                            merged, failed = self.coordinator.integrate_branches(runnable_task, completed_in_batch, integration_branch)
+                            self.coordinator.verify_integration(runnable_task, merged)
+
+                    final_task = self.storage.load_task(runnable_task.task_id)
+                    self._check_and_complete_task(final_task)
+                    return
+                finally:
+                    final_task = self.storage.load_task(runnable_task.task_id)
+                    final_task.assigned_to = None
+                    self.storage.save_task(final_task)
 
         # Phase 3.11: Find the next runnable subtask
         next_subtask = self._find_next_runnable_subtask(runnable_task)
@@ -354,51 +407,16 @@ class Scheduler:
         runnable.sort(key=lambda t: (t.created_at is None, t.created_at or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)))
         return runnable[0]
 
-    def _find_next_runnable_subtask(self, task: Task) -> Subtask | None:
+    def _find_runnable_subtasks(self, task: Task) -> list[Subtask]:
+        """Returns all currently runnable active subtasks in topological order."""
         if not task.plan:
-            return None
+            return []
+        return self.coordinator.identify_runnable_subtasks(task)
 
-        active_subtasks = getattr(task.plan, "active_subtasks", [
-            s for s in task.plan.subtasks
-            if s.status not in {SubtaskStatus.SUPERSEDED, SubtaskStatus.PRUNED}
-        ])
-        if not active_subtasks:
-            return None
-
-        completed_ids = {s.subtask_id for s in active_subtasks if s.status == SubtaskStatus.COMPLETED}
-        active_map = {s.subtask_id: s for s in active_subtasks}
-
-        # Calculate topological level for deterministic tie-breaking
-        depth_memo: dict[str, int] = {}
-        def _get_depth(sub_id: str, visiting: set[str]) -> int:
-            if sub_id in depth_memo:
-                return depth_memo[sub_id]
-            if sub_id not in active_map or sub_id in visiting:
-                return 0
-            visiting.add(sub_id)
-            sub = active_map[sub_id]
-            if not sub.dependencies:
-                depth = 0
-            else:
-                depth = 1 + max((_get_depth(d, visiting) for d in sub.dependencies if d in active_map), default=0)
-            visiting.remove(sub_id)
-            depth_memo[sub_id] = depth
-            return depth
-
-        for sub in active_subtasks:
-            _get_depth(sub.subtask_id, set())
-
-        def _sort_key(s: Subtask):
-            created_ts = s.created_at or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-            return (depth_memo.get(s.subtask_id, 0), created_ts, s.subtask_id)
-
-        sorted_subtasks = sorted(active_subtasks, key=_sort_key)
-
-        for subtask in sorted_subtasks:
-            if subtask.status in {SubtaskStatus.PENDING, SubtaskStatus.PAUSED}:
-                if all(dep_id in completed_ids for dep_id in subtask.dependencies):
-                    return subtask
-        return None
+    def _find_next_runnable_subtask(self, task: Task) -> Subtask | None:
+        """Returns the next runnable subtask for serial execution."""
+        runnable = self._find_runnable_subtasks(task)
+        return runnable[0] if runnable else None
 
     def _check_and_complete_task(self, task: Task) -> None:
         if not task.plan:

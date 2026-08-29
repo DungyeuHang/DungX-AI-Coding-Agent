@@ -115,5 +115,111 @@ class GitIntegration:
     def get_current_branch(self) -> str:
         return self._run("rev-parse", "--abbrev-ref", "HEAD")
 
+    def get_head_commit(self, ref: str = "HEAD") -> str:
+        """Returns the full commit SHA of the specified ref."""
+        return self._run("rev-parse", ref)
+
+    def checkout(self, target: str) -> bool:
+        """Checks out a branch, tag, or commit."""
+        return self._run_for_exit_code("checkout", target) == 0
+
     def get_remote_url(self, remote_name: str) -> str | None:
         return self._run("config", "--get", f"remote.{remote_name}.url")
+
+    def worktree_add(
+        self,
+        path: Path | str,
+        branch: str,
+        start_point: str = "HEAD",
+        create_branch: bool = True,
+    ) -> bool:
+        """
+        Creates a new Git worktree at path with the specified branch.
+        If create_branch is True, creates a new branch (-b branch start_point).
+        """
+        target_path = Path(path).resolve()
+        # Ensure parent directory exists
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if create_branch:
+            code = self._run_for_exit_code("worktree", "add", "-b", branch, str(target_path), start_point)
+            if code != 0:
+                # If branch already exists, attempt adding worktree tracking existing branch
+                code = self._run_for_exit_code("worktree", "add", str(target_path), branch)
+        else:
+            code = self._run_for_exit_code("worktree", "add", str(target_path), branch)
+        return code == 0
+
+    def worktree_remove(self, path: Path | str, force: bool = True) -> bool:
+        """Removes a Git worktree at the specified path."""
+        target_path = Path(path).resolve()
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(str(target_path))
+        return self._run_for_exit_code(*args) == 0
+
+    def worktree_prune(self) -> bool:
+        """Prunes stale Git worktree metadata."""
+        return self._run_for_exit_code("worktree", "prune") == 0
+
+    def worktree_list(self) -> list[dict[str, str]]:
+        """
+        Lists all worktrees using porcelain format.
+        Returns a list of dicts with keys: worktree, HEAD, branch, bare, locked, etc.
+        """
+        output = self._run("worktree", "list", "--porcelain")
+        if not output:
+            return []
+        worktrees: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        for line in output.splitlines():
+            line = line.strip()
+            if not line:
+                if current and "worktree" in current:
+                    worktrees.append(current)
+                    current = {}
+                continue
+            if " " in line:
+                key, val = line.split(" ", 1)
+                current[key] = val.strip()
+            else:
+                current[line] = "true"
+        if current and "worktree" in current:
+            worktrees.append(current)
+        return worktrees
+
+    def merge_branch(self, branch: str, message: str = "") -> tuple[bool, str]:
+        """
+        Merges the specified branch into the current HEAD using --no-ff.
+        Returns (success, output_or_error).
+        """
+        args = ["git", "merge", "--no-ff", branch]
+        if message:
+            args.extend(["-m", message])
+        try:
+            result = subprocess.run(
+                args, cwd=self.root, capture_output=True, text=True, timeout=60
+            )
+            out = (result.stdout + "\n" + result.stderr).strip()
+            return result.returncode == 0, out
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return False, str(e)
+
+    def merge_abort(self) -> bool:
+        """Aborts an in-progress merge conflict."""
+        return self._run_for_exit_code("merge", "--abort") == 0
+
+    def rebase_branch(self, upstream: str) -> tuple[bool, str]:
+        """Rebases current HEAD onto the specified upstream ref."""
+        try:
+            result = subprocess.run(
+                ["git", "rebase", upstream],
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            out = (result.stdout + "\n" + result.stderr).strip()
+            return result.returncode == 0, out
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return False, str(e)

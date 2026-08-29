@@ -90,6 +90,8 @@ class AgentConfig:
     knowledge_graph_enabled: bool = True
     max_knowledge_context_chars: int = 2000
     max_knowledge_symbols: int = 1000
+    parallel_worktree_execution: bool = False
+    serialize_overlapping_subtasks: bool = True
 
     @property
     def tool_policy(self) -> Any:
@@ -172,6 +174,8 @@ class AgentConfig:
             "knowledge_graph_enabled": "AGENT_KNOWLEDGE_GRAPH_ENABLED",
             "max_knowledge_context_chars": "AGENT_MAX_KNOWLEDGE_CONTEXT_CHARS",
             "max_knowledge_symbols": "AGENT_MAX_KNOWLEDGE_SYMBOLS",
+            "parallel_worktree_execution": "AGENT_PARALLEL_WORKTREES",
+            "serialize_overlapping_subtasks": "AGENT_SERIALIZE_OVERLAPPING_SUBTASKS",
         }
 
         def value(name: str, default: object) -> object:
@@ -323,6 +327,8 @@ class AgentConfig:
             knowledge_graph_enabled=_bool(value("knowledge_graph_enabled", True)),
             max_knowledge_context_chars=_positive_int(value("max_knowledge_context_chars", 2000), "max_knowledge_context_chars"),
             max_knowledge_symbols=_positive_int(value("max_knowledge_symbols", 1000), "max_knowledge_symbols"),
+            parallel_worktree_execution=_bool(value("parallel_worktree_execution", False)),
+            serialize_overlapping_subtasks=_bool(value("serialize_overlapping_subtasks", True)),
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -351,6 +357,8 @@ class AgentConfig:
             raise ValueError("command_timeout_seconds must be positive")
         if self.max_parallel_subtasks < 1:
             raise ValueError("max_parallel_subtasks must be at least 1")
+        if self.max_parallel_subtasks > 4:
+            raise ValueError("max_parallel_subtasks cannot exceed 4")
         for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats", "max_knowledge_context_chars", "max_knowledge_symbols"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
@@ -365,7 +373,7 @@ class AgentConfig:
         # Validate tool policy creation
         _ = self.tool_policy
 
-def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args: bool = False) -> None:
+def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args: bool = True) -> None:
     parser.add_argument("--project", default=".", help="local project directory")
     parser.add_argument("--provider", choices=("mock", "openai", "gemini", "antigravity", "deepseek", "anthropic"), default=None)
     parser.add_argument("--model", default=None)
@@ -381,6 +389,8 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--verification-model", default=None)
     parser.add_argument("--dual-review", type=_bool, default=None, help="enable deliberative dual-model review")
     parser.add_argument("--knowledge-graph", type=_bool, default=None, help="enable persistent repository knowledge graph (true/false)")
+    parser.add_argument("--parallel-worktrees", type=_bool, default=None, help="enable parallel DAG execution in isolated Git worktrees (true/false)")
+    parser.add_argument("--serialize-overlapping-subtasks", type=_bool, default=None, help="serialize execution of subtasks with predicted file overlap (true/false)")
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
@@ -417,6 +427,8 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "verification_model": getattr(args, "verification_model", None),
             "dual_review_enabled": getattr(args, "dual_review", None),
             "knowledge_graph_enabled": getattr(args, "knowledge_graph", None),
+            "parallel_worktree_execution": getattr(args, "parallel_worktrees", None),
+            "serialize_overlapping_subtasks": getattr(args, "serialize_overlapping_subtasks", None),
             "validation_commands": args.validation,
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,

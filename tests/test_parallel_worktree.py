@@ -1,0 +1,580 @@
+from __future__ import annotations
+
+import datetime
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from local_agent.config import AgentConfig
+from local_agent.coordinator import ParallelExecutionCoordinator
+from local_agent.credentials import MockCredentialStore
+from local_agent.git import GitIntegration
+from local_agent.knowledge import KnowledgeGraphManager
+from local_agent.models import (
+    Checkpoint,
+    ExportedSymbol,
+    Plan,
+    ProjectContext,
+    ProviderConfig,
+    RepositoryKnowledgeGraph,
+    Subtask,
+    SubtaskContract,
+    SubtaskStatus,
+    Task,
+    TaskPlan,
+    TaskStatus,
+    WorktreeSession,
+)
+from local_agent.scheduler import Scheduler
+from local_agent.storage import JsonFileStorage, TaskStorage
+from local_agent.worktree import WorktreeManager
+
+
+def _make_test_task(task_id: str, plan: TaskPlan) -> Task:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return Task(
+        task_id=task_id,
+        objective=plan.objective,
+        status=TaskStatus.PENDING,
+        created_at=now,
+        updated_at=now,
+        plan=plan,
+    )
+
+
+class TestWorktreeLifecycle(unittest.TestCase):
+    """Unit tests for WorktreeManager path allocation, creation, and cleanup."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.repo_root = Path(self.temp_dir) / "repo"
+        self.repo_root.mkdir()
+        self.git = GitIntegration(self.repo_root)
+        self.manager = WorktreeManager(self.repo_root, self.git)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_allocate_worktree_path_deterministic(self):
+        p1 = self.manager.allocate_worktree_path("task-123", "sub-abc")
+        p2 = self.manager.allocate_worktree_path("task-123", "sub-abc")
+        self.assertEqual(p1, p2)
+        self.assertTrue(p1.as_posix().endswith(".agent_worktrees/task-task-123/sub-sub-abc"))
+
+    def test_allocate_worktree_path_prevents_escape(self):
+        with self.assertRaises(ValueError):
+            self.manager.allocate_worktree_path("../../../etc", "passwd")
+
+    def test_branch_name_for_subtask_sanitization(self):
+        branch = self.manager.branch_name_for_subtask("task:100", "sub/50")
+        self.assertEqual(branch, "agent/task_100/sub_50")
+
+    def test_create_and_remove_worktree_cleanly(self):
+        session = self.manager.create_worktree("task-1", "sub-1")
+        self.assertIsInstance(session, WorktreeSession)
+        self.assertEqual(session.status, "active")
+        self.assertTrue(Path(session.worktree_path).exists())
+
+        # Removal
+        removed = self.manager.remove_worktree(session, force=True)
+        self.assertTrue(removed)
+        self.assertFalse(Path(session.worktree_path).exists())
+        self.assertEqual(session.status, "cleaned")
+
+    def test_prune_and_cleanup_stale_worktrees(self):
+        s1 = self.manager.create_worktree("task-1", "sub-1")
+        s2 = self.manager.create_worktree("task-1", "sub-2")
+
+        # Keep s1 active, s2 stale
+        cleaned = self.manager.cleanup_stale_worktrees(active_session_paths={s1.worktree_path})
+        self.assertTrue(Path(s1.worktree_path).exists())
+
+    def test_cleanup_all_worktrees(self):
+        s1 = self.manager.create_worktree("task-1", "sub-1")
+        s2 = self.manager.create_worktree("task-1", "sub-2")
+        self.manager.cleanup_all()
+        self.assertFalse(Path(s1.worktree_path).exists())
+        self.assertFalse(Path(s2.worktree_path).exists())
+
+    def test_remove_worktree_idempotent(self):
+        session = self.manager.create_worktree("task-1", "sub-1")
+        self.assertTrue(self.manager.remove_worktree(session))
+        # Second call on already cleaned session should be harmless True
+        self.assertTrue(self.manager.remove_worktree(session))
+
+
+class TestWorktreeSessionModel(unittest.TestCase):
+    """Unit tests for WorktreeSession data structure and serialization."""
+
+    def test_worktree_session_serialization_roundtrip(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        session = WorktreeSession(
+            session_id="wt-123",
+            subtask_id="sub-1",
+            worktree_path="/repo/.agent_worktrees/task-1/sub-1",
+            branch_name="agent/task-1/sub-1",
+            base_commit="abc12345",
+            created_at=now,
+            status="active",
+        )
+        d = session.to_dict()
+        self.assertEqual(d["session_id"], "wt-123")
+        self.assertEqual(d["subtask_id"], "sub-1")
+        self.assertEqual(d["status"], "active")
+
+        loaded = WorktreeSession.from_dict(d)
+        self.assertEqual(loaded.session_id, "wt-123")
+        self.assertEqual(loaded.subtask_id, "sub-1")
+        self.assertEqual(loaded.worktree_path, "/repo/.agent_worktrees/task-1/sub-1")
+        self.assertEqual(loaded.branch_name, "agent/task-1/sub-1")
+        self.assertEqual(loaded.base_commit, "abc12345")
+        self.assertEqual(loaded.status, "active")
+
+    def test_subtask_with_worktree_session_serialization(self):
+        session = WorktreeSession(
+            session_id="wt-456",
+            subtask_id="sub-2",
+            worktree_path="/path",
+            branch_name="agent/t/s",
+            base_commit="c123",
+            status="merged",
+        )
+        subtask = Subtask(
+            subtask_id="sub-2",
+            title="Sub 2",
+            worktree_session=session,
+            integration_commit="commit-789",
+        )
+        d = subtask.to_dict()
+        self.assertIn("worktree_session", d)
+        self.assertEqual(d["worktree_session"]["session_id"], "wt-456")
+        self.assertEqual(d["integration_commit"], "commit-789")
+
+        loaded = Subtask.from_dict(d)
+        self.assertIsNotNone(loaded.worktree_session)
+        self.assertEqual(loaded.worktree_session.session_id, "wt-456")
+        self.assertEqual(loaded.integration_commit, "commit-789")
+
+
+class TestGitWorktreePrimitives(unittest.TestCase):
+    """Unit tests for GitIntegration worktree and merge primitives."""
+
+    def test_worktree_list_porcelain_parsing(self):
+        git = GitIntegration(".")
+        sample_porcelain = (
+            "worktree /repo/main\n"
+            "HEAD 1234567890abcdef\n"
+            "branch refs/heads/main\n\n"
+            "worktree /repo/.agent_worktrees/task-1/sub-1\n"
+            "HEAD fedcba0987654321\n"
+            "branch refs/heads/agent/task-1/sub-1\n"
+            "locked\n"
+        )
+        with patch.object(git, "_run", return_value=sample_porcelain):
+            parsed = git.worktree_list()
+            self.assertEqual(len(parsed), 2)
+            self.assertEqual(parsed[0]["worktree"], "/repo/main")
+            self.assertEqual(parsed[0]["branch"], "refs/heads/main")
+            self.assertEqual(parsed[1]["worktree"], "/repo/.agent_worktrees/task-1/sub-1")
+            self.assertEqual(parsed[1]["locked"], "true")
+
+    def test_merge_branch_and_abort(self):
+        git = GitIntegration(".")
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="Merge made by 'ort' strategy.", stderr="")
+            success, output = git.merge_branch("agent/task-1/sub-1", message="merge message")
+            self.assertTrue(success)
+            self.assertIn("Merge made", output)
+
+        with patch.object(git, "_run_for_exit_code", return_value=0):
+            self.assertTrue(git.merge_abort())
+
+    def test_rebase_branch(self):
+        git = GitIntegration(".")
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="Successfully rebased.", stderr="")
+            success, output = git.rebase_branch("main")
+            self.assertTrue(success)
+            self.assertIn("rebased", output)
+
+
+class TestDAGSchedulingAndReadiness(unittest.TestCase):
+    """Unit tests for runnable subtask discovery across DAG dependencies."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config = AgentConfig(project=Path(self.temp_dir), provider="mock")
+        self.storage = JsonFileStorage(Path(self.temp_dir) / "storage")
+        self.coordinator = ParallelExecutionCoordinator(self.config, self.storage)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_identify_runnable_subtasks_single_ready_root(self):
+        s0 = Subtask(subtask_id="sub-0", title="Root", dependencies=[], status=SubtaskStatus.PENDING)
+        s1 = Subtask(subtask_id="sub-1", title="Child", dependencies=["sub-0"], status=SubtaskStatus.PENDING)
+        task = _make_test_task("t1", TaskPlan(objective="test", subtasks=[s0, s1]))
+
+        runnable = self.coordinator.identify_runnable_subtasks(task)
+        self.assertEqual(len(runnable), 1)
+        self.assertEqual(runnable[0].subtask_id, "sub-0")
+
+    def test_identify_runnable_subtasks_multiple_independent_ready(self):
+        s0 = Subtask(subtask_id="sub-0", title="Root", dependencies=[], status=SubtaskStatus.COMPLETED)
+        s1 = Subtask(subtask_id="sub-1", title="Branch A", dependencies=["sub-0"], status=SubtaskStatus.PENDING)
+        s2 = Subtask(subtask_id="sub-2", title="Branch B", dependencies=["sub-0"], status=SubtaskStatus.PENDING)
+        s3 = Subtask(subtask_id="sub-3", title="Join", dependencies=["sub-1", "sub-2"], status=SubtaskStatus.PENDING)
+        task = _make_test_task("t1", TaskPlan(objective="test", subtasks=[s0, s1, s2, s3]))
+
+        runnable = self.coordinator.identify_runnable_subtasks(task)
+        self.assertEqual(len(runnable), 2)
+        runnable_ids = {s.subtask_id for s in runnable}
+        self.assertEqual(runnable_ids, {"sub-1", "sub-2"})
+
+    def test_identify_runnable_subtasks_ignores_superseded_and_pruned(self):
+        s0 = Subtask(subtask_id="sub-0", title="Old", dependencies=[], status=SubtaskStatus.SUPERSEDED)
+        s1 = Subtask(subtask_id="sub-1", title="Pruned", dependencies=[], status=SubtaskStatus.PRUNED)
+        s2 = Subtask(subtask_id="sub-2", title="Valid", dependencies=[], status=SubtaskStatus.PENDING)
+        task = _make_test_task("t1", TaskPlan(objective="test", subtasks=[s0, s1, s2]))
+
+        runnable = self.coordinator.identify_runnable_subtasks(task)
+        self.assertEqual(len(runnable), 1)
+        self.assertEqual(runnable[0].subtask_id, "sub-2")
+
+
+class TestConflictPredictionAndPartitioning(unittest.TestCase):
+    """Unit tests for conflict prediction and batch partitioning."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config = AgentConfig(project=Path(self.temp_dir), provider="mock", max_parallel_subtasks=3)
+        self.storage = JsonFileStorage(Path(self.temp_dir) / "storage")
+        self.coordinator = ParallelExecutionCoordinator(self.config, self.storage)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_predict_file_conflicts_from_subtasks(self):
+        s1 = Subtask(subtask_id="s1", title="Update auth", acceptance_criteria=["Modify auth.py"])
+        s2 = Subtask(subtask_id="s2", title="Update ui", acceptance_criteria=["Modify ui.py"])
+        predicted = self.coordinator.predict_file_conflicts([s1, s2])
+        self.assertIn("auth.py", predicted["s1"])
+        self.assertIn("ui.py", predicted["s2"])
+
+    def test_partition_disjoint_subtasks_into_single_parallel_batch(self):
+        s1 = Subtask(subtask_id="s1", title="Update auth", acceptance_criteria=["Modify auth.py"])
+        s2 = Subtask(subtask_id="s2", title="Update billing", acceptance_criteria=["Modify billing.py"])
+        s3 = Subtask(subtask_id="s3", title="Update ui", acceptance_criteria=["Modify ui.py"])
+
+        predicted = {
+            "s1": {"auth.py"},
+            "s2": {"billing.py"},
+            "s3": {"ui.py"},
+        }
+        batches = self.coordinator.partition_parallel_batches([s1, s2, s3], predicted, serialize_overlapping=True)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(len(batches[0]), 3)
+
+    def test_partition_overlapping_subtasks_into_serialized_batches(self):
+        s1 = Subtask(subtask_id="s1", title="Feature A", acceptance_criteria=["Modify models.py"])
+        s2 = Subtask(subtask_id="s2", title="Feature B", acceptance_criteria=["Modify models.py and utils.py"])
+        s3 = Subtask(subtask_id="s3", title="Feature C", acceptance_criteria=["Modify helper.py"])
+
+        predicted = {
+            "s1": {"models.py"},
+            "s2": {"models.py", "utils.py"},
+            "s3": {"helper.py"},
+        }
+        batches = self.coordinator.partition_parallel_batches([s1, s2, s3], predicted, serialize_overlapping=True)
+        self.assertEqual(len(batches), 2)
+        # Batch 1 contains s1 and s3 (disjoint)
+        self.assertEqual({s.subtask_id for s in batches[0]}, {"s1", "s3"})
+        # Batch 2 contains s2
+        self.assertEqual({s.subtask_id for s in batches[1]}, {"s2"})
+
+    def test_partition_respects_max_workers_bound(self):
+        self.coordinator.max_workers = 2
+        s1 = Subtask(subtask_id="s1", title="A")
+        s2 = Subtask(subtask_id="s2", title="B")
+        s3 = Subtask(subtask_id="s3", title="C")
+
+        predicted = {"s1": {"a.py"}, "s2": {"b.py"}, "s3": {"c.py"}}
+        batches = self.coordinator.partition_parallel_batches([s1, s2, s3], predicted, serialize_overlapping=True)
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(len(batches[0]), 2)
+        self.assertEqual(len(batches[1]), 1)
+
+    def test_partition_without_serialization_when_disabled(self):
+        s1 = Subtask(subtask_id="s1", title="A")
+        s2 = Subtask(subtask_id="s2", title="B")
+        s3 = Subtask(subtask_id="s3", title="C")
+        predicted = {"s1": {"shared.py"}, "s2": {"shared.py"}, "s3": {"shared.py"}}
+        batches = self.coordinator.partition_parallel_batches([s1, s2, s3], predicted, serialize_overlapping=False)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(len(batches[0]), 3)
+
+
+class TestParallelExecutionAndIntegration(unittest.TestCase):
+    """Integration tests for parallel worktree execution, merging, and verification."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config = AgentConfig(
+            project=Path(self.temp_dir),
+            provider="mock",
+            parallel_worktree_execution=True,
+            max_parallel_subtasks=2,
+        )
+        self.storage = JsonFileStorage(Path(self.temp_dir) / "storage")
+        self.coordinator = ParallelExecutionCoordinator(self.config, self.storage)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_execute_parallel_batch_concurrent_subtasks(self):
+        s1 = Subtask(subtask_id="sub-1", title="Subtask 1", goal="Goal 1")
+        s2 = Subtask(subtask_id="sub-2", title="Subtask 2", goal="Goal 2")
+        task = _make_test_task("task-123", TaskPlan(objective="test", subtasks=[s1, s2]))
+
+        with patch.object(self.coordinator, "execute_subtask_in_worktree") as mock_exec:
+            mock_exec.side_effect = [
+                (Subtask(subtask_id="sub-1", status=SubtaskStatus.COMPLETED), MagicMock(completed=True), None),
+                (Subtask(subtask_id="sub-2", status=SubtaskStatus.COMPLETED), MagicMock(completed=True), None),
+            ]
+            results = self.coordinator.execute_parallel_batch(task, [s1, s2])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(mock_exec.call_count, 2)
+
+    def test_single_worker_failure_does_not_halt_other_workers(self):
+        s1 = Subtask(subtask_id="sub-1", title="Subtask 1")
+        s2 = Subtask(subtask_id="sub-2", title="Subtask 2")
+        task = _make_test_task("task-123", TaskPlan(objective="test", subtasks=[s1, s2]))
+
+        with patch.object(self.coordinator, "execute_subtask_in_worktree") as mock_exec:
+            mock_exec.side_effect = [
+                (Subtask(subtask_id="sub-1", status=SubtaskStatus.FAILED), None, RuntimeError("Worker failed")),
+                (Subtask(subtask_id="sub-2", status=SubtaskStatus.COMPLETED), MagicMock(completed=True), None),
+            ]
+            results = self.coordinator.execute_parallel_batch(task, [s1, s2])
+            self.assertEqual(len(results), 2)
+            statuses = {s.status for s, rep, err in results}
+            self.assertIn(SubtaskStatus.FAILED, statuses)
+            self.assertIn(SubtaskStatus.COMPLETED, statuses)
+
+    def test_tier2_integration_verification_and_knowledge_promotion(self):
+        contract = SubtaskContract(
+            subtask_id="sub-1",
+            title="Sub 1",
+            modified_files=["app.py"],
+            exported_symbols=[ExportedSymbol(symbol_id="sym1", name="hello", kind="function", file_path="app.py", verified=True)],
+        )
+        s1 = Subtask(subtask_id="sub-1", title="Sub 1", contract=contract)
+        task = _make_test_task("task-1", TaskPlan(objective="test", subtasks=[s1]))
+
+        # Run verify_integration
+        verified = self.coordinator.verify_integration(task, [s1])
+        self.assertTrue(verified)
+
+        # Check knowledge graph updated
+        kg = self.storage.load_knowledge_graph()
+        self.assertIn("sym1", kg.symbols)
+
+    def test_failed_merge_aborts_cleanly_without_corrupting_tree(self):
+        s1 = Subtask(
+            subtask_id="sub-1",
+            title="Sub 1",
+            worktree_session=WorktreeSession(
+                session_id="wt-1",
+                subtask_id="sub-1",
+                worktree_path="/tmp/path",
+                branch_name="agent/t/s",
+                base_commit="abc",
+            ),
+        )
+        task = _make_test_task("task-1", TaskPlan(objective="test", subtasks=[s1]))
+
+        with patch.object(self.coordinator.git, "is_repository", return_value=True), \
+             patch.object(self.coordinator.git, "checkout", return_value=True), \
+             patch.object(self.coordinator.git, "merge_branch", return_value=(False, "CONFLICT")), \
+             patch.object(self.coordinator.git, "merge_abort", return_value=True) as mock_abort:
+            merged, failed = self.coordinator.integrate_branches(task, [s1], "agent-task/task-1")
+            self.assertEqual(len(failed), 1)
+            self.assertEqual(mock_abort.call_count, 1)
+
+
+class TestSchedulerParallelIntegration(unittest.TestCase):
+    """Integration tests for Scheduler interaction with parallel worktree execution."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.project_root = Path(self.temp_dir) / "proj"
+        self.project_root.mkdir()
+        self.storage = JsonFileStorage(Path(self.temp_dir) / "storage")
+        self.storage.save_provider_configs([ProviderConfig(provider_id="mock", priority=10, enabled=True)])
+        self.credential_store = MockCredentialStore()
+        self.credential_store.save("dungx-ai-coding-agent", "mock", "mock_key")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_scheduler_runs_parallel_worktree_execution_when_enabled(self):
+        config = AgentConfig(
+            project=self.project_root,
+            provider="mock",
+            parallel_worktree_execution=True,
+            max_parallel_subtasks=2,
+        )
+        scheduler = Scheduler(config, self.storage, self.credential_store)
+
+        s1 = Subtask(subtask_id="s1", title="Sub 1", status=SubtaskStatus.PENDING)
+        s2 = Subtask(subtask_id="s2", title="Sub 2", status=SubtaskStatus.PENDING)
+        task = _make_test_task("task-parallel", TaskPlan(objective="Parallel goal", subtasks=[s1, s2]))
+        self.storage.save_task(task)
+
+        with patch.object(scheduler.coordinator, "execute_parallel_batch") as mock_exec, \
+             patch.object(scheduler.coordinator, "integrate_branches", return_value=([s1, s2], [])), \
+             patch.object(scheduler.coordinator, "verify_integration", return_value=True):
+            mock_exec.return_value = [
+                (Subtask(subtask_id="s1", status=SubtaskStatus.COMPLETED), MagicMock(completed=True), None),
+                (Subtask(subtask_id="s2", status=SubtaskStatus.COMPLETED), MagicMock(completed=True), None),
+            ]
+            scheduler.run_once()
+            self.assertEqual(mock_exec.call_count, 1)
+
+    def test_scheduler_runs_serial_when_parallel_disabled(self):
+        config = AgentConfig(
+            project=self.project_root,
+            provider="mock",
+            parallel_worktree_execution=False,
+            max_parallel_subtasks=1,
+        )
+        scheduler = Scheduler(config, self.storage, self.credential_store)
+
+        s1 = Subtask(subtask_id="s1", title="Sub 1", status=SubtaskStatus.PENDING)
+        task = _make_test_task("task-serial", TaskPlan(objective="Serial goal", subtasks=[s1]))
+        self.storage.save_task(task)
+
+        with patch("local_agent.scheduler.Orchestrator") as mock_orch_cls:
+            mock_orch = MagicMock()
+            mock_orch.run.return_value = MagicMock(outcome="SUCCESS")
+            mock_orch_cls.return_value = mock_orch
+
+            scheduler.run_once()
+            self.assertEqual(mock_orch.run.call_count, 1)
+
+
+class TestKnowledgeGraphParallelIsolation(unittest.TestCase):
+    """Integration tests for Knowledge Graph safety and isolation during parallel execution."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.project_root = Path(self.temp_dir) / "proj"
+        self.project_root.mkdir()
+        self.storage = JsonFileStorage(Path(self.temp_dir) / "storage")
+        self.config = AgentConfig(project=self.project_root, provider="mock", parallel_worktree_execution=True)
+        self.coordinator = ParallelExecutionCoordinator(self.config, self.storage)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_worktree_knowledge_reads_do_not_corrupt_central_graph(self):
+        # Save initial clean graph
+        initial_graph = RepositoryKnowledgeGraph(repo_id="repo-main")
+        self.storage.save_knowledge_graph(initial_graph)
+
+        # Worker reads graph
+        loaded = self.storage.load_knowledge_graph()
+        self.assertEqual(loaded.repo_id, "repo-main")
+
+    def test_integration_sync_authoritative_hashes(self):
+        # Add contract with symbol
+        sym = ExportedSymbol(symbol_id="auth_login", name="login", kind="function", file_path="auth.py", verified=True)
+        contract = SubtaskContract(subtask_id="sub-auth", title="Auth", modified_files=["auth.py"], exported_symbols=[sym])
+        sub = Subtask(subtask_id="sub-auth", title="Auth", contract=contract)
+        task = _make_test_task("task-kg", TaskPlan(objective="Auth", subtasks=[sub]))
+
+        self.coordinator.verify_integration(task, [sub])
+        kg = self.storage.load_knowledge_graph()
+        self.assertIn("auth_login", kg.symbols)
+
+
+class TestCheckpointAndResumeWithWorktrees(unittest.TestCase):
+    """Unit tests for Checkpoint active worktrees persistence and recovery."""
+
+    def test_checkpoint_roundtrip_with_active_worktrees(self):
+        cp = Checkpoint(
+            checkpoint_id="cp-1",
+            task_id="task-1",
+            subtask_id="sub-1",
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+            current_state_description="Parallel checkpoint",
+            active_worktrees=[{"subtask_id": "sub-1", "worktree_path": ".agent_worktrees/task-1/sub-1"}],
+            integration_branch="agent-task/task-1",
+        )
+        d = cp.to_dict()
+        self.assertEqual(len(d["active_worktrees"]), 1)
+        self.assertEqual(d["integration_branch"], "agent-task/task-1")
+
+        loaded = Checkpoint.from_dict(d)
+        self.assertEqual(loaded.checkpoint_id, "cp-1")
+        self.assertEqual(len(loaded.active_worktrees), 1)
+        self.assertEqual(loaded.integration_branch, "agent-task/task-1")
+
+
+class TestConfigurationAndBackwardCompatibility(unittest.TestCase):
+    """Unit tests for Phase 4.14 configuration and serial execution compatibility."""
+
+    def test_default_config_parallel_worktrees_is_false(self):
+        config = AgentConfig(project=Path("."))
+        self.assertFalse(config.parallel_worktree_execution)
+        self.assertEqual(config.max_parallel_subtasks, 1)
+        self.assertTrue(config.serialize_overlapping_subtasks)
+
+    def test_from_environment_overrides_parallel_settings(self):
+        config = AgentConfig.from_environment(
+            project=Path("."),
+            parallel_worktree_execution=True,
+            max_parallel_subtasks=3,
+            serialize_overlapping_subtasks=False,
+        )
+        self.assertTrue(config.parallel_worktree_execution)
+        self.assertEqual(config.max_parallel_subtasks, 3)
+        self.assertFalse(config.serialize_overlapping_subtasks)
+
+    def test_validate_max_parallel_subtasks_bounds(self):
+        config = AgentConfig(project=Path("."), max_parallel_subtasks=0)
+        with self.assertRaises(ValueError):
+            config.validate()
+
+        config2 = AgentConfig(project=Path("."), max_parallel_subtasks=5)
+        with self.assertRaises(ValueError):
+            config2.validate()
+
+        config3 = AgentConfig(project=Path("."), max_parallel_subtasks=4)
+        config3.validate()  # valid
+
+    def test_legacy_task_storage_subclass_compatibility(self):
+        class LegacyStorage(TaskStorage):
+            def save_task(self, task): pass
+            def load_task(self, task_id): pass
+            def list_tasks(self): return []
+            def save_checkpoint(self, checkpoint): pass
+            def load_checkpoint(self, checkpoint_id): pass
+            def save_scheduler_state(self, state): pass
+            def load_scheduler_state(self): pass
+            def save_provider_configs(self, configs): pass
+            def load_provider_configs(self): return []
+            def save_semantic_index(self, index): pass
+            def load_semantic_index(self): pass
+            def save_project_memory(self, memory): pass
+            def load_project_memory(self): pass
+
+        storage = LegacyStorage()
+        kg = storage.load_knowledge_graph()
+        self.assertIsInstance(kg, RepositoryKnowledgeGraph)
+
+
+if __name__ == "__main__":
+    unittest.main()

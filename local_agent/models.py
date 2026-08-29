@@ -777,6 +777,8 @@ class Checkpoint:
     last_provider_result: dict[str, Any] | None = None
     next_recommended_action: str = ""
     continuation_context: dict[str, Any] = field(default_factory=dict)
+    active_worktrees: list[dict[str, Any]] = field(default_factory=list)
+    integration_branch: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -785,8 +787,11 @@ class Checkpoint:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
-        data["timestamp"] = datetime.datetime.fromisoformat(data["timestamp"])
-        return cls(**data)
+        d = dict(data)
+        d["timestamp"] = datetime.datetime.fromisoformat(d["timestamp"]) if isinstance(d["timestamp"], str) else d["timestamp"]
+        d.setdefault("active_worktrees", [])
+        d.setdefault("integration_branch", None)
+        return cls(**d)
 
 # Phase 4.10 / Phase 4.11: Cross-Subtask Semantic Contract & Behavioral Verification Models
 @dataclass
@@ -1041,6 +1046,53 @@ class SubtaskContract:
         )
 
 
+# Phase 4.14: Worktree Session & Parallel DAG Execution Models
+@dataclass
+class WorktreeSession:
+    session_id: str
+    subtask_id: str
+    worktree_path: str
+    branch_name: str
+    base_commit: str
+    created_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+    status: Literal["active", "merged", "failed", "cleaned", "abandoned"] = "active"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "subtask_id": self.subtask_id,
+            "worktree_path": self.worktree_path,
+            "branch_name": self.branch_name,
+            "base_commit": self.base_commit,
+            "created_at": self.created_at.isoformat() if isinstance(self.created_at, datetime.datetime) else str(self.created_at),
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        if not isinstance(data, dict):
+            return cls(session_id="", subtask_id="", worktree_path="", branch_name="", base_commit="")
+        raw_ts = data.get("created_at")
+        if isinstance(raw_ts, str):
+            try:
+                created_at = datetime.datetime.fromisoformat(raw_ts)
+            except Exception:
+                created_at = datetime.datetime.now(datetime.timezone.utc)
+        elif isinstance(raw_ts, datetime.datetime):
+            created_at = raw_ts
+        else:
+            created_at = datetime.datetime.now(datetime.timezone.utc)
+        return cls(
+            session_id=str(data.get("session_id", "")),
+            subtask_id=str(data.get("subtask_id", "")),
+            worktree_path=str(data.get("worktree_path", "")),
+            branch_name=str(data.get("branch_name", "")),
+            base_commit=str(data.get("base_commit", "")),
+            created_at=created_at,
+            status=data.get("status", "active"),
+        )
+
+
 @dataclass
 class Subtask:
     subtask_id: str
@@ -1059,6 +1111,8 @@ class Subtask:
     latest_checkpoint_id: str | None = None
     completion_info: dict[str, Any] = field(default_factory=dict)
     contract: SubtaskContract | None = None # Added for Phase 4.10
+    worktree_session: WorktreeSession | None = None # Added for Phase 4.14
+    integration_commit: str | None = None # Added for Phase 4.14
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -1073,6 +1127,8 @@ class Subtask:
             data["completed_at"] = self.completed_at.isoformat()
         if self.contract:
             data["contract"] = self.contract.to_dict()
+        if self.worktree_session:
+            data["worktree_session"] = self.worktree_session.to_dict()
         return data
 
     @classmethod
@@ -1090,18 +1146,24 @@ class Subtask:
         else:
             data["status"] = SubtaskStatus.PENDING
         if data.get("created_at"):
-            data["created_at"] = datetime.datetime.fromisoformat(data["created_at"])
+            data["created_at"] = datetime.datetime.fromisoformat(data["created_at"]) if isinstance(data["created_at"], str) else data["created_at"]
         if data.get("updated_at"):
-            data["updated_at"] = datetime.datetime.fromisoformat(data["updated_at"])
+            data["updated_at"] = datetime.datetime.fromisoformat(data["updated_at"]) if isinstance(data["updated_at"], str) else data["updated_at"]
         if data.get("started_at"):
-            data["started_at"] = datetime.datetime.fromisoformat(data["started_at"])
+            data["started_at"] = datetime.datetime.fromisoformat(data["started_at"]) if isinstance(data["started_at"], str) else data["started_at"]
         if data.get("completed_at"):
-            data["completed_at"] = datetime.datetime.fromisoformat(data["completed_at"])
+            data["completed_at"] = datetime.datetime.fromisoformat(data["completed_at"]) if isinstance(data["completed_at"], str) else data["completed_at"]
         if data.get("contract"):
             if isinstance(data["contract"], dict):
                 data["contract"] = SubtaskContract.from_dict(data["contract"])
         else:
             data["contract"] = None
+        if data.get("worktree_session"):
+            if isinstance(data["worktree_session"], dict):
+                data["worktree_session"] = WorktreeSession.from_dict(data["worktree_session"])
+        else:
+            data["worktree_session"] = None
+        data.setdefault("integration_commit", None)
         return cls(**data)
 
 

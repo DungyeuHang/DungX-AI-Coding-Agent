@@ -87,6 +87,7 @@ class TaskStorage(ABC):
         return RepositoryKnowledgeGraph()
 
 class JsonFileStorage(TaskStorage):
+    def __init__(self, base_dir: str | Path):
         self.base_dir = Path(base_dir)
         self.tasks_dir = self.base_dir / "tasks"
         self.checkpoints_dir = self.base_dir / "checkpoints"

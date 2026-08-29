@@ -15,7 +15,7 @@ DEFAULT_MAX_OUTPUT_BYTES = 4000
 DEFAULT_MAX_RESULTS = 50
 DEFAULT_MAX_LINES = 500
 
-PROTECTED_DIRS = {".git", ".hg", ".svn", ".agent_data"}
+PROTECTED_DIRS = {".git", ".hg", ".svn", ".agent_data", ".agent_worktrees"}
 
 
 def _is_binary_file(path: Path) -> bool:
