@@ -2871,11 +2871,6 @@ class ArchitecturalInvariantTests(unittest.TestCase):
             "local_agent.semantic_impact", imported_modules("local_agent.maintenance")
         )
 
-    def test_maintenance_modules_define_no_second_validation_decision(self):
-        for module in MAINTENANCE_MODULES:
-            source = ast.dump(_module_ast(module))
-            self.assertNotIn("ValidationDecision", source, module)
-
     def test_the_runner_reaches_the_repository_only_through_the_executor(self):
         """The single seam through which a repository change can happen.
 

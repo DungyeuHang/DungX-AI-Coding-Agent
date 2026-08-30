@@ -366,11 +366,13 @@ def sanitize_relative_path(value: Any) -> str:
 
     Rejects, in order: non-strings, absolute paths, Windows drive-qualified
     paths, UNC paths, anything that normalises to an escape from the root, and
-    anything whose first segment is a protected directory.
+    anything whose first segment is a protected directory. Embedded NUL bytes
+    are stripped before any other check, since some lower-level filesystem
+    APIs historically truncate a string at the first NUL.
     """
     if not isinstance(value, str):
         return ""
-    raw = value.strip()
+    raw = value.replace("\x00", "").strip()
     if not raw:
         return ""
     if raw.startswith("\\\\"):  # UNC
@@ -1399,6 +1401,9 @@ class MaintenanceStore:
         raw_candidates = data.get("candidates")
         if isinstance(raw_candidates, list):
             for entry in raw_candidates:
+                if not isinstance(entry, Mapping):
+                    store.corrupted_records_skipped += 1
+                    continue
                 try:
                     candidate = MaintenanceCandidate.from_dict(entry)
                 except Exception:
@@ -1413,6 +1418,9 @@ class MaintenanceStore:
         raw_runs = data.get("runs")
         if isinstance(raw_runs, list):
             for entry in raw_runs:
+                if not isinstance(entry, Mapping):
+                    store.corrupted_records_skipped += 1
+                    continue
                 try:
                     store._runs.append(MaintenanceRunRecord.from_dict(entry))
                 except Exception:

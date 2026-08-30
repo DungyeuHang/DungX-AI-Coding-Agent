@@ -8,3 +8,5 @@ venv/
 dist/
 build/
 *.egg-info/
+.agent_data/
+.agent_worktrees/
