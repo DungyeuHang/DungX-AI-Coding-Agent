@@ -457,6 +457,73 @@ tally, per-evidence-type reliability, a false-confidence-incident count
 status beyond `shadow_only`, since no live mode exists. Nothing consults this
 automatically; it exists to be read.
 
+It additionally reports an `analysis_degradation_rate` (how often the *analyzer*
+was the weak link, from the `degraded_analysis` flag now stored on each
+record), an `evidence_corruption_rate` measured against everything the store was
+ever offered rather than only what it kept, and the shadow aggregates
+(`shadow_comparisons`, `shadow_would_narrow`, `shadow_would_broaden`,
+`shadow_safety_overrides`, and `calibration_drift` - the mean *absolute*
+confidence delta calibration wanted to apply). All are zero by default, since
+`validation_calibration_enabled` is off.
+
+### Decision-quality metrics, and what the data cannot support
+
+`compute_decision_quality_metrics()` implements the metrics list, with naming
+chosen to avoid overclaiming:
+
+- **No recall figure is reported, ever.** Recall needs the count of defects a
+  change actually introduced, including those *no* scope ever detected. Nothing
+  observes that, so `recall_available` is permanently `False` and there is no
+  recall field to misread.
+- What is observable is the **observed escape rate**: of the targeted-scope
+  decisions where a broader run also executed and *could* have contradicted the
+  narrow one, how often it did. This is a *lower* bound on the true escape rate,
+  so `observed_escape_rate_upper_bound` (the pessimistic Wilson end) is what any
+  safety argument should quote. With zero trials it is `1.0`, not `0.0` - no
+  data must never look safe.
+- `targeted_agreement_rate` is called *agreement*, not *precision*: it measures
+  that the broader run did not contradict the narrow decision, which is weaker
+  than the narrow scope having been sufficient.
+- Reuse hit/rejection rates and the per-reason tally come from the same bounded
+  reason vocabulary as Phase 4.18; `stale_evidence_rejections` is the only
+  freshness signal available, since raw evidence timestamps are not retained
+  here. Measured over the ten Part 14 reuse scenarios, eight of the eleven
+  defined reasons actually occur (scenarios 7 and 8 - environment changed and
+  tool unavailable - both correctly surface as an environment mismatch).
+- `confidence_buckets` groups resolved observations by *predicted* confidence,
+  each with a Wilson lower bound, which is the raw material a future live
+  calibration would need.
+
+### Validation cost model
+
+`compute_cost_model()` reports measured cost only. A record whose duration is
+`0.0` is treated as **unmeasured and excluded**, never as a zero-cost run -
+averaging in a placeholder zero would fabricate a cheaper-looking cost profile.
+Every average is therefore accompanied by its `*_samples` count, the broad/
+targeted ratio is computed only over runs where *both* ends were measured on the
+same run, and `measured` is `False` when there is nothing to report. Nothing in
+the package consumes a cost model to make, weaken, or narrow a decision: it is
+input to the diagnostic report and to human judgement, not to policy.
+
+### Empirical false-negative findings
+
+`tests/test_empirical_validation_calibration.py` builds ten fixture
+repositories, one per dependency-relationship type, and analyzes each with the
+real analyzer. The measured result is worth stating plainly: **the graph misses
+some real dependencies.** Attribute-only access and an unresolved dynamic import
+do not surface the dependent in `affected_files` at all. What makes that
+survivable is that those same fixtures never come out at TARGETED scope - the
+confidence policy escalates them to EXPANDED, so the miss is compensated rather
+than silent. That property is asserted directly, and a genuinely isolated change
+is validated BROADly, which is a *cost* false positive and the correct direction
+to be wrong in.
+
+Synthetic defect injection confirms the escape mechanism is real rather than
+theoretical: a defect introduced into a dependent reached only by module-
+attribute access passes a targeted `pytest` run and fails the broad one, both
+executed as actual subprocesses in a temporary repository, and classifies as
+`targeted_missed_defect`.
+
 ### Concurrency and storage bounds
 
 `ValidationTelemetryManager` mirrors `KnowledgeGraphManager`'s pattern (one

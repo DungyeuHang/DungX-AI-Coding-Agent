@@ -2403,12 +2403,21 @@ class TestExecutableResolution(unittest.TestCase):
 
     def test_python_falls_back_to_the_running_interpreter(self):
         argv, note = resolve_executable(("python", "-c", "print(1)"))
-        self.assertEqual(argv[0], sys.executable)
         self.assertEqual(argv[1:], ("-c", "print(1)"))
+        if shutil.which("python") is not None:
+            # Already resolvable: rewriting it would be wrong, and
+            # ``resolve_executable`` correctly leaves it alone with no note.
+            self.assertEqual(argv[0], "python")
+            self.assertFalse(note)
+            return
+        self.assertEqual(argv[0], sys.executable)
         self.assertTrue(note)
 
     def test_python3_also_falls_back(self):
         argv, _ = resolve_executable(("python3", "-V"))
+        if shutil.which("python3") is not None:
+            self.assertEqual(argv[0], "python3")
+            return
         self.assertEqual(argv[0], sys.executable)
 
     def test_pytest_falls_back_to_dash_m_pytest(self):

@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from .dependency_resolution import ALL_EVIDENCE_TYPES, CONFIDENCE_BY_EVIDENCE_TYPE, confidence_for
+from .evidence import REASON_OK, REASON_STALE
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime import cycle
     from .semantic_impact import ChangeImpactReport
@@ -310,6 +311,13 @@ class ValidationDecisionRecord:
     targeted_duration_seconds: float = 0.0
     broad_duration_seconds: float = 0.0
     time_saved_seconds: float = 0.0
+    #: True when :func:`impact_is_degraded` held for the impact report behind
+    #: this decision. Stored (rather than recomputed) because the impact report
+    #: itself is deliberately *not* retained, and Part 15's "analyzer failure
+    #: rate" needs it. Defaults to ``False`` so a record written by the
+    #: original Phase 4.19 build - which had no such field - loads unchanged
+    #: and is simply not counted as degraded.
+    degraded_analysis: bool = False
     shadow: ShadowComparison = field(default_factory=ShadowComparison)
 
     def to_dict(self) -> dict[str, Any]:
@@ -337,6 +345,7 @@ class ValidationDecisionRecord:
             "targeted_duration_seconds": round(self.targeted_duration_seconds, 4),
             "broad_duration_seconds": round(self.broad_duration_seconds, 4),
             "time_saved_seconds": round(self.time_saved_seconds, 4),
+            "degraded_analysis": self.degraded_analysis,
             "shadow": self.shadow.to_dict(),
         }
 
@@ -373,6 +382,7 @@ class ValidationDecisionRecord:
             targeted_duration_seconds=float(data.get("targeted_duration_seconds", 0.0) or 0.0),
             broad_duration_seconds=float(data.get("broad_duration_seconds", 0.0) or 0.0),
             time_saved_seconds=float(data.get("time_saved_seconds", 0.0) or 0.0),
+            degraded_analysis=bool(data.get("degraded_analysis", False)),
             shadow=ShadowComparison.from_dict(data.get("shadow")),
         )
 
@@ -409,6 +419,7 @@ def build_decision_record(
         denied_command_count=decision.denied_count,
         reuse_reasons=dict(reuse_reasons or {}),
         time_saved_seconds=decision.time_saved_seconds,
+        degraded_analysis=impact_is_degraded(impact),
     )
 
 
@@ -561,6 +572,32 @@ class CalibrationObservation:
 # -- reliability estimation ----------------------------------------------------
 
 
+def wilson_bounds(successes: int, trials: int, *, z: float = 1.96) -> tuple[float, float]:
+    """Both ends of the Wilson score interval for ``successes/trials``.
+
+    Two callers need opposite ends of the same interval and must not disagree
+    about the arithmetic: :func:`wilson_lower_bound` wants the conservative end
+    of a *reliability* estimate (low is pessimistic), while
+    :func:`compute_decision_quality_metrics` wants the conservative end of an
+    *escape-rate* estimate (high is pessimistic). Sharing one implementation
+    keeps the two consistent by construction.
+
+    Returns ``(0.0, 1.0)`` for zero trials: with no data the true rate could be
+    anything, and neither end may pretend otherwise.
+    """
+    if trials <= 0:
+        return 0.0, 1.0
+    successes = max(0, min(successes, trials))
+    p_hat = successes / trials
+    z2 = z * z
+    denominator = 1.0 + z2 / trials
+    centre = p_hat + z2 / (2 * trials)
+    margin = z * ((p_hat * (1 - p_hat) / trials + z2 / (4 * trials * trials)) ** 0.5)
+    lower = (centre - margin) / denominator
+    upper = (centre + margin) / denominator
+    return max(0.0, min(1.0, lower)), max(0.0, min(1.0, upper))
+
+
 def wilson_lower_bound(successes: int, trials: int, *, z: float = 1.96) -> float:
     """Conservative (lower-bound) Wilson score confidence-interval estimate.
 
@@ -575,14 +612,7 @@ def wilson_lower_bound(successes: int, trials: int, *, z: float = 1.96) -> float
     """
     if trials <= 0:
         return 0.0
-    successes = max(0, min(successes, trials))
-    p_hat = successes / trials
-    z2 = z * z
-    denominator = 1.0 + z2 / trials
-    centre = p_hat + z2 / (2 * trials)
-    margin = z * ((p_hat * (1 - p_hat) / trials + z2 / (4 * trials * trials)) ** 0.5)
-    lower = (centre - margin) / denominator
-    return max(0.0, min(1.0, lower))
+    return wilson_bounds(successes, trials, z=z)[0]
 
 
 @dataclass
@@ -952,6 +982,288 @@ class ValidationTelemetryStore:
         return store
 
 
+# -- cost model (Part 11) --------------------------------------------------------
+
+
+def _mean(values: list[float]) -> float:
+    return (sum(values) / len(values)) if values else 0.0
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+@dataclass
+class ValidationCostModel:
+    """Measured validation cost, never a modelled or extrapolated one.
+
+    Every number here is an aggregate over durations that were *actually
+    recorded* by a finalized :class:`ValidationDecisionRecord`. A record whose
+    duration is ``0.0`` is treated as **unmeasured and excluded**, not as a
+    zero-cost run: averaging in a placeholder zero would silently invent a
+    cheaper-looking cost profile, which is precisely the kind of fabricated
+    metric Part 11 forbids ("just create reliable measurements"). The
+    ``*_samples`` counts therefore always accompany the corresponding
+    averages, so a caller can see how much data a number rests on.
+
+    This is deliberately *only* measurement. Nothing in this module consumes a
+    cost model to make, weaken, or narrow a validation decision - Part 11's
+    "do NOT let this phase automatically trade safety for cost".
+    """
+
+    decisions: int = 0
+    targeted_samples: int = 0
+    broad_samples: int = 0
+    mean_targeted_seconds: float = 0.0
+    median_targeted_seconds: float = 0.0
+    mean_broad_seconds: float = 0.0
+    median_broad_seconds: float = 0.0
+    #: Mean ``broad / targeted`` cost ratio, computed only over decisions where
+    #: *both* durations were measured on the same run (a cross-record ratio of
+    #: two independent means would not describe any real run).
+    paired_samples: int = 0
+    mean_broad_to_targeted_ratio: float = 0.0
+    #: Candidate-stage command runtime avoided by evidence reuse, summed from
+    #: what :class:`~local_agent.evidence.EvidenceLedger` actually measured when
+    #: the command originally ran.
+    total_reuse_time_saved_seconds: float = 0.0
+    mean_reuse_time_saved_per_decision_seconds: float = 0.0
+    mean_commands_selected: float = 0.0
+    mean_commands_reused: float = 0.0
+    #: False when there is nothing measured at all; a consumer must not present
+    #: any of the averages above as a cost estimate in that case.
+    measured: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "decisions": self.decisions,
+            "targeted_samples": self.targeted_samples,
+            "broad_samples": self.broad_samples,
+            "mean_targeted_seconds": round(self.mean_targeted_seconds, 4),
+            "median_targeted_seconds": round(self.median_targeted_seconds, 4),
+            "mean_broad_seconds": round(self.mean_broad_seconds, 4),
+            "median_broad_seconds": round(self.median_broad_seconds, 4),
+            "paired_samples": self.paired_samples,
+            "mean_broad_to_targeted_ratio": round(self.mean_broad_to_targeted_ratio, 4),
+            "total_reuse_time_saved_seconds": round(self.total_reuse_time_saved_seconds, 4),
+            "mean_reuse_time_saved_per_decision_seconds": round(
+                self.mean_reuse_time_saved_per_decision_seconds, 4
+            ),
+            "mean_commands_selected": round(self.mean_commands_selected, 4),
+            "mean_commands_reused": round(self.mean_commands_reused, 4),
+            "measured": self.measured,
+        }
+
+
+def compute_cost_model(store: "ValidationTelemetryStore") -> ValidationCostModel:
+    """Aggregate measured validation cost over a bounded decision history."""
+    decisions = store.decisions
+    if not decisions:
+        return ValidationCostModel()
+
+    targeted = [r.targeted_duration_seconds for r in decisions if r.targeted_duration_seconds > 0]
+    broad = [r.broad_duration_seconds for r in decisions if r.broad_duration_seconds > 0]
+    ratios = [
+        r.broad_duration_seconds / r.targeted_duration_seconds
+        for r in decisions
+        if r.targeted_duration_seconds > 0 and r.broad_duration_seconds > 0
+    ]
+    saved = [r.time_saved_seconds for r in decisions]
+
+    return ValidationCostModel(
+        decisions=len(decisions),
+        targeted_samples=len(targeted),
+        broad_samples=len(broad),
+        mean_targeted_seconds=_mean(targeted),
+        median_targeted_seconds=_median(targeted),
+        mean_broad_seconds=_mean(broad),
+        median_broad_seconds=_median(broad),
+        paired_samples=len(ratios),
+        mean_broad_to_targeted_ratio=_mean(ratios),
+        total_reuse_time_saved_seconds=sum(saved),
+        mean_reuse_time_saved_per_decision_seconds=_mean(saved),
+        mean_commands_selected=_mean([float(r.selected_command_count) for r in decisions]),
+        mean_commands_reused=_mean([float(r.reused_command_count) for r in decisions]),
+        measured=bool(targeted or broad),
+    )
+
+
+# -- decision-quality metrics (Part 4) -------------------------------------------
+
+
+@dataclass
+class ConfidenceBucket:
+    """Observed behaviour of one predicted-confidence level."""
+
+    predicted_confidence: str = ""
+    resolved_trials: int = 0
+    escapes: int = 0
+    agreement_rate: float = 0.0
+    agreement_lower_bound: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "predicted_confidence": self.predicted_confidence,
+            "resolved_trials": self.resolved_trials,
+            "escapes": self.escapes,
+            "agreement_rate": round(self.agreement_rate, 4),
+            "agreement_lower_bound": round(self.agreement_lower_bound, 4),
+        }
+
+
+@dataclass
+class DecisionQualityMetrics:
+    """Part 4's metrics, with deliberately conservative naming.
+
+    **Terminology, and what this data genuinely cannot support.** Part 4 asks
+    for "targeted recall". Recall requires knowing the total number of defects
+    a change actually introduced, including those *no* validation scope ran by
+    this agent ever detected. Nothing observes that, so no recall figure is
+    reported and :attr:`recall_available` is permanently ``False``. What *is*
+    observable is: of the targeted-scope decisions where a broader run also
+    executed and could therefore contradict the narrow one, how often it did.
+    That is an **observed escape rate**, and it is a *lower* bound on the true
+    escape rate (a defect neither the targeted nor the broad run caught is
+    invisible to it), which is why
+    :attr:`observed_escape_rate_upper_bound` - the pessimistic end of the
+    Wilson interval, not the point estimate - is what any safety argument
+    should quote.
+
+    Likewise :attr:`targeted_agreement_rate` is called *agreement*, not
+    *precision*: it measures how often the narrow decision was not contradicted
+    by the broader run, which is a weaker claim than the narrow scope having
+    been sufficient.
+    """
+
+    resolved_observations: int = 0
+    #: Targeted-scope decisions that reached a state where a broader run either
+    #: confirmed or contradicted them - the only denominator that supports an
+    #: escape-rate claim at all.
+    targeted_resolved_trials: int = 0
+    targeted_escapes: int = 0
+    targeted_caught_defects: int = 0
+    observed_escape_rate: float = 0.0
+    observed_escape_rate_upper_bound: float = 1.0
+    targeted_agreement_rate: float = 0.0
+    broad_validation_rate: float = 0.0
+    broad_not_proven_necessary: int = 0
+    reuse_attempts: int = 0
+    reuse_grants: int = 0
+    reuse_denials: int = 0
+    reuse_hit_rate: float = 0.0
+    reuse_rejection_rate: float = 0.0
+    reuse_rejection_reasons: dict[str, int] = field(default_factory=dict)
+    #: Denials attributed specifically to evidence age - the only freshness
+    #: signal available, since raw evidence timestamps are not retained here.
+    stale_evidence_rejections: int = 0
+    confidence_buckets: dict[str, ConfidenceBucket] = field(default_factory=dict)
+    #: Permanently ``False``; see the class docstring.
+    recall_available: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "resolved_observations": self.resolved_observations,
+            "targeted_resolved_trials": self.targeted_resolved_trials,
+            "targeted_escapes": self.targeted_escapes,
+            "targeted_caught_defects": self.targeted_caught_defects,
+            "observed_escape_rate": round(self.observed_escape_rate, 4),
+            "observed_escape_rate_upper_bound": round(self.observed_escape_rate_upper_bound, 4),
+            "targeted_agreement_rate": round(self.targeted_agreement_rate, 4),
+            "broad_validation_rate": round(self.broad_validation_rate, 4),
+            "broad_not_proven_necessary": self.broad_not_proven_necessary,
+            "reuse_attempts": self.reuse_attempts,
+            "reuse_grants": self.reuse_grants,
+            "reuse_denials": self.reuse_denials,
+            "reuse_hit_rate": round(self.reuse_hit_rate, 4),
+            "reuse_rejection_rate": round(self.reuse_rejection_rate, 4),
+            "reuse_rejection_reasons": dict(self.reuse_rejection_reasons),
+            "stale_evidence_rejections": self.stale_evidence_rejections,
+            "confidence_buckets": {k: v.to_dict() for k, v in self.confidence_buckets.items()},
+            "recall_available": self.recall_available,
+        }
+
+
+def compute_decision_quality_metrics(
+    store: "ValidationTelemetryStore",
+) -> DecisionQualityMetrics:
+    """Derive Part 4's metrics from a bounded store. Read-only and pure."""
+    decisions = store.decisions
+    observations = store.observations
+
+    resolved = [
+        o
+        for o in observations
+        if o.decision_quality in _RESOLVED_SUCCESS_QUALITIES
+        or o.decision_quality in _RESOLVED_FAILURE_QUALITIES
+    ]
+    targeted_resolved = [o for o in resolved if o.selected_scope == "targeted"]
+    escapes = sum(
+        1 for o in targeted_resolved if o.decision_quality == QUALITY_TARGETED_MISSED_DEFECT
+    )
+    caught = sum(
+        1 for o in targeted_resolved if o.decision_quality == QUALITY_TARGETED_CAUGHT_DEFECT
+    )
+    trials = len(targeted_resolved)
+    escape_rate = (escapes / trials) if trials else 0.0
+    # The pessimistic end of the interval on the escape rate. With zero trials
+    # this is 1.0: no data must never look like a low escape rate.
+    _, escape_upper = wilson_bounds(escapes, trials)
+
+    buckets: dict[str, ConfidenceBucket] = {}
+    for level in _CONFIDENCE_ORDER:
+        in_bucket = [o for o in resolved if o.predicted_confidence == level]
+        if not in_bucket:
+            continue
+        bucket_escapes = sum(
+            1 for o in in_bucket if o.decision_quality == QUALITY_TARGETED_MISSED_DEFECT
+        )
+        agreements = len(in_bucket) - bucket_escapes
+        buckets[level] = ConfidenceBucket(
+            predicted_confidence=level,
+            resolved_trials=len(in_bucket),
+            escapes=bucket_escapes,
+            agreement_rate=agreements / len(in_bucket),
+            agreement_lower_bound=wilson_lower_bound(agreements, len(in_bucket)),
+        )
+
+    reason_totals = store.reuse_reason_totals()
+    grants = reason_totals.get(REASON_OK, 0)
+    attempts = sum(reason_totals.values())
+    denials = attempts - grants
+    rejection_reasons = {k: v for k, v in reason_totals.items() if k != REASON_OK}
+
+    total_decisions = len(decisions)
+    broad_count = sum(1 for r in decisions if r.scope == "broad")
+
+    return DecisionQualityMetrics(
+        resolved_observations=len(resolved),
+        targeted_resolved_trials=trials,
+        targeted_escapes=escapes,
+        targeted_caught_defects=caught,
+        observed_escape_rate=escape_rate,
+        observed_escape_rate_upper_bound=escape_upper,
+        targeted_agreement_rate=((trials - escapes) / trials) if trials else 0.0,
+        broad_validation_rate=(broad_count / total_decisions) if total_decisions else 0.0,
+        broad_not_proven_necessary=sum(
+            1 for o in observations if o.decision_quality == QUALITY_BROAD_NOT_PROVEN_NECESSARY
+        ),
+        reuse_attempts=attempts,
+        reuse_grants=grants,
+        reuse_denials=denials,
+        reuse_hit_rate=(grants / attempts) if attempts else 0.0,
+        reuse_rejection_rate=(denials / attempts) if attempts else 0.0,
+        reuse_rejection_reasons=rejection_reasons,
+        stale_evidence_rejections=reason_totals.get(REASON_STALE, 0),
+        confidence_buckets=buckets,
+    )
+
+
 # -- health report --------------------------------------------------------------
 
 
@@ -969,6 +1281,26 @@ class ValidationIntelligenceHealth:
     unresolved_dependency_rate: float = 0.0
     dynamic_import_rate: float = 0.0
     corrupted_records_skipped: int = 0
+    #: Fraction of decisions whose impact analysis was itself degraded
+    #: (:func:`impact_is_degraded`). Part 15's "analyzer failure rate": a high
+    #: value means the *analyzer*, not the calibration, is the weak link.
+    analysis_degradation_rate: float = 0.0
+    #: Corrupted entries as a fraction of everything that was offered to the
+    #: store (kept entries plus skipped ones), so the number stays meaningful
+    #: as history accumulates instead of only ever growing.
+    evidence_corruption_rate: float = 0.0
+    #: Shadow-mode aggregates. ``calibration_drift`` is the mean *absolute*
+    #: confidence delta over shadow comparisons that were actually computed -
+    #: how far calibration wants to move from the fixed table, in either
+    #: direction. Zero when nothing has been computed, which is the default
+    #: state since ``validation_calibration_enabled`` defaults to ``False``.
+    shadow_comparisons: int = 0
+    shadow_would_narrow: int = 0
+    shadow_would_broaden: int = 0
+    shadow_safety_overrides: int = 0
+    calibration_drift: float = 0.0
+    cost: ValidationCostModel = field(default_factory=ValidationCostModel)
+    quality: DecisionQualityMetrics = field(default_factory=DecisionQualityMetrics)
     calibration_status: str = "insufficient_data"
 
     def to_dict(self) -> dict[str, Any]:
@@ -987,6 +1319,15 @@ class ValidationIntelligenceHealth:
             "unresolved_dependency_rate": round(self.unresolved_dependency_rate, 4),
             "dynamic_import_rate": round(self.dynamic_import_rate, 4),
             "corrupted_records_skipped": self.corrupted_records_skipped,
+            "analysis_degradation_rate": round(self.analysis_degradation_rate, 4),
+            "evidence_corruption_rate": round(self.evidence_corruption_rate, 4),
+            "shadow_comparisons": self.shadow_comparisons,
+            "shadow_would_narrow": self.shadow_would_narrow,
+            "shadow_would_broaden": self.shadow_would_broaden,
+            "shadow_safety_overrides": self.shadow_safety_overrides,
+            "calibration_drift": round(self.calibration_drift, 4),
+            "cost": self.cost.to_dict(),
+            "quality": self.quality.to_dict(),
             "calibration_status": self.calibration_status,
         }
 
@@ -1017,6 +1358,12 @@ def compute_health(
     dynamic_hits = sum(
         1 for r in decisions if any("dynamic_import" in e for e in r.evidence_types)
     )
+    degraded_hits = sum(1 for r in decisions if r.degraded_analysis)
+    shadow_records = [r for r in decisions if r.shadow.computed]
+    # Everything the store was ever offered: what it kept plus what it refused
+    # to deserialise. Using this as the denominator keeps the corruption *rate*
+    # honest even after eviction has trimmed the kept entries.
+    offered = total + len(observations) + store.corrupted_records_skipped
 
     resolved = [o for o in observations if o.outcome != OUTCOME_PENDING]
     false_confidence = sum(
@@ -1044,6 +1391,21 @@ def compute_health(
         unresolved_dependency_rate=(unresolved_hits / total) if total else 0.0,
         dynamic_import_rate=(dynamic_hits / total) if total else 0.0,
         corrupted_records_skipped=store.corrupted_records_skipped,
+        analysis_degradation_rate=(degraded_hits / total) if total else 0.0,
+        evidence_corruption_rate=(
+            store.corrupted_records_skipped / offered if offered else 0.0
+        ),
+        shadow_comparisons=len(shadow_records),
+        shadow_would_narrow=sum(1 for r in shadow_records if r.shadow.would_narrow),
+        shadow_would_broaden=sum(1 for r in shadow_records if r.shadow.would_broaden),
+        shadow_safety_overrides=sum(1 for r in shadow_records if r.shadow.safety_override),
+        calibration_drift=(
+            sum(abs(r.shadow.confidence_delta) for r in shadow_records) / len(shadow_records)
+            if shadow_records
+            else 0.0
+        ),
+        cost=compute_cost_model(store),
+        quality=compute_decision_quality_metrics(store),
         calibration_status=status,
     )
 
