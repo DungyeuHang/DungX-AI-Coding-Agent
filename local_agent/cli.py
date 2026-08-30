@@ -617,6 +617,41 @@ def _build_maintenance_runner(config, storage, *, progress=None):
     ), manager
 
 
+def _candidates_with_live_tasks(storage) -> set[str]:
+    """Maintenance candidate ids that already have a non-terminal task.
+
+    Reads the provenance stamp ``_enqueue_work_orders`` writes into the task's
+    execution history. A storage backend that cannot list tasks, or a task
+    whose history is malformed, contributes nothing: failing to detect a
+    duplicate costs an extra queued task, whereas failing the whole run over an
+    unreadable record would cost the operator the scan.
+    """
+    from .models import TaskStatus as _TaskStatus
+
+    live_states = {
+        _TaskStatus.PENDING,
+        _TaskStatus.RUNNING,
+        _TaskStatus.PAUSED,
+        _TaskStatus.PLAN_REVIEW,
+        _TaskStatus.PLAN_PROPOSED,
+    }
+    outstanding: set[str] = set()
+    try:
+        tasks = storage.list_tasks()
+    except Exception:
+        return outstanding
+    for task in tasks or []:
+        if getattr(task, "status", None) not in live_states:
+            continue
+        for entry in getattr(task, "execution_history", None) or []:
+            if not isinstance(entry, dict) or entry.get("source") != "maintenance":
+                continue
+            candidate_id = entry.get("candidate_id")
+            if isinstance(candidate_id, str) and candidate_id:
+                outstanding.add(candidate_id)
+    return outstanding
+
+
 def _enqueue_work_orders(result, storage) -> list[str]:
     """Turn planned work orders into ordinary pending tasks.
 
@@ -631,8 +666,21 @@ def _enqueue_work_orders(result, storage) -> list[str]:
 
     from .models import Task, TaskStatus as _TaskStatus
 
+    # A maintenance signal persists until something fixes it, so every run
+    # re-discovers it and re-plans the same work order. Without this check a
+    # scheduled `maintenance run --enqueue` - which is the whole point of a
+    # *continuous* maintenance loop - would add another identical pending task
+    # on every tick, and the queue would grow without bound while nothing new
+    # was ever proposed. A candidate that already has live work outstanding is
+    # skipped; once that task reaches a terminal state the candidate becomes
+    # enqueueable again, which is what makes a genuinely recurring problem
+    # recur.
+    outstanding = _candidates_with_live_tasks(storage)
+
     created: list[str] = []
     for candidate_id in sorted(result.work_orders):
+        if candidate_id in outstanding:
+            continue
         order = result.work_orders[candidate_id]
         now = datetime.datetime.now(datetime.timezone.utc)
         objective = order.objective

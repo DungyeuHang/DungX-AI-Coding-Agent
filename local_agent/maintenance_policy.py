@@ -31,13 +31,14 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .maintenance import (
-    PROTECTED_DIRECTORY_NAMES,
     PROTECTED_RELATIVE_PATHS,
     MaintenanceBudget,
     MaintenanceCandidate,
     MaintenanceSignal,
     SEVERITY_CRITICAL,
     SEVERITY_ORDER,
+    is_protected_directory_segment,
+    is_protected_relative_path,
     sanitize_relative_path,
     sanitize_text,
     severity_rank,
@@ -409,6 +410,17 @@ class MaintenanceExecutionPolicy:
         self.protected_paths = PROTECTED_RELATIVE_PATHS | frozenset(protected_paths or ())
         self.repository_root = Path(repository_root).resolve() if repository_root else None
 
+    def is_protected(self, path: Any) -> bool:
+        """True when ``path`` is on this policy's protected floor.
+
+        Case-insensitive, for the reason documented on
+        :func:`~local_agent.maintenance.is_protected_relative_path`: on
+        Windows and macOS ``Local_Agent/Tool_Engine.py`` is the very same file
+        as ``local_agent/tool_engine.py``, and a case-sensitive membership test
+        would grant an executing tier to a candidate targeting the tool engine.
+        """
+        return is_protected_relative_path(path, extra=self.protected_paths)
+
     def decide(
         self,
         candidate: MaintenanceCandidate,
@@ -451,7 +463,7 @@ class MaintenanceExecutionPolicy:
                 "protected directory: " + ", ".join(rejected[:5])
             )
         protected_hits = sorted(
-            path for path in candidate.affected_files if path in self.protected_paths
+            path for path in candidate.affected_files if self.is_protected(path)
         )
         if protected_hits:
             verdict.blocking_reasons.append(
@@ -549,7 +561,7 @@ class MaintenanceExecutionPolicy:
             if sanitize_relative_path(path) != path:
                 rejected.append(sanitize_text(path, limit=200))
                 continue
-            if any(segment in PROTECTED_DIRECTORY_NAMES for segment in path.split("/")):
+            if any(is_protected_directory_segment(segment) for segment in path.split("/")):
                 rejected.append(path)
                 continue
             if self.repository_root is not None and not self._inside_root(path):

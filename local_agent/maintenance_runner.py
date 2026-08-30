@@ -264,10 +264,20 @@ def plan_execution_batches(
     max_width = max(1, int(max_width))
     batches: list[list[MaintenanceCandidate]] = []
     batch_files: list[set[str]] = []
+    # Batches only ever gain members, so once a batch is full it stays full and
+    # the index of the first non-full batch never decreases. Tracking it turns
+    # what was a quadratic rescan of every already-full batch into an
+    # amortised-constant skip; with 10 000 disjoint candidates the original
+    # loop took ~1.5s doing nothing but re-reading full batches. The placement
+    # decision - and therefore the output - is unchanged.
+    first_open = 0
     for candidate in candidates:
         files = set(candidate.affected_files)
         placed = False
-        for index, existing in enumerate(batch_files):
+        while first_open < len(batches) and len(batches[first_open]) >= max_width:
+            first_open += 1
+        for index in range(first_open, len(batch_files)):
+            existing = batch_files[index]
             if len(batches[index]) >= max_width:
                 continue
             if files and existing.intersection(files):
@@ -344,8 +354,14 @@ def reassess(
        see everything cannot testify that something is gone.
     3. **Validation failed** -> ``PERSISTING`` at best. A change that does not
        validate has not fixed anything, whatever the signal now says.
-    4. **Signal absent** -> ``RESOLVED``. This is the only path to RESOLVED,
-       and it requires 1-3 to have passed first.
+    3b. **Validation outcome unknown** -> ``INCONCLUSIVE`` where the answer
+       would otherwise have been ``RESOLVED``. A pipeline that did not report a
+       validation verdict has not told us the change is safe, and "the signal
+       is gone" plus "we do not know whether the repository still works" is not
+       a resolution. This mirrors the runner's own rule that an unknown
+       validation result is never assumed to be a pass.
+    4. **Signal absent and validation passed** -> ``RESOLVED``. This is the only
+       path to RESOLVED, and it requires 1-3b to have passed first.
     5. **Severity increased, or the fingerprint changed for the worse** ->
        ``REGRESSED``.
     6. **Severity decreased** -> ``PARTIALLY_RESOLVED``.
@@ -376,6 +392,13 @@ def reassess(
         verdict.outcome = ReassessmentOutcome.PERSISTING
         verdict.reasons.append(
             "validation failed, so no fix can be credited regardless of the signal"
+        )
+        return verdict
+    if after is None and validation_passed is None:
+        verdict.outcome = ReassessmentOutcome.INCONCLUSIVE
+        verdict.reasons.append(
+            "the signal is no longer detected, but the pipeline reported no "
+            "validation verdict, so the change cannot be credited as a fix"
         )
         return verdict
     if after is None:
@@ -720,7 +743,15 @@ class MaintenanceRunner:
             record.errors.append(sanitize_text(f"{type(exc).__name__}: {exc}"))
 
         elapsed = time.perf_counter() - started
-        ledger.observe("max_elapsed_seconds", elapsed)
+        # Only the time not already attributed to an individual candidate is
+        # added here. Observing the whole wall-clock again would double-count
+        # every executor call: the ledger would report roughly twice the time
+        # the run actually spent, and - worse - ``exhausted`` would start
+        # refusing candidates while half the budget was still unspent.
+        ledger.observe(
+            "max_elapsed_seconds",
+            max(0.0, elapsed - ledger.consumed("max_elapsed_seconds")),
+        )
         record.elapsed_seconds = elapsed
         record.finished_at = _timestamp()
         record.budget = ledger.to_dict()
@@ -757,6 +788,21 @@ class MaintenanceRunner:
         record.candidates_discovered = len(considered)
         for name, error in sorted(analysis.extractor_errors.items()):
             record.errors.append(f"{name}: {error}")
+        # Degradation has to survive into the persisted record. Without this,
+        # `maintenance history` shows a scan that could not see half the
+        # repository's intelligence as an unqualified success, and an operator
+        # reading it later has no way to tell "we found nothing" apart from
+        # "we could not look" - the exact confusion the AnalysisResult.degraded
+        # flag exists to prevent, thrown away at persistence time.
+        unavailable = sorted(
+            name for name, available in analysis.sources_available.items() if not available
+        )
+        if unavailable:
+            record.notes.append(
+                "degraded scan: intelligence source(s) unavailable: "
+                + ", ".join(unavailable)
+                + "; absence of a signal is not evidence it is gone"
+            )
         return analysis
 
     def _score_and_select(
@@ -904,7 +950,7 @@ class MaintenanceRunner:
         protected_touched = sorted(
             path
             for path in outcome.changed_files
-            if path in self.policy.protected_paths
+            if self.policy.is_protected(path)
         )
         if protected_touched:
             errors.append(

@@ -73,6 +73,40 @@ PROTECTED_DIRECTORY_NAMES: frozenset[str] = frozenset(
     {".git", ".venv", "venv", "node_modules", "__pycache__"}
 )
 
+#: Case-folded views of the two protection sets.
+#:
+#: Every comparison against them is case-insensitive, because the agent's two
+#: primary platforms (Windows, macOS) have case-insensitive filesystems: there,
+#: ``Local_Agent/Tool_Engine.py`` and ``.GIT/config`` name exactly the same
+#: objects as their lowercase spellings, and a case-sensitive membership test
+#: would let a candidate walk straight past the protection floor. Folding is
+#: strictly more conservative than not folding, so it is applied on every
+#: platform rather than being made platform-dependent - a candidate loaded from
+#: a store written on Windows must be refused when it is read on Linux too.
+_PROTECTED_RELATIVE_PATHS_FOLDED: frozenset[str] = frozenset(
+    path.casefold() for path in PROTECTED_RELATIVE_PATHS
+)
+_PROTECTED_DIRECTORY_NAMES_FOLDED: frozenset[str] = frozenset(
+    name.casefold() for name in PROTECTED_DIRECTORY_NAMES
+)
+
+
+def is_protected_directory_segment(segment: Any) -> bool:
+    """True when ``segment`` names a protected directory, ignoring case."""
+    return str(segment).casefold() in _PROTECTED_DIRECTORY_NAMES_FOLDED
+
+
+def is_protected_relative_path(path: Any, *, extra: Iterable[str] = ()) -> bool:
+    """True when ``path`` is on the protected floor, ignoring case.
+
+    ``extra`` lets a caller add its own protected paths without having to
+    re-implement the folding rule; they are folded here on the way in.
+    """
+    folded = str(path).casefold()
+    if folded in _PROTECTED_RELATIVE_PATHS_FOLDED:
+        return True
+    return any(folded == str(item).casefold() for item in extra)
+
 
 # -- signal taxonomy ----------------------------------------------------------
 
@@ -387,7 +421,7 @@ def sanitize_relative_path(value: Any) -> str:
     if escapes_root(normalised):
         return ""
     segments = normalised.split("/")
-    if any(segment in PROTECTED_DIRECTORY_NAMES for segment in segments):
+    if any(is_protected_directory_segment(segment) for segment in segments):
         return ""
     if any(segment in {"", ".", ".."} for segment in segments):
         return ""
@@ -581,7 +615,7 @@ class MaintenanceCandidate:
         here - it simply is not in the list any more. Both conditions are
         checked separately by :mod:`local_agent.maintenance_policy`.
         """
-        return any(path in PROTECTED_RELATIVE_PATHS for path in self.affected_files)
+        return any(is_protected_relative_path(path) for path in self.affected_files)
 
     @property
     def failure_ratio(self) -> float:
@@ -785,6 +819,12 @@ def _safe_int(value: Any, *, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _positive_or(value: Any, default: int) -> int:
+    """``value`` as a positive int, or ``default`` when it is not one."""
+    parsed = _safe_int(value, default=0)
+    return parsed if parsed > 0 else default
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1034,7 +1074,30 @@ class BudgetLedger:
         return dict(self._refusals)
 
     def child(self, budget: MaintenanceBudget | None = None) -> "BudgetLedger":
-        return BudgetLedger(budget or self.budget, parent=self)
+        """A sub-ledger that can never be more permissive than this one.
+
+        Shared run-level budgets are already policed through ``parent`` on
+        every consumption. The per-candidate counts are not - they are meant to
+        be spent independently - so without clamping, handing ``child()`` a
+        larger budget would raise the effective limit above the parent's and
+        break ``child_budget <= parent_remaining_budget``. Every limit is
+        therefore clamped to the parent's *remaining* allowance at the moment
+        the child is created.
+        """
+        if budget is None:
+            return BudgetLedger(self.budget, parent=self)
+        clamped: dict[str, Any] = {}
+        for name, value in budget.to_dict().items():
+            remaining = self.remaining(name)
+            clamped[name] = (
+                min(int(value), int(remaining))
+                if isinstance(value, int) and not isinstance(value, bool)
+                else min(float(value), remaining)
+            )
+        # A fully-spent parent leaves a child with a zero time/cost allowance,
+        # which ``MaintenanceBudget.validate`` rejects; the ledger still bounds
+        # it correctly, so validation is deliberately not re-run here.
+        return BudgetLedger(MaintenanceBudget(**clamped), parent=self)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1388,9 +1451,14 @@ class MaintenanceStore:
             store = cls()
             store.corrupted_records_skipped = 1
             return store
+        # A persisted retention cap is honoured only when it is a usable
+        # positive integer. A corrupted or hostile file carrying
+        # ``max_candidates: -5`` (or ``"abc"``, or ``0``) would otherwise clamp
+        # to one and silently evict the operator's entire history during the
+        # load - data loss driven by the very record that is not to be trusted.
         store = cls(
-            max_candidates=data.get("max_candidates", DEFAULT_MAX_CANDIDATES),
-            max_runs=data.get("max_runs", DEFAULT_MAX_RUNS),
+            max_candidates=_positive_or(data.get("max_candidates"), DEFAULT_MAX_CANDIDATES),
+            max_runs=_positive_or(data.get("max_runs"), DEFAULT_MAX_RUNS),
         )
         store.corrupted_records_skipped = max(
             0, _safe_int(data.get("corrupted_records_skipped"))

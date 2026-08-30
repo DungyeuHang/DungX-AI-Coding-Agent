@@ -38,6 +38,7 @@ from local_agent.maintenance import (
     ALL_CANDIDATE_STATES,
     ALL_REASSESSMENT_OUTCOMES,
     ALL_RUN_MODES,
+    ALL_PROVENANCES,
     ALL_SIGNAL_KINDS,
     DEFAULT_MAX_CANDIDATES,
     MAINTENANCE_SCHEMA_VERSION,
@@ -1980,13 +1981,32 @@ class RealRepositoryScanTests(unittest.TestCase):
         self.assertNotIn(MaintenanceSignal.PARSE_FAILURE, {c.kind for c in result.candidates})
 
     def test_scanning_the_agents_own_repository_produces_real_candidates(self):
+        """REAL REPOSITORY DATA: the agent's own tree.
+
+        Strengthened during the post-implementation audit. As written
+        originally this asserted only ``isinstance(list)`` and then looped over
+        a possibly-empty list, so it passed identically whether the analyzer
+        produced eleven candidates or none at all - which is exactly the
+        outcome it was named to rule out. It now asserts the precondition (the
+        graph really was built), that the scan really did produce candidates,
+        and that every one of them is well-formed and attributed.
+        """
         root = Path(__file__).resolve().parents[1]
         graph = SemanticGraph.build(root)
+        self.assertTrue(graph.reverse_deps, "the semantic graph came back empty")
         result = MaintenanceAnalyzer(root).analyze(semantic_graph=graph)
-        self.assertIsInstance(result.candidates, list)
+        self.assertTrue(
+            result.candidates,
+            "scanning the agent's own repository produced no candidates at all",
+        )
         for candidate in result.candidates:
-            self.assertTrue(candidate.candidate_id)
+            self.assertTrue(candidate.candidate_id, candidate.title)
             self.assertIn(candidate.kind, ALL_SIGNAL_KINDS)
+            self.assertIn(candidate.provenance, ALL_PROVENANCES)
+            self.assertTrue(candidate.title)
+            self.assertTrue(candidate.recommended_action)
+            for path in candidate.affected_files:
+                self.assertEqual(sanitize_relative_path(path), path)
 
 
 class ChurnTests(unittest.TestCase):
@@ -2108,9 +2128,29 @@ class ReassessmentTests(unittest.TestCase):
         verdict = reassess(self.before, after, executed=True, validation_passed=True)
         self.assertEqual(verdict.outcome, ReassessmentOutcome.REGRESSED)
 
-    def test_unknown_validation_still_permits_resolution_on_a_vanished_signal(self):
+    def test_unknown_validation_cannot_be_credited_as_resolution(self):
+        """A vanished signal plus an unknown validation verdict is INCONCLUSIVE.
+
+        This test previously asserted RESOLVED. That was wrong, and it
+        contradicted both the runner ("unknown stays unknown, never assumed
+        true") and the module's own stated rule that insufficient evidence
+        yields INCONCLUSIVE. A pipeline that reports no validation verdict has
+        not told us the repository still works, and "the maintenance signal is
+        gone" is not, on its own, a safe outcome: a change that deletes the
+        offending file removes the signal too.
+        """
         verdict = reassess(self.before, None, executed=True, validation_passed=None)
-        self.assertEqual(verdict.outcome, ReassessmentOutcome.RESOLVED)
+        self.assertEqual(verdict.outcome, ReassessmentOutcome.INCONCLUSIVE)
+
+    def test_a_vanished_signal_needs_a_positive_validation_verdict(self):
+        self.assertEqual(
+            reassess(self.before, None, executed=True, validation_passed=True).outcome,
+            ReassessmentOutcome.RESOLVED,
+        )
+        self.assertNotEqual(
+            reassess(self.before, None, executed=True, validation_passed=None).outcome,
+            ReassessmentOutcome.RESOLVED,
+        )
 
     def test_every_verdict_carries_a_reason(self):
         for after in (None, make_candidate()):
@@ -2874,10 +2914,11 @@ class ArchitecturalInvariantTests(unittest.TestCase):
     def test_the_runner_reaches_the_repository_only_through_the_executor(self):
         """The single seam through which a repository change can happen.
 
-        Asserted from the AST: the runner names exactly one attribute that is
-        called with a work order, and it is injected. If a future change added
-        a direct call into the implementation pipeline, this would catch it by
-        the module's import list rather than by anyone remembering to look.
+        The original docstring claimed this test proved "the runner names
+        exactly one attribute that is called with a work order"; it did not -
+        it only checked the import list. Both claims are worth having, so the
+        second one is now actually asserted: ``self.executor`` is the only
+        attribute the runner ever calls with the work order it built.
         """
         imported = imported_modules("local_agent.maintenance_runner")
         for forbidden in (
@@ -2888,6 +2929,24 @@ class ArchitecturalInvariantTests(unittest.TestCase):
             "local_agent.validation",
         ):
             self.assertNotIn(forbidden, imported, forbidden)
+
+        execute = next(
+            node
+            for node in ast.walk(_module_ast("local_agent.maintenance_runner"))
+            if isinstance(node, ast.FunctionDef) and node.name == "_execute_one"
+        )
+        called_with_the_order = set()
+        for call in ast.walk(execute):
+            if not isinstance(call, ast.Call):
+                continue
+            if any(
+                isinstance(arg, ast.Name) and arg.id == "order" for arg in call.args
+            ):
+                called_with_the_order.add(ast.dump(call.func))
+        self.assertEqual(
+            called_with_the_order,
+            {ast.dump(ast.parse("self.executor", mode="eval").body)},
+        )
 
 
 class ConfigurationInvariantTests(unittest.TestCase):
@@ -3508,6 +3567,474 @@ class PerformanceTests(unittest.TestCase):
         graph = SemanticGraph.build(root)
         MaintenanceAnalyzer(root).analyze(semantic_graph=graph)
         self.assertLess(time.perf_counter() - started, 120.0)
+
+
+# =============================================================================
+# R. post-implementation audit regressions
+#
+# Every test in this section pins a defect that the original Phase 4.21
+# implementation actually had, found by tracing the production path rather
+# than by reading the docstrings.
+# =============================================================================
+
+
+class ProtectedPathCaseFoldingTests(unittest.TestCase):
+    """The protection floor was case-sensitive; the filesystem is not.
+
+    On Windows and macOS - the platforms this agent is developed on -
+    ``Local_Agent/Tool_Engine.py`` opens exactly the file that
+    ``local_agent/tool_engine.py`` opens. Before the fix, a candidate spelling
+    it that way was granted ``execute_autonomously`` by the policy, was not
+    reported by ``touches_protected_path``, and would not have been caught by
+    the runner's post-execution protected-file review either.
+    """
+
+    CASE_VARIANTS = (
+        "Local_Agent/Tool_Engine.py",
+        "LOCAL_AGENT/TOOL_ENGINE.PY",
+        "local_agent/Tool_Engine.py",
+        "Local_Agent/approval.py",
+        "local_agent/APPROVAL.py",
+    )
+
+    def _candidate(self, path: str) -> MaintenanceCandidate:
+        return make_candidate(
+            kind=MaintenanceSignal.PARSE_FAILURE,
+            subject=path,
+            affected_files=[path],
+            confidence=0.99,
+            sample_size=20,
+            occurrence_count=5,
+            uncertainty=[],
+        )
+
+    def test_a_case_variant_of_a_protected_file_is_recognised(self):
+        for path in self.CASE_VARIANTS:
+            self.assertTrue(self._candidate(path).touches_protected_path, path)
+
+    def test_a_case_variant_of_a_protected_file_is_blocked_by_the_policy(self):
+        policy = MaintenanceExecutionPolicy()
+        for path in self.CASE_VARIANTS:
+            verdict = policy.decide(
+                self._candidate(path),
+                configured_tier=AutonomyTier.EXECUTE_AUTONOMOUSLY,
+            )
+            self.assertTrue(verdict.blocked, path)
+            self.assertFalse(verdict.may_execute, path)
+            self.assertNotIn(verdict.granted_tier, EXECUTING_TIERS, path)
+
+    def test_an_unrelated_file_is_still_not_protected(self):
+        self.assertFalse(self._candidate("local_agent/planner.py").touches_protected_path)
+        self.assertFalse(
+            MaintenanceExecutionPolicy().is_protected("local_agent/planner.py")
+        )
+
+    def test_case_variants_of_protected_directories_are_refused(self):
+        for path in (".GIT/config", ".Git/config", "a/.GIT/b.py",
+                     "NODE_MODULES/x.js", "__PYCACHE__/x.pyc", ".VENV/lib/x.py"):
+            self.assertEqual(sanitize_relative_path(path), "", path)
+
+    def test_extra_protected_paths_are_also_case_folded(self):
+        policy = MaintenanceExecutionPolicy(protected_paths=frozenset({"docs/POLICY.md"}))
+        self.assertTrue(policy.is_protected("docs/policy.md"))
+        self.assertTrue(policy.is_protected("DOCS/Policy.MD"))
+
+    def test_the_runner_review_stage_catches_a_case_variant(self):
+        """A pipeline reporting a case-variant protected write must still fail."""
+
+        def executor(order):
+            return MaintenanceExecutionOutcome(
+                succeeded=True,
+                validation_passed=True,
+                changed_files=["pkg/mod.py", "Local_Agent/Tool_Engine.py"],
+            )
+
+        harness = RunnerHarness(
+            self,
+            candidates=[[actionable_candidate()], []],
+            tier=AutonomyTier.EXECUTE_AUTONOMOUSLY,
+            executor=executor,
+        )
+        result = harness.runner.run(mode=RUN_MODE_EXECUTE)
+        self.assertEqual(result.record.executions_succeeded, 0)
+        self.assertEqual(result.record.executions_failed, 1)
+        errors = " ".join(result.record.outcomes[0].errors)
+        self.assertIn("protected", errors)
+        self.assertNotEqual(
+            result.reassessments[actionable_candidate().candidate_id].outcome,
+            ReassessmentOutcome.RESOLVED,
+        )
+
+
+class ElapsedBudgetAccountingTests(unittest.TestCase):
+    """Run time was counted twice: once per candidate, once again in total."""
+
+    def test_the_ledger_does_not_double_count_executor_time(self):
+        def slow(order):
+            time.sleep(0.25)
+            return MaintenanceExecutionOutcome(
+                succeeded=True, validation_passed=True, changed_files=["pkg/mod.py"]
+            )
+
+        harness = RunnerHarness(
+            self,
+            candidates=[[actionable_candidate()], []],
+            tier=AutonomyTier.EXECUTE_AUTONOMOUSLY,
+            executor=slow,
+        )
+        result = harness.runner.run(mode=RUN_MODE_EXECUTE)
+        consumed = result.record.budget["consumed"]["max_elapsed_seconds"]
+        # The ledger may never claim more time was spent than the run took.
+        self.assertLessEqual(consumed, result.record.elapsed_seconds + 1e-6)
+        self.assertGreater(consumed, 0.0)
+
+    def test_a_scan_only_run_still_accounts_its_own_time(self):
+        harness = RunnerHarness(self, candidates=[[actionable_candidate()]])
+        result = harness.runner.run(mode=RUN_MODE_SCAN)
+        consumed = result.record.budget["consumed"].get("max_elapsed_seconds", 0.0)
+        self.assertGreater(consumed, 0.0)
+        self.assertLessEqual(consumed, result.record.elapsed_seconds + 1e-6)
+
+
+class HostileRetentionCapTests(unittest.TestCase):
+    """A corrupt file must not be able to delete the history it sits in."""
+
+    def _payload(self, cap):
+        payload = MaintenanceStore().to_dict()
+        payload["max_candidates"] = cap
+        payload["candidates"] = [
+            make_candidate(subject=f"f{index}.py").to_dict() for index in range(20)
+        ]
+        return payload
+
+    def test_a_negative_cap_falls_back_to_the_default(self):
+        store = MaintenanceStore.from_dict(self._payload(-5))
+        self.assertEqual(store.max_candidates, DEFAULT_MAX_CANDIDATES)
+        self.assertEqual(len(store), 20)
+
+    def test_a_zero_cap_falls_back_to_the_default(self):
+        self.assertEqual(len(MaintenanceStore.from_dict(self._payload(0))), 20)
+
+    def test_a_non_numeric_cap_falls_back_to_the_default(self):
+        self.assertEqual(len(MaintenanceStore.from_dict(self._payload("all of them"))), 20)
+
+    def test_a_hostile_run_cap_does_not_discard_run_history(self):
+        payload = MaintenanceStore().to_dict()
+        payload["max_runs"] = -1
+        payload["runs"] = [
+            MaintenanceRunRecord(run_id=f"r{index}").to_dict() for index in range(10)
+        ]
+        self.assertEqual(len(MaintenanceStore.from_dict(payload).runs), 10)
+
+    def test_a_legitimate_cap_is_still_honoured(self):
+        self.assertLessEqual(len(MaintenanceStore.from_dict(self._payload(3))), 3)
+
+
+class ChildBudgetContainmentTests(unittest.TestCase):
+    """``child_budget <= parent_remaining_budget`` at every level."""
+
+    def test_a_child_cannot_declare_a_larger_shared_limit(self):
+        parent = BudgetLedger(MaintenanceBudget(max_elapsed_seconds=10.0))
+        child = parent.child(MaintenanceBudget(max_elapsed_seconds=1000.0))
+        self.assertLessEqual(child.limit_for("max_elapsed_seconds"), 10.0)
+        self.assertFalse(child.try_consume("max_elapsed_seconds", 500.0))
+
+    def test_a_child_cannot_declare_a_larger_per_candidate_limit(self):
+        parent = BudgetLedger(MaintenanceBudget(max_subtasks_per_candidate=4))
+        child = parent.child(MaintenanceBudget(max_subtasks_per_candidate=9999))
+        self.assertLessEqual(child.limit_for("max_subtasks_per_candidate"), 4)
+
+    def test_every_child_limit_is_within_the_parent_remaining_allowance(self):
+        parent = BudgetLedger(MaintenanceBudget())
+        parent.try_consume("max_candidates_selected", 3)
+        inflated = MaintenanceBudget(
+            max_candidates_considered=10**6,
+            max_candidates_selected=10**6,
+            max_candidates_executed=10**6,
+            max_elapsed_seconds=10**6,
+            max_estimated_cost_units=10**6,
+            max_dag_width=10**6,
+            max_subtasks_per_candidate=10**6,
+            max_changed_files_per_candidate=10**6,
+            max_changed_lines_per_candidate=10**6,
+            max_repair_iterations_per_candidate=10**6,
+            max_tool_steps_per_subtask=10**6,
+            max_candidate_iterations=10**6,
+            max_validation_commands=10**6,
+        )
+        child = parent.child(inflated)
+        for name in MaintenanceBudget().to_dict():
+            self.assertLessEqual(
+                child.limit_for(name), parent.remaining(name), name
+            )
+
+    def test_a_child_without_an_explicit_budget_shares_the_parents(self):
+        parent = BudgetLedger(MaintenanceBudget(max_subtasks_per_candidate=4))
+        self.assertEqual(parent.child().limit_for("max_subtasks_per_candidate"), 4.0)
+
+
+class EnqueueDeduplicationTests(unittest.TestCase):
+    """A continuous loop must not re-queue work it already queued.
+
+    A maintenance signal persists until it is fixed, so every run rediscovers
+    it. Before the fix, each ``maintenance run --enqueue`` created another
+    identical pending task; three scheduled runs produced three duplicate
+    tasks for one unfixed parse error.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "mod.py").write_text("def broken(:\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+
+    def _run(self):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = cli_main([
+                "maintenance", "run", "--enqueue",
+                "--project", str(self.root),
+                "--maintenance", "true",
+                "--maintenance-tier", "execute_autonomously",
+            ])
+        self.assertEqual(code, 0, buffer.getvalue())
+        return buffer.getvalue()
+
+    def _tasks(self):
+        return JsonFileStorage(self.root / ".agent_data").list_tasks()
+
+    def test_the_first_run_enqueues_the_candidate(self):
+        self._run()
+        self.assertEqual(len(self._tasks()), 1)
+
+    def test_repeated_runs_do_not_duplicate_the_task(self):
+        for _ in range(3):
+            self._run()
+        self.assertEqual(len(self._tasks()), 1)
+
+    def test_the_surviving_task_still_carries_its_provenance(self):
+        self._run()
+        self._run()
+        history = self._tasks()[0].execution_history
+        self.assertEqual(history[0]["source"], "maintenance")
+        self.assertTrue(history[0]["candidate_id"])
+
+    def test_a_terminal_task_lets_the_candidate_be_queued_again(self):
+        from local_agent.models import TaskStatus
+
+        self._run()
+        storage = JsonFileStorage(self.root / ".agent_data")
+        task = storage.list_tasks()[0]
+        task.status = TaskStatus.COMPLETED
+        storage.save_task(task)
+        self._run()
+        self.assertEqual(len(self._tasks()), 2)
+
+
+class AuditedReachabilityTests(unittest.TestCase):
+    """Facts about what the shipped wiring can and cannot do.
+
+    These are deliberately phrased as assertions about the *production* wiring
+    rather than about the classes, because the gap between the two is the
+    single most important thing an operator needs to know about this phase.
+    """
+
+    def test_the_shipped_cli_wires_no_maintenance_executor(self):
+        """`_build_maintenance_runner` passes `executor=None`, structurally.
+
+        If a future change wires a real executor, this test must be updated
+        deliberately - and at that point every claim about maintenance being
+        plan-only stops being true and has to be re-audited.
+        """
+        source = (
+            Path(sys.modules["local_agent"].__file__).parent / "cli.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        builder = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_build_maintenance_runner"
+        )
+        executors = [
+            keyword
+            for call in ast.walk(builder)
+            if isinstance(call, ast.Call)
+            for keyword in call.keywords
+            if keyword.arg == "executor"
+        ]
+        self.assertEqual(len(executors), 1)
+        self.assertIsInstance(executors[0].value, ast.Constant)
+        self.assertIsNone(executors[0].value.value)
+
+    def test_no_production_module_outside_the_cli_reaches_the_runner(self):
+        package = Path(sys.modules["local_agent"].__file__).parent
+        importers = []
+        for path in sorted(package.glob("*.py")):
+            if path.name.startswith("maintenance") or path.name == "cli.py":
+                continue
+            if "maintenance_runner" in path.read_text(encoding="utf-8"):
+                importers.append(path.name)
+        self.assertEqual(importers, [])
+
+    def test_the_ordinary_task_path_cannot_reach_maintenance(self):
+        for module in (
+            "local_agent.orchestrator",
+            "local_agent.coding_agent",
+            "local_agent.scheduler",
+            "local_agent.planner",
+            "local_agent.reviewer",
+            "local_agent.validation_decision",
+            "local_agent.worktree",
+            "local_agent.coordinator",
+        ):
+            for imported in imported_modules(module):
+                self.assertNotIn("maintenance", imported, module)
+
+    def test_maintenance_cannot_reach_the_worktree_manager(self):
+        for module in MAINTENANCE_MODULES:
+            self.assertNotIn("local_agent.worktree", imported_modules(module), module)
+            self.assertNotIn("local_agent.coordinator", imported_modules(module), module)
+
+    def test_structural_observations_can_never_reach_unattended_execution(self):
+        """Every extractor that reports a structural fact uses sample_size 1.
+
+        The policy requires ``min_samples_for_autonomy`` (5) samples before it
+        will grant ``execute_autonomously``. Parse failures and test gaps are
+        single observations by construction, so they are permanently capped at
+        ``execute_with_existing_approval`` no matter how the operator
+        configures the ceiling. This is intentional, and asserting it stops a
+        later change from quietly raising their sample size to buy autonomy.
+        """
+        policy = MaintenanceExecutionPolicy()
+        for kind in (MaintenanceSignal.PARSE_FAILURE, MaintenanceSignal.TEST_GAP):
+            candidate = make_candidate(
+                kind=kind,
+                confidence=1.0,
+                sample_size=1,
+                occurrence_count=50,
+                uncertainty=[],
+            )
+            verdict = policy.decide(
+                candidate, configured_tier=AutonomyTier.EXECUTE_AUTONOMOUSLY
+            )
+            self.assertEqual(
+                verdict.granted_tier,
+                AutonomyTier.EXECUTE_WITH_EXISTING_APPROVAL,
+                kind,
+            )
+
+    def test_batching_disjoint_candidates_is_not_quadratic(self):
+        """``plan_execution_batches`` rescanned every already-full batch.
+
+        With ``max_width=2`` and n disjoint candidates that is ~n^2/2 set
+        lookups doing nothing: 10 000 candidates took ~1.5s. Production never
+        sees numbers that large (``max_candidates_selected`` defaults to 5),
+        but the shape was genuinely quadratic, so it is pinned here.
+        """
+        candidates = [
+            make_candidate(subject=f"s{index}", affected_files=[f"p{index}.py"])
+            for index in range(8000)
+        ]
+        started = time.perf_counter()
+        batches = plan_execution_batches(candidates, max_width=2)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(sum(len(batch) for batch in batches), 8000)
+        self.assertLess(elapsed, 1.0)
+
+    def test_the_batching_optimisation_did_not_change_any_placement(self):
+        """The fast path must place candidates exactly where the naive one did."""
+
+        def reference(cands, max_width):
+            max_width = max(1, int(max_width))
+            batches, batch_files = [], []
+            for candidate in cands:
+                files = set(candidate.affected_files)
+                placed = False
+                for index, existing in enumerate(batch_files):
+                    if len(batches[index]) >= max_width:
+                        continue
+                    if files and existing.intersection(files):
+                        continue
+                    batches[index].append(candidate)
+                    existing.update(files)
+                    placed = True
+                    break
+                if not placed:
+                    batches.append([candidate])
+                    batch_files.append(set(files))
+            return batches
+
+        import random
+
+        rng = random.Random(20260830)
+        for _ in range(200):
+            width = rng.randint(1, 4)
+            pool = [f"f{index}.py" for index in range(rng.randint(1, 8))]
+            candidates = [
+                make_candidate(
+                    subject=f"s{index}",
+                    affected_files=rng.sample(pool, rng.randint(0, min(2, len(pool)))),
+                )
+                for index in range(rng.randint(0, 40))
+            ]
+            self.assertEqual(
+                [[c.subject for c in b] for b in plan_execution_batches(candidates, max_width=width)],
+                [[c.subject for c in b] for b in reference(candidates, width)],
+            )
+
+    def test_a_degraded_scan_says_so_in_the_persisted_record(self):
+        """Degradation must outlive the in-memory AnalysisResult.
+
+        ``maintenance history`` and ``maintenance status`` read the persisted
+        run record, not the analysis; before the fix a scan that could not
+        reach a whole intelligence source was recorded, and displayed later, as
+        an unqualified success.
+        """
+        harness = RunnerHarness(self, candidates=[[actionable_candidate()]], degraded=True)
+        result = harness.runner.run(mode=RUN_MODE_SCAN)
+        self.assertTrue(result.analysis.degraded)
+        self.assertTrue(
+            any("degraded scan" in note for note in result.record.notes),
+            result.record.notes,
+        )
+        reloaded = harness.manager.load().find_run(result.record.run_id)
+        self.assertIsNotNone(reloaded)
+        self.assertTrue(any("degraded scan" in note for note in reloaded.notes))
+
+    def test_a_clean_scan_carries_no_degradation_note(self):
+        harness = RunnerHarness(self, candidates=[[actionable_candidate()]])
+        result = harness.runner.run(mode=RUN_MODE_SCAN)
+        self.assertFalse(any("degraded scan" in note for note in result.record.notes))
+
+    def test_only_four_budget_dimensions_are_actually_enforced_by_a_run(self):
+        """Pins the *measured* enforcement surface, not the declared one.
+
+        Nine of the thirteen declared budget dimensions are carried into the
+        work order and never consumed, because nothing in this build executes a
+        work order. Asserting the real number keeps the documentation honest
+        and turns any future wiring into a deliberate, visible change.
+        """
+        harness = RunnerHarness(
+            self,
+            candidates=[[actionable_candidate()], []],
+            tier=AutonomyTier.EXECUTE_AUTONOMOUSLY,
+            executor=lambda order: MaintenanceExecutionOutcome(
+                succeeded=True, validation_passed=True, changed_files=["pkg/mod.py"]
+            ),
+        )
+        result = harness.runner.run(mode=RUN_MODE_EXECUTE)
+        self.assertEqual(
+            sorted(result.record.budget["consumed"]),
+            [
+                "max_candidates_considered",
+                "max_candidates_executed",
+                "max_candidates_selected",
+                "max_elapsed_seconds",
+            ],
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
