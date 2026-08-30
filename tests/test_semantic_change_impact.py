@@ -448,11 +448,46 @@ class TestAstPythonIndexer(unittest.TestCase):
         self.assertTrue(facts.has_dynamic_imports)
         self.assertEqual(self._dynamic_resolved(facts), [])
 
-    def test_importlib_call_with_relative_literal_still_flags_dynamic(self):
-        # A package-relative dynamic import needs its ``package=`` argument
-        # resolved too; declining that is the conservative, correct choice.
+    def test_importlib_relative_literal_with_literal_package_now_resolves(self):
+        """Phase 4.20 changed this deliberately.
+
+        Phase 4.19 declined ``import_module('.sub', package='pkg')`` and left
+        the file flagged as having unresolvable dynamic imports. That was a
+        *deferral*, not a correctness requirement: with both the module string
+        and ``package`` given as literal constants, the target is fully
+        determined at parse time by exactly the rule ``importlib`` itself
+        applies, so resolving it is no more speculative than resolving
+        ``from pkg import sub``. It is now resolved, and the file is no longer
+        degraded on account of this call. The shapes that genuinely cannot be
+        resolved are covered by the tests immediately below and still degrade.
+        """
         facts = self.indexer.analyze(
             "import importlib\nimportlib.import_module('.sub', package='pkg')\n"
+        )
+        self.assertFalse(facts.has_dynamic_imports)
+        self.assertEqual([r.module for r in self._dynamic_resolved(facts)], ["pkg.sub"])
+
+    def test_importlib_relative_literal_without_package_still_flags_dynamic(self):
+        # Without ``package=``, importlib falls back to the *caller's*
+        # ``__package__`` - a runtime property. Assuming it would be a guess.
+        facts = self.indexer.analyze(
+            "import importlib\nimportlib.import_module('.sub')\n"
+        )
+        self.assertTrue(facts.has_dynamic_imports)
+        self.assertEqual(self._dynamic_resolved(facts), [])
+
+    def test_importlib_relative_literal_with_variable_package_still_flags_dynamic(self):
+        facts = self.indexer.analyze(
+            "import importlib\npkg = 'a'\nimportlib.import_module('.sub', package=pkg)\n"
+        )
+        self.assertTrue(facts.has_dynamic_imports)
+        self.assertEqual(self._dynamic_resolved(facts), [])
+
+    def test_importlib_relative_literal_escaping_package_root_still_flags_dynamic(self):
+        # ``...sub`` from a one-segment package walks above the root, which is
+        # a runtime ValueError - there is no module to point an edge at.
+        facts = self.indexer.analyze(
+            "import importlib\nimportlib.import_module('...sub', package='pkg')\n"
         )
         self.assertTrue(facts.has_dynamic_imports)
         self.assertEqual(self._dynamic_resolved(facts), [])

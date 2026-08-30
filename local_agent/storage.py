@@ -13,6 +13,7 @@ from typing import Any, TYPE_CHECKING, TypeVar
 from .models import Checkpoint, ProjectMemory, ProviderConfig, RepositoryKnowledgeGraph, SchedulerState, SemanticIndex, Subtask, Task
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime import cycle
+    from .validation_lifecycle import ValidationLifecycleStore
     from .validation_telemetry import ValidationTelemetryStore
 
 T = TypeVar("T", Task, Checkpoint)
@@ -96,6 +97,16 @@ class TaskStorage(ABC):
         from .validation_telemetry import ValidationTelemetryStore
         return ValidationTelemetryStore()
 
+    def save_validation_lifecycle(self, store: "ValidationLifecycleStore") -> None:
+        """Phase 4.20. Default no-op, matching every other optional store here:
+        a ``TaskStorage`` implementation that predates this method keeps working
+        and simply retains no lifecycle history."""
+        pass
+
+    def load_validation_lifecycle(self) -> "ValidationLifecycleStore":
+        from .validation_lifecycle import ValidationLifecycleStore
+        return ValidationLifecycleStore()
+
 class JsonFileStorage(TaskStorage):
     def __init__(self, base_dir: str | Path):
         self.base_dir = Path(base_dir)
@@ -128,6 +139,9 @@ class JsonFileStorage(TaskStorage):
 
     def _validation_telemetry_path(self) -> Path:
         return self.base_dir / "validation_telemetry.json"
+
+    def _validation_lifecycle_path(self) -> Path:
+        return self.base_dir / "validation_lifecycle.json"
 
     def _atomic_write(self, path: Path, data: dict[str, Any]) -> None:
         temp_path = path.with_suffix(".json.tmp")
@@ -281,3 +295,30 @@ class JsonFileStorage(TaskStorage):
                 pass
             print(f"Warning: Failed to load validation telemetry due to malformed data ({e}). Quarantined to {corrupt_path.name} and returning an empty store.")
             return ValidationTelemetryStore()
+
+    def save_validation_lifecycle(self, store: "ValidationLifecycleStore") -> None:
+        self._atomic_write(self._validation_lifecycle_path(), store.to_dict())
+
+    def load_validation_lifecycle(self) -> "ValidationLifecycleStore":
+        from .validation_lifecycle import ValidationLifecycleStore
+        path = self._validation_lifecycle_path()
+        if not path.exists():
+            return ValidationLifecycleStore()
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return ValidationLifecycleStore.from_dict(json.load(f))
+        except (json.JSONDecodeError, KeyError, ValueError, UnicodeDecodeError) as e:
+            # Same quarantine policy as the knowledge graph and the telemetry
+            # store: keep the bad file for forensics, return an empty store, and
+            # mark it corrupt so downstream analysis stays conservative rather
+            # than treating "no data" as "clean history".
+            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+            corrupt_path = self.base_dir / f"validation_lifecycle.json.corrupt.{timestamp}"
+            try:
+                shutil.copy2(path, corrupt_path)
+            except Exception:
+                pass
+            print(f"Warning: Failed to load validation lifecycle history due to malformed data ({e}). Quarantined to {corrupt_path.name} and returning an empty store.")
+            store = ValidationLifecycleStore()
+            store.corrupted_records_skipped = 1
+            return store

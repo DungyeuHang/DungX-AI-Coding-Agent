@@ -117,6 +117,30 @@ def build_parser() -> argparse.ArgumentParser:
     credentials_delete = credentials_sub.add_parser("delete", help="delete the API key for a provider")
     credentials_delete.add_argument("provider_id", help="The ID of the provider to delete credentials for")
 
+    # Phase 4.20: diagnostic surface over the validation intelligence stores.
+    # Read-only by construction: every subcommand loads a store and prints it.
+    # None of them can record, finalize, calibrate or otherwise mutate anything.
+    validation = subparsers.add_parser(
+        "validation", help="inspect validation intelligence telemetry and lifecycle history"
+    )
+    validation_sub = validation.add_subparsers(dest="validation_command", required=True)
+    for name, description in (
+        ("health", "show validation intelligence health diagnostics"),
+        ("history", "list recorded validation lifecycles"),
+        ("defects", "show recurring defect signatures and repair effectiveness"),
+        ("calibration", "show shadow-mode calibration and evidence-type reliability"),
+        ("recommendations", "show the advisory scope recommendation and its safety floor"),
+    ):
+        sub = validation_sub.add_parser(name, help=description)
+        add_common_arguments(sub)
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    validation_lifecycle = validation_sub.add_parser(
+        "lifecycle", help="show one lifecycle trace, including its repair lineage"
+    )
+    add_common_arguments(validation_lifecycle)
+    validation_lifecycle.add_argument("lifecycle_id", help="ID of the lifecycle to show")
+    validation_lifecycle.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
     return parser
 
 
@@ -250,12 +274,265 @@ def _approval_prompt(changes) -> bool:
         return False
 
 
+def _handle_validation_command(args, config, storage) -> int:
+    """Phase 4.20 diagnostics. Read-only over the two bounded stores.
+
+    Every path here must survive an empty or brand-new repository: the stores
+    both return a well-formed empty instance when their file does not exist, so
+    the only extra work is saying "no data yet" instead of printing zeros as if
+    they were measurements.
+    """
+    from .validation_lifecycle import (
+        AdaptiveValidationRecommender,
+        compute_repair_effectiveness,
+    )
+    from .validation_telemetry import compute_health
+
+    command = getattr(args, "validation_command", "")
+    as_json = bool(getattr(args, "json", False))
+    min_samples = getattr(config, "validation_calibration_min_samples", 20)
+    lifecycle_min_samples = getattr(config, "validation_lifecycle_min_samples", 10)
+    telemetry = storage.load_validation_telemetry()
+    lifecycles = storage.load_validation_lifecycle()
+
+    def _emit(payload: dict) -> None:
+        print(json.dumps(payload, indent=2, default=str))
+
+    if command == "health":
+        health = compute_health(telemetry, min_samples=min_samples)
+        effectiveness = compute_repair_effectiveness(
+            lifecycles, min_samples=lifecycle_min_samples
+        )
+        if as_json:
+            _emit({
+                "telemetry": health.to_dict(),
+                "lifecycle": effectiveness.to_dict(),
+            })
+            return 0
+        print("Validation Intelligence Health")
+        print("=" * 30)
+        print(f"  Decisions recorded:      {health.total_decisions}")
+        print(f"  Observations:            {health.total_observations} "
+              f"({health.resolved_observations} resolved)")
+        print(f"  Calibration status:      {health.calibration_status}")
+        print(f"  Scope counts:            {health.scope_counts or 'none'}")
+        print(f"  Broad validation rate:   {health.broad_validation_rate:.2%}")
+        print(f"  Reuse hit rate:          {health.reuse_hit_rate:.2%}")
+        print(f"  False-confidence events: {health.false_confidence_incidents}")
+        print(f"  Analysis degradation:    {health.analysis_degradation_rate:.2%}")
+        print(f"  Corrupted records:       {health.corrupted_records_skipped}")
+        print(f"\n  Lifecycles recorded:     {effectiveness.lifecycles} "
+              f"({effectiveness.resolved} resolved)")
+        if effectiveness.insufficient_data:
+            print(f"  NOTE: fewer than {effectiveness.min_samples} resolved lifecycle(s); "
+                  "rates below are not established.")
+        print(f"  First-pass success:      {effectiveness.first_pass_success_rate:.2%} "
+              f"(conservative lower bound {effectiveness.first_pass_success_lower_bound:.2f})")
+        print(f"  Repair success:          {effectiveness.repair_success_rate:.2%} "
+              f"(conservative lower bound {effectiveness.repair_success_lower_bound:.2f})")
+        if not effectiveness.history_trustworthy:
+            print("  WARNING: lifecycle history contains records that failed to load; "
+                  "treated as no history.")
+        if health.total_decisions == 0 and effectiveness.lifecycles == 0:
+            print("\n  No validation history recorded yet for this repository.")
+        return 0
+
+    if command == "history":
+        records = lifecycles.lifecycles
+        if as_json:
+            _emit({
+                "lifecycles": [r.to_dict() for r in records],
+                "corrupted_records_skipped": lifecycles.corrupted_records_skipped,
+            })
+            return 0
+        if not records:
+            print("No validation lifecycles recorded yet.")
+            return 0
+        print(f"{len(records)} validation lifecycle(s), oldest first:")
+        for record in records:
+            print(f"- {record.lifecycle_id} [{record.state}] task={record.task_id or '-'} "
+                  f"subtask={record.subtask_id or '-'} iterations={len(record.iterations)} "
+                  f"repairs={record.repair_count} updated={record.updated_at}")
+        if lifecycles.corrupted_records_skipped:
+            print(f"\nWARNING: {lifecycles.corrupted_records_skipped} record(s) could not be "
+                  "loaded and were skipped.")
+        return 0
+
+    if command == "lifecycle":
+        record = lifecycles.find(args.lifecycle_id)
+        if record is None:
+            print(f"error: no lifecycle with ID {args.lifecycle_id}", file=sys.stderr)
+            return 1
+        if as_json:
+            _emit(record.to_dict())
+            return 0
+        print(f"Lifecycle: {record.lifecycle_id}")
+        print(f"  State:     {record.state}")
+        print(f"  Task:      {record.task_id or '-'} / subtask {record.subtask_id or '-'}")
+        print(f"  Created:   {record.created_at}")
+        print(f"  Updated:   {record.updated_at}")
+        print(f"  Outcome:   {record.terminal_outcome or 'in progress'} "
+              f"({record.failure_category or 'n/a'})")
+        print("\n  State history:")
+        for entry in record.state_history:
+            print(f"    - {entry.get('state', '?')} at {entry.get('at', '?')}"
+                  f"{': ' + entry['reason'] if entry.get('reason') else ''}")
+        print(f"\n  Iterations ({len(record.iterations)}):")
+        for iteration in record.iterations:
+            parent = iteration.parent_iteration_id or "-"
+            print(f"    #{iteration.iteration_number} [{iteration.kind}] "
+                  f"{iteration.iteration_id} parent={parent}")
+            print(f"        scope={iteration.scope or '-'} "
+                  f"stage={iteration.validation_stage} "
+                  f"result={iteration.validation_result} "
+                  f"duration={iteration.duration_seconds:.2f}s")
+            if iteration.defect_signature is not None:
+                print(f"        defect={iteration.defect_signature.fingerprint} "
+                      f"{iteration.defect_signature.describe()[:100]}")
+        recurring = record.recurring_defects()
+        if recurring:
+            print("\n  Recurring defects within this lifecycle:")
+            for fingerprint, count in sorted(recurring.items()):
+                print(f"    - {fingerprint}: {count} occurrence(s)")
+        return 0
+
+    if command == "defects":
+        effectiveness = compute_repair_effectiveness(
+            lifecycles, min_samples=lifecycle_min_samples
+        )
+        if as_json:
+            _emit(effectiveness.to_dict())
+            return 0
+        if effectiveness.lifecycles == 0:
+            print("No validation lifecycles recorded yet; no defect history to report.")
+            return 0
+        print("Repair Effectiveness and Defect Recurrence")
+        print("=" * 42)
+        if effectiveness.insufficient_data:
+            print(f"NOTE: only {effectiveness.resolved} resolved lifecycle(s), below the "
+                  f"minimum of {effectiveness.min_samples}. Rates are reported but are "
+                  "NOT established.")
+        print(f"  Lifecycles:              {effectiveness.lifecycles} "
+              f"({effectiveness.resolved} resolved, {effectiveness.in_progress} in progress)")
+        print(f"  Completed/abandoned/failed: {effectiveness.completed}/"
+              f"{effectiveness.abandoned}/{effectiveness.failed}")
+        print(f"  Repairs (total):         {effectiveness.total_repair_iterations}")
+        print(f"  Median repairs (when needed): {effectiveness.median_repair_iterations}")
+        print(f"  Abandonment rate:        {effectiveness.abandonment_rate:.2%} "
+              f"(pessimistic upper bound {effectiveness.abandonment_rate_upper_bound:.2f})")
+        print(f"  Repeated-defect rate:    {effectiveness.repeated_defect_rate:.2%} "
+              f"(pessimistic upper bound {effectiveness.repeated_defect_rate_upper_bound:.2f})")
+        print(f"  Defects by stage:        {effectiveness.stage_distribution or 'none'}")
+        print(f"  Candidate vs post-apply: {effectiveness.candidate_stage_defects} vs "
+              f"{effectiveness.post_apply_defects}")
+        if effectiveness.measured_duration_samples:
+            print(f"  Validation duration:     mean "
+                  f"{effectiveness.mean_validation_seconds:.2f}s / median "
+                  f"{effectiveness.median_validation_seconds:.2f}s over "
+                  f"{effectiveness.measured_duration_samples} measured sample(s)")
+        else:
+            print("  Validation duration:     NOT MEASURED (no iteration recorded a duration)")
+        if effectiveness.top_recurring_defects:
+            print("\n  Top recurring defect signatures:")
+            for defect in effectiveness.top_recurring_defects:
+                print(f"    - {defect.fingerprint} x{defect.occurrences} "
+                      f"across {defect.lifecycles} lifecycle(s)")
+                if defect.description:
+                    print(f"      {defect.description[:140]}")
+        else:
+            print("\n  No defect signatures recorded.")
+        return 0
+
+    if command == "calibration":
+        health = compute_health(telemetry, min_samples=min_samples)
+        if as_json:
+            _emit({
+                "calibration_status": health.calibration_status,
+                "shadow_comparisons": health.shadow_comparisons,
+                "shadow_would_narrow": health.shadow_would_narrow,
+                "shadow_would_broaden": health.shadow_would_broaden,
+                "shadow_safety_overrides": health.shadow_safety_overrides,
+                "calibration_drift": health.calibration_drift,
+                "evidence_type_reliability": {
+                    k: v.to_dict() for k, v in health.evidence_type_reliability.items()
+                },
+                "quality": health.quality.to_dict(),
+                "min_samples": min_samples,
+                "calibration_enabled": getattr(config, "validation_calibration_enabled", False),
+                "live_calibration_implemented": False,
+            })
+            return 0
+        print("Validation Calibration (SHADOW MODE ONLY)")
+        print("=" * 40)
+        print("  No calibrated confidence is ever applied to a real validation decision;")
+        print("  there is no live-calibration code path in this build.")
+        print(f"\n  Status:                {health.calibration_status}")
+        print(f"  Minimum samples:       {min_samples}")
+        print(f"  Shadow comparisons:    {health.shadow_comparisons}")
+        print(f"  Would narrow/broaden:  {health.shadow_would_narrow}/"
+              f"{health.shadow_would_broaden}")
+        print(f"  Safety-floor overrides:{health.shadow_safety_overrides}")
+        print(f"  Mean |confidence drift|: {health.calibration_drift:.4f}")
+        if health.evidence_type_reliability:
+            print("\n  Evidence-type reliability (Wilson lower bound, conservative):")
+            for name in sorted(health.evidence_type_reliability):
+                item = health.evidence_type_reliability[name]
+                flag = "" if item.sufficient_data else "  [INSUFFICIENT DATA]"
+                print(f"    - {name}: {item.successes}/{item.trials} "
+                      f"lower_bound={item.lower_bound:.3f}{flag}")
+        else:
+            print("\n  No reliability data recorded yet.")
+        print(f"\n  Observed targeted escape rate: {health.quality.observed_escape_rate:.2%} "
+              f"(pessimistic upper bound "
+              f"{health.quality.observed_escape_rate_upper_bound:.2f})")
+        print("  Recall is not reported: the data cannot support it.")
+        return 0
+
+    if command == "recommendations":
+        # No impact analysis has been run in this process, so there is no
+        # change-specific floor to hand the recommender. BROAD is the only
+        # honest floor for "we have not analysed anything": a diagnostic
+        # command must never display a narrower floor than a real run would
+        # compute, or the output would read as permission the analysis never
+        # actually gave.
+        recommendation = AdaptiveValidationRecommender(
+            min_samples=lifecycle_min_samples
+        ).recommend(safety_floor="broad", store=lifecycles)
+        if as_json:
+            _emit(recommendation.to_dict())
+            return 0
+        print("Adaptive Validation Recommendation (ADVISORY)")
+        print("=" * 45)
+        print("  This is not a decision. ValidationDecisionEngine remains the only")
+        print("  authority; the effective scope below is never narrower than the floor.")
+        print(f"\n  Safety floor:      {recommendation.safety_floor}")
+        print(f"  Recommended scope: {recommendation.recommended_scope}")
+        print(f"  Effective scope:   {recommendation.effective_scope}")
+        print(f"  Conflicts w/ floor:{recommendation.conflicts_with_floor}")
+        print(f"  Data sufficient:   {recommendation.data_sufficient} "
+              f"({recommendation.samples} resolved lifecycle(s))")
+        print(f"  History trusted:   {recommendation.history_trustworthy}")
+        print("\n  Safety reasons:")
+        for reason in recommendation.safety_reasons:
+            print(f"    - {reason}")
+        print("\n  Recommendation reasons:")
+        for reason in recommendation.reasons:
+            print(f"    - {reason}")
+        return 0
+
+    print(f"error: unknown validation subcommand '{command}'", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config = config_from_args(args)
         logging.basicConfig(level=getattr(logging, config.log_level), format="%(levelname)s %(message)s")
         storage = JsonFileStorage(getattr(config, "data_dir", None) or (config.project / ".agent_data"))
+
+        if args.command == "validation":
+            return _handle_validation_command(args, config, storage)
 
         if args.command == "analyze":
             _print_context(RepositoryIntelligence(config.project).scan())

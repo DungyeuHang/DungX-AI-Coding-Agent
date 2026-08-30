@@ -115,6 +115,32 @@ class PythonFileFacts:
     #: proves nothing about what ``obj`` actually is (see ``ATTRIBUTE_RESOLUTION``
     #: in :mod:`local_agent.dependency_resolution`).
     attribute_references: frozenset[str] = frozenset()
+    # --- Phase 4.20: attribute *receiver* facts -------------------------------
+    #: ``(receiver, attribute)`` pairs for attribute accesses whose receiver is
+    #: a plain name (``obj.method()`` -> ``("obj", "method")``) or an immediate
+    #: constructor call (``Widget().method()`` -> ``("Widget", "method")``).
+    #: Recorded so :func:`~local_agent.dependency_resolution.resolve_attribute_receiver`
+    #: can *sometimes* say which class ``obj`` is, rather than always giving up.
+    #: An access whose receiver is any more complex expression is deliberately
+    #: not recorded at all - see that function's docstring.
+    attribute_accesses: frozenset[tuple[str, str]] = frozenset()
+    #: Local name -> the type name it is confidently bound to, from a
+    #: constructor assignment (``x = Widget()``), an annotated assignment
+    #: (``x: Widget = ...``) or a parameter/variable annotation. A name bound to
+    #: two *different* type names anywhere in the module is omitted entirely
+    #: rather than resolved to either - ambiguity must not become a guess.
+    local_type_bindings: dict[str, str] = field(default_factory=dict)
+    #: Names bound more than once to conflicting types, kept so a caller can
+    #: explain *why* a receiver was left unresolved instead of it looking like
+    #: the name was simply never seen.
+    ambiguous_bindings: frozenset[str] = frozenset()
+    #: Class name -> its base-class names, for ``self.method()`` resolution
+    #: inside a subclass of a changed class.
+    class_bases: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: Every class/function name defined in *this* module. A receiver bound to
+    #: a locally-defined class is a resolved *negative*: it proves the attribute
+    #: belongs to local code, not to the changed module.
+    locally_defined_names: frozenset[str] = frozenset()
 
     @property
     def module_import_names(self) -> list[str]:
@@ -222,6 +248,13 @@ class AstPythonIndexer:
             decorator_references=frozenset(collector.decorator_references),
             annotation_references=frozenset(collector.annotation_references),
             attribute_references=frozenset(collector.attribute_references),
+            attribute_accesses=frozenset(collector.attribute_accesses),
+            local_type_bindings=dict(collector.resolved_bindings()),
+            ambiguous_bindings=frozenset(collector.ambiguous_bindings),
+            class_bases=dict(collector.class_bases),
+            locally_defined_names=frozenset(
+                symbol.name for symbol in collector.symbols
+            ),
         )
 
 
@@ -240,6 +273,30 @@ class _FactCollector:
         self.decorator_references: set[str] = set()
         self.annotation_references: set[str] = set()
         self.attribute_references: set[str] = set()
+        # --- Phase 4.20 ---
+        self.attribute_accesses: set[tuple[str, str]] = set()
+        #: name -> every distinct type name it was ever bound to in this module.
+        #: Kept as a set per name (rather than last-write-wins) precisely so a
+        #: conflicting rebind is *detectable*; see :meth:`resolved_bindings`.
+        self._bindings: dict[str, set[str]] = {}
+        self.class_bases: dict[str, tuple[str, ...]] = {}
+
+    @property
+    def ambiguous_bindings(self) -> set[str]:
+        return {name for name, types in self._bindings.items() if len(types) > 1}
+
+    def resolved_bindings(self) -> dict[str, str]:
+        """Only the names bound to exactly one type. Ambiguity yields nothing."""
+        return {
+            name: next(iter(types))
+            for name, types in self._bindings.items()
+            if len(types) == 1 and not next(iter(types)).startswith("\x00")
+        }
+
+    def _bind(self, name: str, type_name: str) -> None:
+        if not name or not type_name or name == type_name:
+            return
+        self._bindings.setdefault(name, set()).add(type_name)
 
     # -- entry point -------------------------------------------------------
 
@@ -253,6 +310,7 @@ class _FactCollector:
             self._collect_import(node)
             self._collect_dunder_all(node)
             self._collect_reference_kind(node)
+            self._collect_binding(node)
 
     # -- definitions -------------------------------------------------------
 
@@ -375,6 +433,18 @@ class _FactCollector:
             # counts as a reference to the changed symbol.
             self.references.add(node.attr)
             self.attribute_references.add(node.attr)
+            # Phase 4.20: also remember *what the receiver was written as*, but
+            # only for the two shapes that can be resolved without inventing a
+            # type inference engine. Anything else (a subscript, another
+            # attribute chain, a comprehension variable, a function return) is
+            # left unrecorded rather than guessed at.
+            receiver = node.value
+            if isinstance(receiver, ast.Name):
+                self.attribute_accesses.add((receiver.id, node.attr))
+            elif isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name):
+                # ``Widget().method()`` - the constructor is right there, so the
+                # receiver's type is known exactly, with no inference at all.
+                self.attribute_accesses.add((receiver.func.id, node.attr))
 
     def _collect_import(self, node: ast.AST) -> None:
         if isinstance(node, ast.Import):
@@ -412,11 +482,23 @@ class _FactCollector:
                     self.imports.append(
                         ImportRecord(module=literal, level=0, name=None, asname=None, dynamic=True)
                     )
-                else:
-                    # A computed/variable argument, or a relative ("."-leading)
-                    # dynamic import: genuinely cannot know the target without
-                    # running the program, so this stays a real degradation.
-                    self.has_dynamic_imports = True
+                    return
+                # Phase 4.20: a *package-relative* literal
+                # (``import_module(".sub", package="pkg")``) is equally knowable
+                # when the anchoring package is itself a literal, because that
+                # is precisely the information ``importlib`` itself uses. Only
+                # that exact shape is resolved; see ``_relative_module_argument``.
+                relative = _relative_module_argument(node)
+                if relative is not None:
+                    self.imports.append(
+                        ImportRecord(module=relative, level=0, name=None, asname=None, dynamic=True)
+                    )
+                    return
+                # A computed/variable argument, or a relative import with no
+                # statically-known anchoring package: genuinely cannot know the
+                # target without running the program, so this stays a real
+                # degradation.
+                self.has_dynamic_imports = True
             elif called in _OPAQUE_EXECUTION_CALLS:
                 # ``exec``/``eval`` can do anything a literal string can't tell
                 # us about, even when the argument itself is a literal.
@@ -463,6 +545,62 @@ class _FactCollector:
         elif isinstance(node, ast.AnnAssign) and node.annotation is not None:
             _collect_names(node.annotation, self.annotation_references)
 
+    def _collect_binding(self, node: ast.AST) -> None:
+        """Phase 4.20: record the few name->type bindings that are *certain*.
+
+        Four shapes, all of which state the type explicitly in the source with
+        no inference required:
+
+        1. ``x = Widget()``            - a direct constructor call;
+        2. ``x: Widget = ...`` / ``x: Widget`` - an annotated assignment;
+        3. ``def f(x: Widget)``        - an annotated parameter;
+        4. ``class C(Base)``           - recorded into :attr:`class_bases` so
+           ``self.method()`` inside ``C`` can be attributed to ``Base``.
+
+        Everything else - a factory function's return value, a container
+        element, a conditional rebind, ``*args`` - is deliberately not bound.
+        Binding a name is a *claim*, and an unbound name simply falls through
+        to the pre-existing (weaker, safe) attribute-name evidence.
+
+        A bare ``Name`` annotation is used; a subscripted one (``list[Widget]``)
+        is declined, because the receiver is then the container, not the widget.
+        """
+        if isinstance(node, ast.Assign):
+            value = node.value
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self._bind(target.id, value.func.id)
+            elif isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+                # ``x = module.Widget()`` - the attribute name is the class.
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self._bind(target.id, value.func.attr)
+            else:
+                # A rebind to anything we cannot type still has to be *seen*, or
+                # ``x = Widget()`` followed by ``x = make_thing()`` would look
+                # unambiguous. Recording a sentinel makes it ambiguous instead.
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self._bind(target.id, "\x00unknown")
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and isinstance(node.annotation, ast.Name):
+                self._bind(node.target.id, node.annotation.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = node.args
+            for argument in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
+                if isinstance(argument.annotation, ast.Name):
+                    self._bind(argument.arg, argument.annotation.id)
+        elif isinstance(node, ast.ClassDef):
+            bases: list[str] = []
+            for base in node.bases:
+                if isinstance(base, ast.Name):
+                    bases.append(base.id)
+                elif isinstance(base, ast.Attribute):
+                    bases.append(base.attr)
+            if bases:
+                self.class_bases[node.name] = tuple(bases)
+
 
 def _collect_names(expr: ast.expr, into: set[str]) -> None:
     """Every ``Name``/``Attribute`` identifier within one expression subtree."""
@@ -495,3 +633,68 @@ def _literal_module_argument(call: ast.Call) -> str | None:
     if not all(part.isidentifier() for part in parts):
         return None
     return value
+
+
+def _relative_module_argument(call: ast.Call) -> str | None:
+    """Phase 4.20: absolute module name for a package-relative dynamic import.
+
+    ``importlib.import_module(".sub", package="pkg.core")`` is not a guess: it
+    resolves by exactly the documented rule ``importlib`` itself applies - the
+    leading dots count levels up from ``package``, and the remainder is
+    appended. When both the module string and ``package`` are literal
+    constants, the answer is fully determined at parse time and is therefore
+    every bit as knowable as ``from pkg import sub``.
+
+    Resolution is refused, returning ``None`` (which leaves the file flagged as
+    having unresolvable dynamic imports, exactly as before), whenever any part
+    of that rule cannot be evaluated statically:
+
+    * the first argument is not a literal string, or does not start with a dot;
+    * there is no ``package=`` keyword, or its value is not a literal string -
+      ``importlib`` would fall back to the *caller's* ``__package__``, which is
+      a runtime property this indexer must not assume;
+    * ``package`` is not a dotted identifier path;
+    * the dot count walks above the root of ``package`` (which is a
+      ``ValueError`` at runtime, not a module);
+    * the remainder after the dots is not a dotted identifier path.
+    """
+    if not call.args:
+        return None
+    first = call.args[0]
+    if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+        return None
+    raw = first.value.strip()
+    if not raw.startswith("."):
+        return None
+
+    package: str | None = None
+    for keyword in call.keywords:
+        if keyword.arg == "package":
+            if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
+                package = keyword.value.value.strip()
+            break
+    if not package:
+        return None
+    package_parts = package.split(".")
+    if not all(part.isidentifier() for part in package_parts):
+        return None
+
+    level = len(raw) - len(raw.lstrip("."))
+    remainder = raw[level:]
+    # ``import_module(".sub", package="pkg")`` -> level 1 -> anchored at ``pkg``
+    # itself; ``..sub`` -> level 2 -> anchored at ``pkg``'s parent.
+    drop = level - 1
+    if drop > len(package_parts) - 1:
+        # Walks above the root: at runtime this raises, so there is no module
+        # to point an edge at.
+        return None
+    base = package_parts[: len(package_parts) - drop] if drop else package_parts
+    pieces = [piece for piece in base if piece]
+    if remainder:
+        remainder_parts = remainder.split(".")
+        if not all(part.isidentifier() for part in remainder_parts):
+            return None
+        pieces.extend(remainder_parts)
+    if not pieces:
+        return None
+    return ".".join(pieces)

@@ -44,6 +44,14 @@ MODULE_ALIAS = "module_alias_match"
 #: changed symbol name, without proof that ``obj`` is an instance of the
 #: defining class. Deliberately lower confidence than :data:`DIRECT_SYMBOL`.
 ATTRIBUTE_RESOLUTION = "attribute_resolution"
+#: Phase 4.20. An attribute access whose *receiver* was resolved to a specific
+#: class that the change actually touched - ``w = Widget(); w.render()`` where
+#: ``Widget`` is imported from a changed file. Materially stronger than
+#: :data:`ATTRIBUTE_RESOLUTION` because it no longer relies on the attribute
+#: name alone being distinctive: the receiver's type is stated in the source.
+#: Still below :data:`DIRECT_SYMBOL`, because a bare name reference to a
+#: resolved import is more direct evidence than a two-step receiver walk.
+ATTRIBUTE_RECEIVER_RESOLVED = "attribute_receiver_resolved"
 #: The changed name appears as a base class in ``class X(Changed):``.
 INHERITANCE = "inheritance_match"
 #: The changed name appears as a parameter/return/variable type annotation.
@@ -75,6 +83,7 @@ CONFIDENCE_BY_EVIDENCE_TYPE: dict[str, float] = {
     DECORATOR: 0.8,
     ANNOTATION: 0.7,
     REEXPORT: 0.75,
+    ATTRIBUTE_RECEIVER_RESOLVED: 0.75,
     DYNAMIC_IMPORT_RESOLVED: 0.6,
     ATTRIBUTE_RESOLUTION: 0.5,
     DYNAMIC_IMPORT_UNRESOLVED: 0.0,
@@ -237,3 +246,176 @@ def resolve_alias_reference(
         if not next_origins or current_symbol not in next_origins:
             return None
         current_file, current_symbol = next_origins[current_symbol]
+
+
+# -- attribute receiver resolution (Phase 4.20) ---------------------------------
+
+
+#: Why a receiver could not be resolved. A vocabulary, not free text, so a
+#: caller can count blind-spot causes without parsing sentences - and so the
+#: telemetry key space stays bounded.
+RECEIVER_UNBOUND = "receiver_not_bound_to_any_type"
+RECEIVER_AMBIGUOUS = "receiver_bound_to_conflicting_types"
+RECEIVER_LOCAL = "receiver_type_defined_locally"
+RECEIVER_TYPE_UNRESOLVED = "receiver_type_not_traceable_to_a_changed_file"
+RECEIVER_ATTRIBUTE_NOT_CHANGED = "attribute_is_not_a_changed_symbol"
+
+ALL_RECEIVER_FAILURES: frozenset[str] = frozenset({
+    RECEIVER_UNBOUND,
+    RECEIVER_AMBIGUOUS,
+    RECEIVER_LOCAL,
+    RECEIVER_TYPE_UNRESOLVED,
+    RECEIVER_ATTRIBUTE_NOT_CHANGED,
+})
+
+
+@dataclass(frozen=True)
+class ReceiverResolution:
+    """Outcome of one attribute-receiver resolution attempt.
+
+    Carries the *failure reason* as well as the success case, because "we could
+    not tell what ``obj`` is" and "we could tell, and it is not related to the
+    change" are completely different facts about the analysis, and only the
+    first is a blind spot.
+    """
+
+    evidence: DependencyEvidence | None = None
+    reason: str = ""
+
+    @property
+    def resolved(self) -> bool:
+        return self.evidence is not None
+
+
+def resolve_attribute_receiver(
+    *,
+    source_file: str,
+    receiver: str,
+    attribute: str,
+    local_type_bindings: dict[str, str],
+    ambiguous_bindings: frozenset[str],
+    class_bases: dict[str, tuple[str, ...]],
+    locally_defined_names: frozenset[str],
+    imported_symbol_origins: dict[str, dict[str, tuple[str, str]]],
+    changed_files: frozenset[str],
+    changed_symbol_names: frozenset[str],
+    symbols_by_file: dict[str, frozenset[str]] | None = None,
+) -> ReceiverResolution:
+    """Resolve ``receiver.attribute`` to a changed definition, or explain why not.
+
+    **What this deliberately is not.** It is not type inference. There is no
+    dataflow, no call-graph return-type propagation, no cross-module
+    resolution of what a factory function hands back, and no unification. Every
+    rule below reads a type that the source *states*, in one step, and stops.
+    That ceiling is the point: a speculative resolution that is wrong produces
+    a *false confident edge*, and a false confident edge is exactly the input
+    that could justify narrowing validation. A refusal, by contrast, leaves the
+    pre-existing (weaker, safe) attribute-name evidence in place and can only
+    ever make validation broader.
+
+    The rules, all of which require the receiver's type to be written down:
+
+    1. ``receiver`` is bound to exactly one type name in this file, via a
+       constructor call, an annotated assignment, or a parameter annotation
+       (:attr:`~local_agent.indexing.ast_python_indexer.PythonFileFacts.local_type_bindings`);
+    2. that type name resolves - through the already-audited import-origin map,
+       following re-export chains via :func:`resolve_alias_reference` - to a
+       symbol defined in a *changed* file;
+    3. ``attribute`` is itself one of the changed symbol names.
+
+    Plus one inheritance rule: ``self.attribute`` inside a class whose base
+    class resolves to a changed file, which is the same three steps with the
+    base class standing in for the binding.
+
+    Refusals, each with its own reason code:
+
+    * the receiver was never bound to a type -> :data:`RECEIVER_UNBOUND`;
+    * it was bound to two conflicting types -> :data:`RECEIVER_AMBIGUOUS`
+      (ambiguity is never broken by picking one);
+    * the type is defined in *this* file -> :data:`RECEIVER_LOCAL`, a resolved
+      *negative*: the attribute provably belongs to local code;
+    * the type does not trace to a changed file -> :data:`RECEIVER_TYPE_UNRESOLVED`;
+    * the attribute is not a changed symbol -> :data:`RECEIVER_ATTRIBUTE_NOT_CHANGED`.
+    """
+    if attribute not in changed_symbol_names:
+        return ReceiverResolution(reason=RECEIVER_ATTRIBUTE_NOT_CHANGED)
+
+    type_name = ""
+    via = ""
+    if receiver == "self":
+        # Inheritance rule: ``self.attribute`` is attributable only when the
+        # enclosing module declares exactly one class whose bases we know, and
+        # one of those bases resolves to the change. More than one candidate
+        # base class means we cannot say which ``self`` is, so we decline.
+        candidates = sorted({
+            base for bases in class_bases.values() for base in bases
+        })
+        if len(candidates) != 1:
+            return ReceiverResolution(
+                reason=RECEIVER_UNBOUND if not candidates else RECEIVER_AMBIGUOUS
+            )
+        type_name = candidates[0]
+        via = "inherited"
+    else:
+        if receiver in ambiguous_bindings:
+            return ReceiverResolution(reason=RECEIVER_AMBIGUOUS)
+        # A receiver written as a constructor call (``Widget().render()``) is
+        # recorded with the class name in the receiver slot itself, so a name
+        # that is a known type needs no binding lookup.
+        type_name = local_type_bindings.get(receiver, "")
+        if not type_name and (
+            receiver in locally_defined_names
+            or receiver in (imported_symbol_origins.get(source_file) or {})
+        ):
+            type_name = receiver
+        if not type_name:
+            return ReceiverResolution(reason=RECEIVER_UNBOUND)
+        via = "bound"
+
+    if type_name in locally_defined_names:
+        # Defined right here: a resolved negative, not a blind spot.
+        return ReceiverResolution(reason=RECEIVER_LOCAL)
+
+    alias = resolve_alias_reference(
+        source_file=source_file,
+        reference=type_name,
+        imported_symbol_origins=imported_symbol_origins,
+        changed_files=changed_files,
+        changed_symbol_names=frozenset(changed_symbol_names | {type_name}),
+    )
+    if alias is None:
+        return ReceiverResolution(reason=RECEIVER_TYPE_UNRESOLVED)
+
+    target_file = alias.target_file
+    if target_file not in changed_files:
+        return ReceiverResolution(reason=RECEIVER_TYPE_UNRESOLVED)
+    if symbols_by_file is not None:
+        defined = symbols_by_file.get(target_file, frozenset())
+        # The resolved class must actually live in the changed file, and the
+        # attribute must be a name that file defines. Without this the rule
+        # would happily attribute ``widget.render()`` to a changed file that
+        # defines ``Widget`` but has no ``render`` at all.
+        if alias.target_symbol not in defined or attribute not in defined:
+            return ReceiverResolution(reason=RECEIVER_TYPE_UNRESOLVED)
+
+    phrase = (
+        f"'{source_file}' calls '{receiver}.{attribute}' where '{receiver}' inherits from "
+        f"'{alias.target_symbol}'"
+        if via == "inherited"
+        else f"'{source_file}' calls '{receiver}.{attribute}' where '{receiver}' is a "
+        f"'{alias.target_symbol}'"
+    )
+    return ReceiverResolution(
+        evidence=make_evidence(
+            source_file=source_file,
+            target_file=target_file,
+            evidence_type=ATTRIBUTE_RECEIVER_RESOLVED,
+            target_symbol=attribute,
+            source_reference=f"{receiver}.{attribute}",
+            provenance=f"{phrase}, defined in {target_file} and changed by this edit",
+            resolution_notes=(
+                f"receiver type '{type_name}' resolved via {via} declaration",
+            ),
+        ),
+        reason="",
+    )

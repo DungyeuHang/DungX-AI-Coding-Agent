@@ -87,6 +87,19 @@ from .semantic_impact import (
 )
 from .test_synthesizer import BehavioralVerifier, TestSynthesizer, VerificationGapAnalyzer
 from .validation_decision import ReuseAttempt, ValidationDecision, ValidationDecisionEngine
+from .validation_lifecycle import (
+    ITERATION_IMPLEMENTATION,
+    ITERATION_REPAIR,
+    RESULT_FAILED,
+    RESULT_PASSED,
+    STAGE_BROAD,
+    STAGE_TARGETED,
+    LifecycleState,
+    ValidationIterationRecord,
+    ValidationLifecycleManager,
+    can_transition,
+    compute_defect_signature,
+)
 from .validation_telemetry import (
     ValidationTelemetryManager,
     build_decision_record,
@@ -155,6 +168,27 @@ class Orchestrator:
             if getattr(config, "validation_telemetry_enabled", False)
             else None
         )
+        # Phase 4.20: cross-iteration lifecycle tracing. Off by default, and -
+        # like the telemetry manager above - purely observational: nothing on
+        # the validation path reads it back, and the advisory recommender it
+        # exposes is never consulted here.
+        self.lifecycle_manager = (
+            ValidationLifecycleManager(
+                storage,
+                config.project,
+                max_lifecycles=getattr(config, "validation_lifecycle_retention", 200),
+                max_iterations_per_lifecycle=getattr(
+                    config, "validation_lifecycle_max_iterations", 50
+                ),
+            )
+            if getattr(config, "validation_lifecycle_enabled", False)
+            else None
+        )
+        #: The lifecycle id for the run currently in progress, if any.
+        self._lifecycle_id: str = ""
+        #: The iteration id of the most recent lifecycle iteration, so the next
+        #: repair can point at it as its causal parent.
+        self._last_iteration_id: str = ""
 
     def analyze(self):
         return self.analyzer.analyze()
@@ -344,6 +378,7 @@ class Orchestrator:
         )
 
         start_iteration = recovery_state.completed_iterations + 1
+        self._lifecycle_start(task, current_subtask)
         try:
             for iteration in range(start_iteration, self.config.max_iterations + 1):
                 report.iterations = iteration
@@ -510,8 +545,26 @@ class Orchestrator:
                         emit("[4/7] Changes not approved; stopping before write")
                         report.proposed_diff = proposed_diff
                         break
+                # Phase 4.20: the candidate exists, was validated by whatever
+                # prospective machinery is enabled, and is about to be applied
+                # to the authoritative tree. Recorded here rather than after
+                # the write so an apply that throws still leaves the trace at
+                # APPROVED rather than falsely claiming APPLIED.
+                # ``REPAIRED`` is a no-op on the first iteration (the lifecycle
+                # is in CREATED, from which it is not a legal edge) and is what
+                # closes the REPAIR_REQUIRED -> REPAIRED loop on every later one.
+                self._lifecycle_advance(
+                    LifecycleState.REPAIRED,
+                    LifecycleState.CANDIDATE_GENERATED,
+                    LifecycleState.VALIDATED,
+                    LifecycleState.APPROVED,
+                    reason=f"iteration {iteration} ({stage_name})",
+                )
                 with self.repo_lock: # Acquire lock for file system mutation
                     report.changed_files.extend(coding_agent.apply_prepared(prepared))
+                self._lifecycle_advance(
+                    LifecycleState.APPLIED, reason=f"iteration {iteration} applied"
+                )
                 report.proposed_diff = coding_agent.diff()
                 self._create_checkpoint(task, current_subtask, "After code generation, before validation", context, report) # Checkpoint
 
@@ -581,6 +634,30 @@ class Orchestrator:
                     broad_failed=broad_failed,
                     targeted_duration=targeted_duration,
                     broad_duration=broad_duration,
+                )
+
+                # Phase 4.20: link this iteration's real validation outcome
+                # into the lifecycle, with a defect signature when it failed.
+                self._lifecycle_record_iteration(
+                    iteration_number=iteration,
+                    is_repair=(stage_name == "repair"),
+                    report=report,
+                    scope=str(
+                        (getattr(report, "semantic_impact", None) or {}).get(
+                            "recommended_scope", ""
+                        )
+                    ),
+                    failed=failed,
+                    stage=STAGE_BROAD if broad_ran else STAGE_TARGETED,
+                    duration_seconds=targeted_duration + broad_duration,
+                )
+                self._lifecycle_advance(
+                    LifecycleState.REPAIR_REQUIRED if failed is not None
+                    else LifecycleState.POST_VALIDATED,
+                    reason=(
+                        f"iteration {iteration} validation "
+                        f"{'failed' if failed is not None else 'passed'}"
+                    ),
                 )
 
                 # Phase 4.11: Autonomous Verification Gap Analysis & Behavioral Test Synthesis
@@ -907,6 +984,13 @@ class Orchestrator:
             if not report.outcome and task.outcome:
                 report.outcome = task.outcome
 
+        # Phase 4.20: close the lifecycle exactly once, on every exit path from
+        # the loop above (completion, abandonment, provider failure, an
+        # exception that the enclosing handler turned into a report).
+        self._lifecycle_finish(
+            completed=bool(report.completed),
+            reason=report.outcome or ("review approved" if report.completed else "run ended"),
+        )
         return report
 
     def _map_role(self, capability: ProviderCapability | SpecialistRole | str) -> SpecialistRole:
@@ -1301,6 +1385,121 @@ class Orchestrator:
             )
         except Exception as exc:  # noqa: BLE001 - telemetry must never break validation
             LOGGER.warning("Validation decision outcome linking failed: %s", exc)
+
+    # -- Phase 4.20: cross-iteration lifecycle tracing ---------------------
+
+    def _lifecycle_start(self, task: Task, subtask: Subtask | None) -> None:
+        """Open a lifecycle for this run. Never raises.
+
+        Like every other observability hook in this class, a failure here is
+        logged and swallowed: a lifecycle-tracing defect must not be able to
+        stop a real validation run.
+        """
+        self._lifecycle_id = ""
+        self._last_iteration_id = ""
+        if self.lifecycle_manager is None:
+            return
+        try:
+            record = self.lifecycle_manager.start(
+                task_id=task.task_id,
+                subtask_id=subtask.subtask_id if subtask else "",
+            )
+            self._lifecycle_id = record.lifecycle_id
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Validation lifecycle start failed: %s", exc)
+
+    def _lifecycle_advance(self, *states: str, reason: str = "") -> None:
+        """Walk the lifecycle through ``states``, skipping ones it cannot take.
+
+        Deliberately non-raising *here* while
+        :meth:`~local_agent.validation_lifecycle.ValidationLifecycleRecord.transition`
+        stays strict: the strictness is what makes the state machine a real
+        invariant (and is tested directly against the model), while this call
+        site must degrade to "record less" rather than to "abort the run".
+        """
+        if self.lifecycle_manager is None or not self._lifecycle_id:
+            return
+        for state in states:
+            try:
+                record = self.lifecycle_manager.get(self._lifecycle_id)
+                if record is None or not can_transition(record.state, state):
+                    continue
+                self.lifecycle_manager.transition(self._lifecycle_id, state, reason=reason)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Validation lifecycle transition to %s failed: %s", state, exc)
+                return
+
+    def _lifecycle_record_iteration(
+        self,
+        *,
+        iteration_number: int,
+        is_repair: bool,
+        report: RunReport,
+        scope: str,
+        failed: ExecutionResult | None,
+        stage: str,
+        duration_seconds: float,
+    ) -> None:
+        """Record one iteration, with a defect signature when it failed."""
+        if self.lifecycle_manager is None or not self._lifecycle_id:
+            return
+        try:
+            signature = None
+            if failed is not None:
+                signature = compute_defect_signature(
+                    failure_category="validation_failure",
+                    command=failed.command,
+                    exit_code=failed.exit_code,
+                    diagnostic=failed.stderr or failed.stdout,
+                    affected_file=(report.changed_files[0] if report.changed_files else ""),
+                    validation_tier=stage,
+                    stderr=failed.stderr,
+                    stdout=failed.stdout,
+                )
+            iteration = ValidationIterationRecord(
+                iteration_number=iteration_number,
+                parent_iteration_id=self._last_iteration_id if is_repair else "",
+                kind=ITERATION_REPAIR if is_repair else ITERATION_IMPLEMENTATION,
+                decision_id=getattr(report, "validation_decision_id", "") or "",
+                scope=scope,
+                validation_result=RESULT_FAILED if failed is not None else RESULT_PASSED,
+                validation_stage=stage,
+                apply_result="applied",
+                defect_signature=signature,
+                failure_category="validation_failure" if failed is not None else "",
+                duration_seconds=duration_seconds,
+                ended_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            )
+            self.lifecycle_manager.record_iteration(self._lifecycle_id, iteration)
+            self._last_iteration_id = iteration.iteration_id
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Validation lifecycle iteration recording failed: %s", exc)
+
+    def _lifecycle_finish(self, *, completed: bool, reason: str) -> None:
+        """Drive the lifecycle to its terminal state. Never raises."""
+        if self.lifecycle_manager is None or not self._lifecycle_id:
+            return
+        target = LifecycleState.COMPLETED if completed else LifecycleState.ABANDONED
+        try:
+            record = self.lifecycle_manager.get(self._lifecycle_id)
+            if record is None or record.is_terminal:
+                return
+            if not can_transition(record.state, target):
+                # Reach a legal terminal from wherever we actually are. FAILED
+                # and ABANDONED are reachable from every non-terminal state, so
+                # this can only fail if the record is already terminal.
+                target = LifecycleState.FAILED if not completed else target
+                if not can_transition(record.state, target):
+                    self.lifecycle_manager.transition(
+                        self._lifecycle_id, LifecycleState.ABANDONED, reason=reason
+                    )
+                    return
+            self.lifecycle_manager.transition(self._lifecycle_id, target, reason=reason)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Validation lifecycle finalisation failed: %s", exc)
+        finally:
+            self._lifecycle_id = ""
+            self._last_iteration_id = ""
 
     def _execute_code_generation(
         self,

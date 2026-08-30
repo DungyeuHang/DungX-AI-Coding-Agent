@@ -62,6 +62,7 @@ from .dependency_resolution import (
     DependencyEvidence,
     make_evidence,
     resolve_alias_reference,
+    resolve_attribute_receiver,
 )
 from .indexing.ast_python_indexer import (
     AstPythonIndexer,
@@ -1671,6 +1672,16 @@ class SemanticChangeImpactAnalyzer:
         _tag(facts.annotation_references, ANNOTATION, "type-annotates with")
         _tag(facts.attribute_references, ATTRIBUTE_RESOLUTION, "accesses an attribute named")
 
+        # Phase 4.20: where the receiver's type is *written down* in the source,
+        # upgrade the weak attribute-name hit above with a resolved-receiver
+        # edge. Strictly additive: the ATTRIBUTE_RESOLUTION evidence is still
+        # emitted, so a receiver we cannot resolve is no worse off than before
+        # and the scope policy sees exactly what it saw previously plus, at
+        # most, one better-explained edge.
+        out.extend(
+            self._receiver_evidence(graph, test_path, facts, name_to_changed_files)
+        )
+
         for target_file in sorted(graph.dynamic_resolved_edges.get(test_path, ())):
             out.append(
                 make_evidence(
@@ -1683,6 +1694,60 @@ class SemanticChangeImpactAnalyzer:
                     ),
                 )
             )
+        return tuple(out)
+
+    def _receiver_evidence(
+        self,
+        graph: "SemanticGraph",
+        test_path: str,
+        facts: Any,
+        name_to_changed_files: dict[str, set[str]],
+    ) -> tuple[DependencyEvidence, ...]:
+        """Phase 4.20: resolved-receiver evidence for ``obj.attr`` accesses.
+
+        Purely explanatory, exactly like :meth:`_construct_evidence`: it adds
+        better-explained edges and never removes or replaces one, so no target
+        can change tier and no scope can narrow as a result of this method
+        alone. The heavy lifting (and every refusal rule) lives in
+        :func:`~local_agent.dependency_resolution.resolve_attribute_receiver`.
+        """
+        accesses = getattr(facts, "attribute_accesses", frozenset())
+        if not accesses:
+            return ()
+        changed_names = frozenset(name_to_changed_files)
+        changed_files = frozenset(
+            path for paths in name_to_changed_files.values() for path in paths
+        )
+        if not changed_files:
+            return ()
+        symbols_by_file = {
+            path: frozenset(symbol.name for symbol in graph.symbols_of(path))
+            for path in changed_files
+        }
+        out: list[DependencyEvidence] = []
+        seen: set[tuple[str, str]] = set()
+        for receiver, attribute in sorted(accesses):
+            key = (receiver, attribute)
+            if key in seen:
+                continue
+            seen.add(key)
+            resolution = resolve_attribute_receiver(
+                source_file=test_path,
+                receiver=receiver,
+                attribute=attribute,
+                local_type_bindings=dict(getattr(facts, "local_type_bindings", {}) or {}),
+                ambiguous_bindings=frozenset(getattr(facts, "ambiguous_bindings", ()) or ()),
+                class_bases=dict(getattr(facts, "class_bases", {}) or {}),
+                locally_defined_names=frozenset(
+                    getattr(facts, "locally_defined_names", ()) or ()
+                ),
+                imported_symbol_origins=graph.imported_symbol_origins,
+                changed_files=changed_files,
+                changed_symbol_names=changed_names,
+                symbols_by_file=symbols_by_file,
+            )
+            if resolution.evidence is not None:
+                out.append(resolution.evidence)
         return tuple(out)
 
     def _reexport_evidence(

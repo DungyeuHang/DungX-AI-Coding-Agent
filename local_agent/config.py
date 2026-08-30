@@ -143,6 +143,25 @@ class AgentConfig:
     #: Maximum number of decision records and calibration observations
     #: retained by the telemetry store (each bounded independently).
     validation_metrics_retention: int = 500
+    # Phase 4.20: cross-iteration validation lifecycle tracing.
+    #: Records a durable, bounded lifecycle trace (task -> subtask -> iteration
+    #: -> validation decision -> apply -> repair -> outcome) alongside the
+    #: Phase 4.19 per-decision telemetry. Pure observability plus an *advisory*
+    #: recommendation layer; enabling it cannot change what validation runs,
+    #: because the authoritative decision remains
+    #: ``ValidationDecisionEngine``'s and the recommender's effective scope is
+    #: never narrower than the safety floor it is handed.
+    validation_lifecycle_enabled: bool = False
+    #: Maximum number of lifecycle records retained.
+    validation_lifecycle_retention: int = 200
+    #: Maximum iterations retained per lifecycle, so one runaway repair loop
+    #: cannot dominate the bounded store.
+    validation_lifecycle_max_iterations: int = 50
+    #: Minimum resolved lifecycles before the advisory recommender is willing
+    #: to say anything other than "stay at the safety floor". Below this it
+    #: reports ``data_sufficient=False`` and recommends the floor - insufficient
+    #: data may never narrow validation.
+    validation_lifecycle_min_samples: int = 10
 
     @property
     def tool_policy(self) -> Any:
@@ -245,6 +264,10 @@ class AgentConfig:
             "validation_calibration_min_samples": "AGENT_VALIDATION_CALIBRATION_MIN_SAMPLES",
             "validation_calibration_max_adjustment": "AGENT_VALIDATION_CALIBRATION_MAX_ADJUSTMENT",
             "validation_metrics_retention": "AGENT_VALIDATION_METRICS_RETENTION",
+            "validation_lifecycle_enabled": "AGENT_VALIDATION_LIFECYCLE_ENABLED",
+            "validation_lifecycle_retention": "AGENT_VALIDATION_LIFECYCLE_RETENTION",
+            "validation_lifecycle_max_iterations": "AGENT_VALIDATION_LIFECYCLE_MAX_ITERATIONS",
+            "validation_lifecycle_min_samples": "AGENT_VALIDATION_LIFECYCLE_MIN_SAMPLES",
         }
 
         def value(name: str, default: object) -> object:
@@ -424,6 +447,18 @@ class AgentConfig:
             validation_metrics_retention=_positive_int(
                 value("validation_metrics_retention", 500), "validation_metrics_retention"
             ),
+            validation_lifecycle_enabled=_bool(value("validation_lifecycle_enabled", False)),
+            validation_lifecycle_retention=_positive_int(
+                value("validation_lifecycle_retention", 200), "validation_lifecycle_retention"
+            ),
+            validation_lifecycle_max_iterations=_positive_int(
+                value("validation_lifecycle_max_iterations", 50),
+                "validation_lifecycle_max_iterations",
+            ),
+            validation_lifecycle_min_samples=_positive_int(
+                value("validation_lifecycle_min_samples", 10),
+                "validation_lifecycle_min_samples",
+            ),
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -475,6 +510,12 @@ class AgentConfig:
             raise ValueError("validation_calibration_max_adjustment must be between 0.0 and 1.0")
         if self.validation_metrics_retention < 1:
             raise ValueError("validation_metrics_retention must be positive")
+        if self.validation_lifecycle_retention < 1:
+            raise ValueError("validation_lifecycle_retention must be positive")
+        if self.validation_lifecycle_max_iterations < 1:
+            raise ValueError("validation_lifecycle_max_iterations must be positive")
+        if self.validation_lifecycle_min_samples < 1:
+            raise ValueError("validation_lifecycle_min_samples must be at least 1")
         # Validate tool policy creation
         _ = self.tool_policy
 
@@ -508,6 +549,7 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--reuse-candidate-evidence", type=_bool, default=None, help="reuse passing candidate validation evidence post-apply when assumptions still hold (true/false)")
     parser.add_argument("--evidence-max-age-seconds", type=int, default=None, help="reject reuse of validation evidence older than this many seconds (0 = no age limit)")
     parser.add_argument("--validation-telemetry", type=_bool, default=None, help="record bounded, cross-task validation decision telemetry (true/false)")
+    parser.add_argument("--validation-lifecycle", type=_bool, default=None, help="record bounded cross-iteration validation lifecycle traces (true/false)")
     parser.add_argument("--validation-calibration", type=_bool, default=None, help="additionally compute a shadow (never-applied) calibrated decision for comparison (true/false)")
     parser.add_argument("--validation-calibration-min-samples", type=int, default=None, help="minimum resolved observations before calibration may raise confidence for an evidence type")
     parser.add_argument("--validation-calibration-max-adjustment", type=float, default=None, help="maximum absolute confidence-score adjustment calibration may propose (0..1)")
@@ -570,6 +612,7 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
                 args, "validation_calibration_max_adjustment", None
             ),
             "validation_metrics_retention": getattr(args, "validation_metrics_retention", None),
+            "validation_lifecycle_enabled": getattr(args, "validation_lifecycle", None),
             "validation_commands": getattr(args, "validation", None),
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,
