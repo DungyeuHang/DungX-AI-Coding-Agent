@@ -1774,6 +1774,65 @@ class RunnerIntegrationTests(ExecutorCase):
         # And the rolled-back tree still fails to parse, so the signal persists.
         self.assertEqual(SemanticGraph.build(self.root).parse_failures.keys(), {"broken.py"})
 
+    def test_repeated_failure_is_bounded_across_runs(self):
+        """Regression: a persistently failing candidate stops being retried.
+
+        Found by the Phase 4.22 forensic audit. Two linked defects made
+        ``PolicyThresholds.max_failures_before_block`` inert across runs:
+
+        * ``MaintenanceCandidate.merge_observation`` did not fold attempt/failure
+          counts forward, so the store recorded "failed once" no matter how many
+          times a candidate failed; and
+        * a run scored freshly-discovered candidates, whose counters always start
+          at zero, so the policy never saw any history at all.
+
+        The observable consequence was an unbounded retry loop: a scheduled
+        ``maintenance run --execute`` against an unchanged repository with a
+        persistently failing provider would attempt the same candidate forever.
+        """
+        from local_agent.maintenance import RUN_MODE_EXECUTE
+
+        attempts: list[int] = []
+        for _ in range(5):
+            provider = ScriptedProvider(raise_exc=ProviderError("provider is down"))
+            result = self.build_runner(self.executor(provider=provider)).run(
+                mode=RUN_MODE_EXECUTE
+            )
+            attempts.append(result.record.execution_attempts)
+
+        # Exactly two real attempts, then the policy blocks the candidate.
+        self.assertEqual(attempts, [1, 1, 0, 0, 0], attempts)
+        stored = self.storage.load_maintenance().candidates[0]
+        self.assertEqual(stored.failure_count, 2)
+        self.assertEqual((self.root / "broken.py").read_text(encoding="utf-8"), BROKEN_SOURCE)
+
+    def test_attempt_history_survives_persistence(self):
+        """The counts must round-trip, or the bound above is decoration."""
+        from local_agent.maintenance import MaintenanceCandidate, MaintenanceStore
+
+        store = MaintenanceStore()
+        first = MaintenanceCandidate(kind=MaintenanceSignal.PARSE_FAILURE, subject="a.py")
+        first.attempt_count = 3
+        first.failure_count = 2
+        store.upsert(first)
+
+        # A fresh observation of the same problem must not reset the history.
+        fresh = MaintenanceCandidate(kind=MaintenanceSignal.PARSE_FAILURE, subject="a.py")
+        store.upsert(fresh)
+        self.assertEqual(store.candidates[0].failure_count, 2)
+        self.assertEqual(store.candidates[0].attempt_count, 3)
+
+        # A run that incremented its own copy must fold that increase back in.
+        incremented = MaintenanceCandidate(kind=MaintenanceSignal.PARSE_FAILURE, subject="a.py")
+        incremented.attempt_count = 4
+        incremented.failure_count = 3
+        store.upsert(incremented)
+        self.assertEqual(store.candidates[0].failure_count, 3)
+
+        reloaded = MaintenanceStore.from_dict(json.loads(json.dumps(store.to_dict())))
+        self.assertEqual(reloaded.candidates[0].failure_count, 3)
+        self.assertEqual(reloaded.candidates[0].attempt_count, 4)
+
     def test_a_plan_only_tier_never_reaches_the_executor(self):
         from local_agent.maintenance import RUN_MODE_EXECUTE
 

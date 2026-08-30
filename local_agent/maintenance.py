@@ -704,6 +704,20 @@ class MaintenanceCandidate:
             list(self.uncertainty) + list(other.uncertainty)
         )
         self.metrics = sanitize_metrics({**self.metrics, **other.metrics})
+        # Attempt history is monotonic and takes the maximum of the two sides.
+        #
+        # This is load-bearing rather than tidy-minded. A run discovers its
+        # candidates from a fresh scan, so the object it increments during the
+        # run is *not* the object in the store; folding it back in with the
+        # maximum is the only thing that makes ``failure_count`` accumulate
+        # across runs at all. Without it a candidate that fails every single
+        # time is permanently recorded as having failed exactly once, and
+        # ``PolicyThresholds.max_failures_before_block`` - the whole mechanism
+        # that stops a broken candidate being retried forever - never fires.
+        # Taking the maximum (rather than the newer value) also means a stale
+        # observation can never *lower* a candidate's recorded failure history.
+        self.attempt_count = max(self.attempt_count, other.attempt_count)
+        self.failure_count = max(self.failure_count, other.failure_count)
         return self
 
     def _append_history(self, event: str, reason: str) -> None:

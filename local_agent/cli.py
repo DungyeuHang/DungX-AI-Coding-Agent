@@ -613,8 +613,8 @@ def _build_maintenance_executor(config, storage, *, apply_enabled=False, progres
         MaintenanceExecutor,
     )
     from .maintenance_policy import MaintenanceExecutionPolicy
-    from .models import ApprovalPolicy
-    from .providers import build_provider
+    from .models import ApprovalPolicy, SpecialistRole
+    from .providers import SpecialistModelRouter
     from .validation_lifecycle import ValidationLifecycleManager
     from .validation_telemetry import ValidationTelemetryManager
 
@@ -622,9 +622,15 @@ def _build_maintenance_executor(config, storage, *, apply_enabled=False, progres
     approval_engine = ApprovalPolicyEngine(
         [ApprovalPolicy.from_dict(entry) for entry in getattr(config, "approval_policies", [])]
     )
+    # Resolved through the existing specialist router, not ``build_provider``
+    # directly, so maintenance inherits the configured implementation-role
+    # provider, model and fallback chain instead of quietly using a different
+    # model from the rest of the agent. The router stays the authority on
+    # provider selection; the executor never retries a provider itself.
+    router = SpecialistModelRouter(config)
     return MaintenanceExecutor(
         root=config.project,
-        provider_factory=lambda: build_provider(config),
+        provider_factory=lambda: router.get_provider(SpecialistRole.IMPLEMENTATION),
         policy=MaintenanceExecutionPolicy(repository_root=config.project),
         budget=MaintenanceBudget.from_config(config),
         configured_tier=getattr(config, "maintenance_autonomy_tier", "observe_only"),

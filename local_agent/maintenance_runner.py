@@ -825,6 +825,17 @@ class MaintenanceRunner:
             analysis.extractor_errors["scan"] = sanitize_text(
                 f"{type(exc).__name__}: {exc}"
             )
+        # Carry forward what previous runs learned about these candidates.
+        #
+        # A scan produces *fresh* candidate objects with ``attempt_count`` and
+        # ``failure_count`` at zero, because those are properties of our history
+        # with a problem, not of the problem itself. Without this hydration the
+        # policy re-decides every run as though the candidate had never been
+        # attempted, and ``max_failures_before_block`` can never fire - a
+        # candidate that fails on every attempt would be retried forever, which
+        # is precisely the loop the thresholds exist to prevent.
+        self._hydrate_attempt_history(analysis.candidates)
+
         considered: list[MaintenanceCandidate] = []
         for candidate in analysis.candidates:
             if not ledger.try_consume("max_candidates_considered"):
@@ -854,6 +865,26 @@ class MaintenanceRunner:
                 + "; absence of a signal is not evidence it is gone"
             )
         return analysis
+
+    def _hydrate_attempt_history(self, candidates: Sequence[MaintenanceCandidate]) -> None:
+        """Copy persisted attempt/failure counts onto freshly-scanned candidates.
+
+        Only ever *raises* a count (``max``), so a corrupted or truncated store
+        can make the run more conservative but never less. A store that cannot
+        be read at all leaves every count at zero, which is the pre-existing
+        behaviour and is safe in the sense that it only affects retry patience,
+        not what a candidate is allowed to do.
+        """
+        try:
+            store = self.manager.load()
+        except Exception:  # noqa: BLE001 - history is not the work
+            return
+        for candidate in candidates:
+            previous = store.find(candidate.candidate_id)
+            if previous is None:
+                continue
+            candidate.attempt_count = max(candidate.attempt_count, previous.attempt_count)
+            candidate.failure_count = max(candidate.failure_count, previous.failure_count)
 
     def _score_and_select(
         self, result: MaintenanceRunResult, ledger: BudgetLedger, mode: str
