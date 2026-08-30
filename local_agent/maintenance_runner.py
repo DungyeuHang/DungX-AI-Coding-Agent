@@ -134,9 +134,31 @@ class MaintenanceWorkOrder:
     max_tool_steps: int = 1
     max_validation_commands: int = 1
     max_repair_iterations: int = 0
+    #: The autonomy ceiling that was in force when this order was planned. An
+    #: executor re-derives the verdict itself and refuses if the order claims a
+    #: stronger tier than the policy now grants.
+    configured_tier: str = ""
+    #: The full candidate as it was observed at planning time. Carried verbatim
+    #: (rather than as a handful of copied scalars) so that an executor can
+    #: re-run the *real* policy against the *real* candidate object instead of
+    #: trusting a summary that could drift out of sync with it.
+    candidate_snapshot: dict[str, Any] = field(default_factory=dict)
+    #: Content digest of ``scope_files`` at planning time, when the runner was
+    #: given a fingerprint function. An executor compares it against the tree it
+    #: is about to modify; a mismatch means the plan was made against a
+    #: different repository state and must not be executed blindly.
+    scope_fingerprint: str = ""
+    planned_at: str = ""
 
     def __post_init__(self) -> None:
         self.candidate_id = sanitize_text(self.candidate_id, limit=64)
+        self.configured_tier = sanitize_text(self.configured_tier, limit=64)
+        self.scope_fingerprint = sanitize_text(self.scope_fingerprint, limit=128)
+        self.planned_at = sanitize_text(self.planned_at, limit=64)
+        if not isinstance(self.candidate_snapshot, Mapping):
+            self.candidate_snapshot = {}
+        else:
+            self.candidate_snapshot = dict(self.candidate_snapshot)
         self.objective = sanitize_text(self.objective, limit=400)
         self.rationale = sanitize_text(self.rationale, limit=400)
         self.scope_files = sanitize_path_list(self.scope_files)
@@ -166,6 +188,10 @@ class MaintenanceWorkOrder:
             "max_tool_steps": self.max_tool_steps,
             "max_validation_commands": self.max_validation_commands,
             "max_repair_iterations": self.max_repair_iterations,
+            "configured_tier": self.configured_tier,
+            "candidate_snapshot": dict(self.candidate_snapshot),
+            "scope_fingerprint": self.scope_fingerprint,
+            "planned_at": self.planned_at,
         }
 
 
@@ -212,6 +238,8 @@ def build_work_order(
     *,
     granted_tier: str,
     budget: MaintenanceBudget,
+    configured_tier: str = "",
+    fingerprint_fn: Callable[[Sequence[str]], str] | None = None,
 ) -> MaintenanceWorkOrder:
     """Derive a bounded work order from a candidate.
 
@@ -219,7 +247,19 @@ def build_work_order(
     contract the review stage later checks against: any file the execution
     touched that is not in ``scope_files`` is an out-of-scope change, and the
     candidate is failed for it even if validation passed.
+
+    ``fingerprint_fn`` is injected rather than imported so this module keeps its
+    structural independence from the validation/evidence layer. When it is
+    absent the order simply carries no fingerprint, and an executor treats that
+    as "no freshness evidence was recorded" - it still performs its own
+    signal-level freshness re-check.
     """
+    scope_fingerprint = ""
+    if fingerprint_fn is not None:
+        try:
+            scope_fingerprint = str(fingerprint_fn(list(candidate.affected_files)) or "")
+        except Exception:  # noqa: BLE001 - a fingerprint we cannot take is simply absent
+            scope_fingerprint = ""
     return MaintenanceWorkOrder(
         candidate_id=candidate.candidate_id,
         objective=f"Maintenance: {candidate.title}",
@@ -237,6 +277,10 @@ def build_work_order(
         max_tool_steps=budget.max_tool_steps_per_subtask,
         max_validation_commands=budget.max_validation_commands,
         max_repair_iterations=budget.max_repair_iterations_per_candidate,
+        configured_tier=configured_tier or granted_tier,
+        candidate_snapshot=candidate.to_dict(),
+        scope_fingerprint=scope_fingerprint,
+        planned_at=_timestamp(),
     )
 
 
@@ -687,6 +731,7 @@ class MaintenanceRunner:
         configured_tier: str = AutonomyTier.OBSERVE_ONLY,
         cancelled: Callable[[], bool] | None = None,
         progress: Callable[[str], None] | None = None,
+        fingerprint_fn: Callable[[Sequence[str]], str] | None = None,
     ):
         self.analyzer = analyzer
         self.manager = manager
@@ -706,6 +751,11 @@ class MaintenanceRunner:
         )
         self.cancelled = cancelled
         self.progress = progress
+        #: Injected content-fingerprint function used to stamp work orders with
+        #: the repository state they were planned against. ``None`` means no
+        #: fingerprint is recorded; it is never computed here, because that
+        #: would give this module a dependency on the evidence layer.
+        self.fingerprint_fn = fingerprint_fn
         #: Candidates that survived SELECT, handed from that stage to PLAN.
         self._selected: list[MaintenanceCandidate] = []
 
@@ -860,7 +910,11 @@ class MaintenanceRunner:
                 exp for cand, exp in result.ranked if cand.candidate_id == candidate.candidate_id
             )
             order = build_work_order(
-                candidate, granted_tier=verdict.granted_tier, budget=self.budget
+                candidate,
+                granted_tier=verdict.granted_tier,
+                budget=self.budget,
+                configured_tier=self.configured_tier,
+                fingerprint_fn=self.fingerprint_fn,
             )
             result.work_orders[candidate.candidate_id] = order
             _safe_transition(candidate, CandidateState.PLANNED, "work order built")

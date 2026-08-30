@@ -179,6 +179,29 @@ def build_parser() -> argparse.ArgumentParser:
             "existing scheduler executes it through the normal pipeline"
         ),
     )
+    # Phase 4.22. Two separate opt-ins, deliberately: --execute wires the narrow
+    # executor so a supported candidate can be implemented and prospectively
+    # validated, and --apply additionally permits the authoritative write. Neither
+    # is implied by maintenance discovery being enabled, and --apply without
+    # --execute does nothing.
+    maintenance_run.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "wire the narrow maintenance executor so supported candidates are "
+            "implemented and prospectively validated in an isolated workspace "
+            "(nothing is written to the repository without --apply)"
+        ),
+    )
+    maintenance_run.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "permit an executed, prospectively-validated maintenance change to be "
+            "written to the repository through the existing approval and apply "
+            "pipeline; requires --execute"
+        ),
+    )
     maintenance_candidate = maintenance_sub.add_parser(
         "candidate", help="show one maintenance candidate in full, including its evidence"
     )
@@ -569,7 +592,60 @@ def _handle_validation_command(args, config, storage) -> int:
     return 1
 
 
-def _build_maintenance_runner(config, storage, *, progress=None):
+def _build_maintenance_executor(config, storage, *, apply_enabled=False, progress=None):
+    """Wire the Phase 4.22 narrow maintenance executor.
+
+    Everything it needs is a live object: the real provider factory, the real
+    execution policy, the real lifecycle/telemetry managers and a real
+    repository context. The executor itself does no implementation - it hands
+    the work to :class:`~local_agent.coding_agent.InteractiveCodingAgent` and
+    reads back what the existing validation authorities decided.
+
+    ``apply_enabled`` is the operator's explicit ``--apply``. Without it the
+    executor still runs the full implement -> prospective-validate chain, and
+    then refuses the authoritative write with ``approval_required``.
+    """
+    from .approval import ApprovalPolicyEngine
+    from .maintenance import MaintenanceBudget
+    from .maintenance_execution import (
+        ExecutionJournal,
+        MaintenanceApprovalGate,
+        MaintenanceExecutor,
+    )
+    from .maintenance_policy import MaintenanceExecutionPolicy
+    from .models import ApprovalPolicy
+    from .providers import build_provider
+    from .validation_lifecycle import ValidationLifecycleManager
+    from .validation_telemetry import ValidationTelemetryManager
+
+    data_dir = Path(getattr(config, "data_dir", None) or (config.project / ".agent_data"))
+    approval_engine = ApprovalPolicyEngine(
+        [ApprovalPolicy.from_dict(entry) for entry in getattr(config, "approval_policies", [])]
+    )
+    return MaintenanceExecutor(
+        root=config.project,
+        provider_factory=lambda: build_provider(config),
+        policy=MaintenanceExecutionPolicy(repository_root=config.project),
+        budget=MaintenanceBudget.from_config(config),
+        configured_tier=getattr(config, "maintenance_autonomy_tier", "observe_only"),
+        journal=ExecutionJournal(data_dir / "maintenance_execution"),
+        approval_gate=MaintenanceApprovalGate(
+            approval_mode=getattr(config, "approval", "never"),
+            policy_engine=approval_engine,
+            approver=None,
+            apply_enabled=bool(apply_enabled),
+        ),
+        context_provider=lambda: RepositoryIntelligence(config.project).scan(),
+        lifecycle_manager=ValidationLifecycleManager(storage, config.project),
+        telemetry_manager=ValidationTelemetryManager(storage, config.project),
+        workspace_parent=data_dir / "maintenance_workspaces",
+        progress=progress,
+    )
+
+
+def _build_maintenance_runner(
+    config, storage, *, progress=None, executor=None
+):
     """Wire a :class:`MaintenanceRunner` against this repository's real state.
 
     Every source is a live one: the persisted lifecycle and telemetry stores,
@@ -577,7 +653,12 @@ def _build_maintenance_runner(config, storage, *, progress=None):
     churn. Nothing is stubbed, and each provider is resolved lazily on every
     scan so that reassessment genuinely re-reads the repository rather than
     re-reporting a cached view.
+
+    ``executor`` defaults to ``None``, which is still the shipped default: no
+    maintenance run modifies anything unless the operator explicitly asks for
+    the Phase 4.22 executor with ``maintenance run --execute``.
     """
+    from .evidence import compute_state_fingerprint
     from .git import GitIntegration
     from .maintenance import MaintenanceBudget
     from .maintenance_analysis import MaintenanceAnalyzer, collect_churn
@@ -608,12 +689,13 @@ def _build_maintenance_runner(config, storage, *, progress=None):
         budget=MaintenanceBudget.from_config(config),
         policy=MaintenanceExecutionPolicy(repository_root=config.project),
         priority_engine=MaintenancePriorityEngine(),
-        # No executor is wired here. `maintenance run --enqueue` hands work to
-        # the existing scheduler as ordinary tasks instead, which is a real
-        # integration with the existing pipeline rather than a second one.
-        executor=None,
+        # Phase 4.22: this is the executor seam, and it stays empty unless the
+        # operator asked for it. `maintenance run --enqueue` remains the other
+        # real integration - ordinary tasks for the existing scheduler.
+        executor=executor,
         configured_tier=getattr(config, "maintenance_autonomy_tier", "observe_only"),
         progress=progress,
+        fingerprint_fn=lambda paths: compute_state_fingerprint(config.project, paths),
     ), manager
 
 
@@ -704,6 +786,76 @@ def _enqueue_work_orders(result, storage) -> list[str]:
         storage.save_task(task)
         created.append(task.task_id)
     return created
+
+
+def _execution_payload(executor, want_execute: bool, want_apply: bool) -> dict:
+    """Machine-readable account of what the executor actually did."""
+    return {
+        "executor_wired": bool(executor is not None),
+        "execute_requested": bool(want_execute),
+        "apply_permitted": bool(want_apply),
+        "results": [
+            entry.to_dict() for entry in getattr(executor, "results", []) or []
+        ],
+    }
+
+
+def _print_execution_report(executor, want_execute: bool, want_apply: bool, result) -> None:
+    """Report execution honestly, never conflating the seven distinct states.
+
+    DISCOVERED, ELIGIBLE, PLANNED, ATTEMPTED, APPLIED, VALIDATED and RESOLVED
+    are separate facts and are printed separately. In particular ``resolved`` is
+    reported from the runner's own reassessment - a fresh scan that no longer
+    produces the signal - and never inferred from a successful apply.
+    """
+    if executor is None:
+        if want_execute:
+            print("\n  Execution was requested but no executor could be wired.")
+            return
+        print("\n  Nothing was executed. Add --execute to wire the narrow maintenance "
+              "executor (parse-failure signals only), or --enqueue to create ordinary "
+              "pending tasks that the existing scheduler will execute through the "
+              "normal pipeline.")
+        return
+
+    results = list(getattr(executor, "results", []) or [])
+    print("\n  Narrow maintenance execution (Phase 4.22)")
+    print(f"    authoritative apply permitted: {'yes' if want_apply else 'no (--apply not given)'}")
+    if not results:
+        print("    ATTEMPTED: 0 - no candidate reached the executor. A candidate must be")
+        print("      a supported signal, eligible under the policy at an executing tier,")
+        print("      and planned into a work order before it is attempted.")
+        return
+    applied = sum(1 for entry in results if entry.applied and not entry.rolled_back)
+    validated = sum(1 for entry in results if entry.validation_passed is True)
+    resolved = sum(
+        1
+        for verdict in result.reassessments.values()
+        if verdict.outcome == "resolved"
+    )
+    print(f"    ATTEMPTED: {len(results)}   APPLIED: {applied}   "
+          f"VALIDATED: {validated}   RESOLVED (by rescan): {resolved}")
+    for entry in results:
+        print(f"    - {entry.candidate_id} [{entry.signal_kind}] -> {entry.status}")
+        print(f"        applied={entry.applied} rolled_back={entry.rolled_back} "
+              f"post-apply validation={_verdict_text(entry.validation_passed)}")
+        if entry.changed_files:
+            print(f"        changed: {', '.join(entry.changed_files)}")
+        if entry.post_apply_commands:
+            print("        validation commands actually executed: "
+                  + "; ".join(" ".join(command) for command in entry.post_apply_commands))
+        for reason in entry.reasons[:6]:
+            print(f"        note: {reason}")
+        for error in entry.errors[:4]:
+            print(f"        error: {error}")
+
+
+def _verdict_text(value) -> str:
+    if value is True:
+        return "PASSED"
+    if value is False:
+        return "FAILED"
+    return "no verdict (never assumed to be a pass)"
 
 
 def _handle_maintenance_command(args, config, storage) -> int:
@@ -905,7 +1057,21 @@ def _handle_maintenance_command(args, config, storage) -> int:
                   "--maintenance true (or AGENT_MAINTENANCE_ENABLED=1) before running it.",
                   file=sys.stderr)
             return 1
-        runner, _ = _build_maintenance_runner(config, storage)
+        executor = None
+        want_execute = command == "run" and getattr(args, "execute", False)
+        want_apply = command == "run" and getattr(args, "apply", False)
+        if want_apply and not want_execute:
+            print("error: --apply requires --execute; refusing to apply changes that "
+                  "were never executed or prospectively validated.", file=sys.stderr)
+            return 1
+        if want_execute and getattr(args, "dry_run", False):
+            print("error: --execute and --dry-run are mutually exclusive.", file=sys.stderr)
+            return 1
+        if want_execute:
+            executor = _build_maintenance_executor(
+                config, storage, apply_enabled=want_apply
+            )
+        runner, _ = _build_maintenance_runner(config, storage, executor=executor)
         if command == "scan":
             mode = RUN_MODE_SCAN
         elif command == "run" and not getattr(args, "dry_run", False):
@@ -922,6 +1088,7 @@ def _handle_maintenance_command(args, config, storage) -> int:
             payload = result.to_dict()
             payload["enqueued_task_ids"] = enqueued
             payload["maintenance_enabled"] = enabled
+            payload["execution"] = _execution_payload(executor, want_execute, want_apply)
             _emit(payload)
             return 0
 
@@ -987,10 +1154,8 @@ def _handle_maintenance_command(args, config, storage) -> int:
                 print(f"    - {candidate_id}: {order.objective}")
                 print(f"      scope: {', '.join(order.scope_files) or '-'}")
                 print(f"      tier:  {order.granted_tier}")
-        if command == "run" and not result.record.execution_attempts:
-            print("\n  Nothing was executed. This build wires no direct maintenance "
-                  "executor: use --enqueue to create ordinary pending tasks that the "
-                  "existing scheduler will execute through the normal pipeline.")
+        if command == "run":
+            _print_execution_report(executor, want_execute, want_apply, result)
         if enqueued:
             print(f"\n  Enqueued {len(enqueued)} task(s) for the existing scheduler:")
             for task_id in enqueued:

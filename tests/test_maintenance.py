@@ -3422,9 +3422,16 @@ class CliTests(unittest.TestCase):
         _, out, _ = self.run_cli("run", "--maintenance", "true")
         self.assertIn("Execution attempts:0", out)
 
-    def test_run_explains_that_no_executor_is_wired(self):
+    def test_run_explains_that_no_executor_is_wired_without_the_opt_in(self):
+        """Phase 4.22 changed the wording, not the fact.
+
+        Phase 4.21 shipped with no executor at all. Phase 4.22 ships one, but it
+        is only built when the operator passes ``--execute``; a plain
+        ``maintenance run`` still executes nothing and says so.
+        """
         _, out, _ = self.run_cli("run", "--maintenance", "true")
-        self.assertIn("no direct maintenance executor", out)
+        self.assertIn("Nothing was executed", out)
+        self.assertIn("--execute", out)
 
     def test_enqueue_creates_real_tasks(self):
         code, out, _ = self.run_cli(
@@ -3841,12 +3848,16 @@ class AuditedReachabilityTests(unittest.TestCase):
     single most important thing an operator needs to know about this phase.
     """
 
-    def test_the_shipped_cli_wires_no_maintenance_executor(self):
-        """`_build_maintenance_runner` passes `executor=None`, structurally.
+    def test_the_shipped_cli_wires_no_executor_unless_it_is_asked_to(self):
+        """Phase 4.22 replaced ``executor=None`` with an opt-in, structurally.
 
-        If a future change wires a real executor, this test must be updated
-        deliberately - and at that point every claim about maintenance being
-        plan-only stops being true and has to be re-audited.
+        Phase 4.21's version of this test asserted the literal ``executor=None``
+        in ``_build_maintenance_runner`` and said in its own docstring that it
+        must be updated deliberately if a real executor was ever wired. That has
+        now happened, so the invariant is restated at its real strength: the
+        parameter still *defaults* to ``None``, and the only thing that can
+        supply a non-``None`` value is a call guarded by the operator's explicit
+        ``--execute`` flag.
         """
         source = (
             Path(sys.modules["local_agent"].__file__).parent / "cli.py"
@@ -3858,16 +3869,57 @@ class AuditedReachabilityTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
             and node.name == "_build_maintenance_runner"
         )
-        executors = [
+        # 1. The default is still None.
+        defaults = dict(
+            zip(
+                [arg.arg for arg in builder.args.kwonlyargs],
+                builder.args.kw_defaults,
+            )
+        )
+        self.assertIn("executor", defaults)
+        self.assertIsInstance(defaults["executor"], ast.Constant)
+        self.assertIsNone(defaults["executor"].value)
+
+        # 2. Inside the builder the parameter is forwarded, never fabricated.
+        forwarded = [
             keyword
             for call in ast.walk(builder)
             if isinstance(call, ast.Call)
             for keyword in call.keywords
             if keyword.arg == "executor"
         ]
-        self.assertEqual(len(executors), 1)
-        self.assertIsInstance(executors[0].value, ast.Constant)
-        self.assertIsNone(executors[0].value.value)
+        self.assertEqual(len(forwarded), 1)
+        self.assertIsInstance(forwarded[0].value, ast.Name)
+        self.assertEqual(forwarded[0].value.id, "executor")
+
+        # 3. The only construction of a real executor in the whole CLI is
+        #    reachable solely from a branch testing the --execute flag.
+        handler = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_handle_maintenance_command"
+        )
+        guarded = [
+            node
+            for node in ast.walk(handler)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(call.func, ast.Name)
+                and call.func.id == "_build_maintenance_executor"
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call)
+            )
+        ]
+        self.assertTrue(guarded, "the executor must only be built inside a guard")
+        unguarded = [
+            call
+            for call in ast.walk(handler)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_build_maintenance_executor"
+        ]
+        self.assertEqual(len(unguarded), 1, "exactly one construction site")
 
     def test_no_production_module_outside_the_cli_reaches_the_runner(self):
         package = Path(sys.modules["local_agent"].__file__).parent
