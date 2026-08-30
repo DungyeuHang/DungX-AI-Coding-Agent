@@ -68,6 +68,32 @@ class GitIntegration:
     def log(self, limit: int = 5) -> str:
         return self._run("log", f"-{max(1, min(limit, 50))}", "--oneline", "--decorate")
 
+    def file_change_counts(self, limit: int = 200, max_files: int = 2000) -> dict[str, int]:
+        """Repo-relative path -> number of recent commits that touched it.
+
+        Additive helper for Phase 4.21's churn signal. Deliberately bounded on
+        both axes (commits inspected, distinct paths returned) so that running
+        it against a repository with a hundred thousand files cannot turn a
+        maintenance scan into an unbounded memory event. Returns ``{}`` on any
+        git failure - churn is an *enrichment* signal, and a repository without
+        usable history should simply produce fewer maintenance candidates
+        rather than fail the scan.
+        """
+        limit = max(1, min(int(limit), 1000))
+        output = self._run("log", f"-{limit}", "--name-only", "--pretty=format:", "--no-merges")
+        if not output:
+            return {}
+        counts: dict[str, int] = {}
+        max_files = max(1, int(max_files))
+        for line in output.splitlines():
+            relative = line.strip().strip('"')
+            if not relative:
+                continue
+            if relative not in counts and len(counts) >= max_files:
+                continue
+            counts[relative] = counts.get(relative, 0) + 1
+        return counts
+
     def is_dirty(self, expected_changes: list[str] | None = None) -> bool:
         """Checks if the working tree is dirty with unexpected changes."""
         status_output = self._run("status", "--porcelain", "-uall")

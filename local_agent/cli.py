@@ -141,6 +141,51 @@ def build_parser() -> argparse.ArgumentParser:
     validation_lifecycle.add_argument("lifecycle_id", help="ID of the lifecycle to show")
     validation_lifecycle.add_argument("--json", action="store_true", help="emit machine-readable JSON")
 
+    # Phase 4.21: the maintenance operator surface.
+    #
+    # ``scan``/``dry-run`` are read-only by construction. ``run`` is the only
+    # subcommand that can reach an executing tier, and even then only when the
+    # configured autonomy ceiling allows it *and* the policy grants it for the
+    # individual candidate.
+    maintenance = subparsers.add_parser(
+        "maintenance", help="discover, rank and act on repository maintenance opportunities"
+    )
+    maintenance_sub = maintenance.add_subparsers(dest="maintenance_command", required=True)
+    for name, description in (
+        ("scan", "discover maintenance candidates from real repository intelligence"),
+        ("health", "summarise maintenance state and advisory actionability statistics"),
+        ("history", "list previous maintenance runs and what they accomplished"),
+        ("candidates", "list known maintenance candidates and their lifecycle state"),
+        ("recommendations", "show ranked recommendations with their priority explanations"),
+        ("status", "show the most recent maintenance run and what remains unresolved"),
+        ("dry-run", "score, select and plan candidates without executing anything"),
+    ):
+        sub = maintenance_sub.add_parser(name, help=description)
+        add_common_arguments(sub)
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    maintenance_run = maintenance_sub.add_parser(
+        "run", help="run the full maintenance lifecycle, subject to the configured autonomy tier"
+    )
+    add_common_arguments(maintenance_run)
+    maintenance_run.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    # ``--dry-run`` is already supplied by ``add_common_arguments`` with
+    # compatible semantics ("produce the work, write nothing"), so it is reused
+    # here rather than redefined.
+    maintenance_run.add_argument(
+        "--enqueue",
+        action="store_true",
+        help=(
+            "create an ordinary pending Task for each planned work order so the "
+            "existing scheduler executes it through the normal pipeline"
+        ),
+    )
+    maintenance_candidate = maintenance_sub.add_parser(
+        "candidate", help="show one maintenance candidate in full, including its evidence"
+    )
+    add_common_arguments(maintenance_candidate)
+    maintenance_candidate.add_argument("candidate_id", help="ID of the candidate to show")
+    maintenance_candidate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
     return parser
 
 
@@ -524,6 +569,394 @@ def _handle_validation_command(args, config, storage) -> int:
     return 1
 
 
+def _build_maintenance_runner(config, storage, *, progress=None):
+    """Wire a :class:`MaintenanceRunner` against this repository's real state.
+
+    Every source is a live one: the persisted lifecycle and telemetry stores,
+    a freshly-built semantic graph, the knowledge graph, and real ``git log``
+    churn. Nothing is stubbed, and each provider is resolved lazily on every
+    scan so that reassessment genuinely re-reads the repository rather than
+    re-reporting a cached view.
+    """
+    from .git import GitIntegration
+    from .maintenance import MaintenanceBudget
+    from .maintenance_analysis import MaintenanceAnalyzer, collect_churn
+    from .maintenance_policy import MaintenanceExecutionPolicy, MaintenancePriorityEngine
+    from .maintenance_runner import MaintenanceManager, MaintenanceRunner, build_scan_function
+    from .semantic_impact import SemanticGraph
+
+    analyzer = MaintenanceAnalyzer(config.project)
+    git = GitIntegration(config.project)
+    scan = build_scan_function(
+        analyzer,
+        lifecycle_provider=storage.load_validation_lifecycle,
+        telemetry_provider=storage.load_validation_telemetry,
+        graph_provider=lambda: SemanticGraph.build(config.project),
+        knowledge_provider=storage.load_knowledge_graph,
+        churn_provider=lambda: collect_churn(git),
+    )
+    manager = MaintenanceManager(
+        storage,
+        config.project,
+        max_candidates=getattr(config, "maintenance_retention", 300),
+        max_runs=getattr(config, "maintenance_run_retention", 50),
+    )
+    return MaintenanceRunner(
+        analyzer=analyzer,
+        manager=manager,
+        scan=scan,
+        budget=MaintenanceBudget.from_config(config),
+        policy=MaintenanceExecutionPolicy(repository_root=config.project),
+        priority_engine=MaintenancePriorityEngine(),
+        # No executor is wired here. `maintenance run --enqueue` hands work to
+        # the existing scheduler as ordinary tasks instead, which is a real
+        # integration with the existing pipeline rather than a second one.
+        executor=None,
+        configured_tier=getattr(config, "maintenance_autonomy_tier", "observe_only"),
+        progress=progress,
+    ), manager
+
+
+def _enqueue_work_orders(result, storage) -> list[str]:
+    """Turn planned work orders into ordinary pending tasks.
+
+    This is the integration point with the existing execution architecture:
+    the created tasks are indistinguishable from ones a human created with
+    ``agent create-task``, and are planned, routed, implemented, validated,
+    approved and applied by exactly the same machinery. The maintenance layer
+    contributes an objective and a scope statement; it contributes no
+    execution, no validation and no approval behaviour of its own.
+    """
+    import uuid as _uuid
+
+    from .models import Task, TaskStatus as _TaskStatus
+
+    created: list[str] = []
+    for candidate_id in sorted(result.work_orders):
+        order = result.work_orders[candidate_id]
+        now = datetime.datetime.now(datetime.timezone.utc)
+        objective = order.objective
+        if order.scope_files:
+            objective += " (scope: " + ", ".join(order.scope_files[:5]) + ")"
+        task = Task(
+            task_id=str(_uuid.uuid4()),
+            objective=objective,
+            status=_TaskStatus.PENDING,
+            created_at=now,
+            updated_at=now,
+        )
+        task.execution_history.append(
+            {
+                "source": "maintenance",
+                "candidate_id": candidate_id,
+                "work_order": order.to_dict(),
+                "at": now.isoformat(),
+            }
+        )
+        storage.save_task(task)
+        created.append(task.task_id)
+    return created
+
+
+def _handle_maintenance_command(args, config, storage) -> int:
+    """Phase 4.21 operator surface.
+
+    ``scan``, ``dry-run`` and every read-only subcommand can be executed
+    safely on any repository at any time: they read, rank and report. ``run``
+    is the only one that consults the autonomy ceiling, and this build has no
+    executor wired, so the strongest thing it can do is create pending tasks
+    for the existing scheduler when ``--enqueue`` is given.
+    """
+    from .maintenance import RUN_MODE_DRY_RUN, RUN_MODE_EXECUTE, RUN_MODE_SCAN, summarize_candidates
+    from .maintenance_policy import describe_tier
+    from .maintenance_runner import MaintenanceManager, compute_actionability
+
+    command = getattr(args, "maintenance_command", "")
+    as_json = bool(getattr(args, "json", False))
+    enabled = bool(getattr(config, "maintenance_enabled", False))
+    min_samples = getattr(config, "maintenance_min_samples", 5)
+
+    def _emit(payload: dict) -> None:
+        print(json.dumps(payload, indent=2, default=str))
+
+    manager = MaintenanceManager(
+        storage,
+        config.project,
+        max_candidates=getattr(config, "maintenance_retention", 300),
+        max_runs=getattr(config, "maintenance_run_retention", 50),
+    )
+
+    # -- read-only reporting over persisted state --------------------------
+
+    if command in {"health", "history", "candidates", "status", "candidate"}:
+        store = manager.load()
+        if command == "health":
+            actionability = compute_actionability(store, min_samples=min_samples)
+            summary = summarize_candidates(store.candidates)
+            if as_json:
+                _emit({
+                    "enabled": enabled,
+                    "autonomy_tier": getattr(config, "maintenance_autonomy_tier", ""),
+                    "candidates": summary,
+                    "runs_recorded": len(store.runs),
+                    "history_trustworthy": store.history_trustworthy(),
+                    "corrupted_records_skipped": store.corrupted_records_skipped,
+                    "actionability": actionability,
+                })
+                return 0
+            print("Maintenance Health")
+            print("=" * 18)
+            print(f"  Subsystem enabled:     {enabled}")
+            print(f"  Autonomy ceiling:      {getattr(config, 'maintenance_autonomy_tier', '')} "
+                  f"({describe_tier(getattr(config, 'maintenance_autonomy_tier', ''))})")
+            print(f"  Known candidates:      {summary['total']}")
+            print(f"  By severity:           {summary['by_severity'] or 'none'}")
+            print(f"  By state:              {summary['by_state'] or 'none'}")
+            print(f"  By outcome:            {summary['by_outcome'] or 'none'}")
+            print(f"  Runs recorded:         {len(store.runs)}")
+            if store.corrupted_records_skipped:
+                print(f"  WARNING: {store.corrupted_records_skipped} persisted record(s) "
+                      "could not be loaded and were skipped.")
+            print("\n  Advisory actionability (ADVISORY ONLY - nothing consumes this):")
+            if not actionability["data_sufficient"]:
+                print(f"    NOTE: {actionability['total_attempts']} executed attempt(s), below "
+                      f"the minimum of {min_samples}. Rates are NOT established.")
+            if not actionability["by_kind"]:
+                print("    No maintenance work has been executed yet.")
+            for kind in sorted(actionability["by_kind"]):
+                stats = actionability["by_kind"][kind]
+                print(f"    - {kind}: {stats['resolved']}/{stats['attempts']} resolved "
+                      f"({stats['resolution_rate']:.0%}), {stats['persisting']} persisting, "
+                      f"{stats['regressed']} regressed, {stats['inconclusive']} inconclusive")
+            return 0
+
+        if command == "history":
+            if as_json:
+                _emit({"runs": [record.to_dict() for record in store.runs]})
+                return 0
+            if not store.runs:
+                print("No maintenance runs recorded yet.")
+                return 0
+            print(f"{len(store.runs)} maintenance run(s), oldest first:")
+            for record in store.runs:
+                print(f"- {record.run_id} [{record.status}] mode={record.mode} "
+                      f"tier={record.configured_tier} discovered={record.candidates_discovered} "
+                      f"selected={record.candidates_selected} "
+                      f"executed={record.execution_attempts} "
+                      f"({record.executions_succeeded} ok / {record.executions_failed} failed) "
+                      f"{record.elapsed_seconds:.2f}s")
+                if record.outcome_counts:
+                    print(f"    outcomes: {record.outcome_counts}")
+                for error in record.errors[:3]:
+                    print(f"    error: {error}")
+            return 0
+
+        if command == "candidates":
+            records = store.candidates
+            if as_json:
+                _emit({
+                    "candidates": [candidate.to_dict() for candidate in records],
+                    "summary": summarize_candidates(records),
+                })
+                return 0
+            if not records:
+                print("No maintenance candidates recorded yet. Run 'agent maintenance scan'.")
+                return 0
+            print(f"{len(records)} known maintenance candidate(s):")
+            for candidate in records:
+                print(f"- {candidate.candidate_id} [{candidate.severity}] {candidate.kind}")
+                print(f"    {candidate.title}")
+                print(f"    state={candidate.state} outcome={candidate.outcome} "
+                      f"seen={candidate.occurrence_count}x confidence={candidate.confidence:.2f} "
+                      f"({candidate.sample_size} sample(s))")
+                if candidate.affected_files:
+                    print(f"    files: {', '.join(candidate.affected_files[:5])}")
+            return 0
+
+        if command == "candidate":
+            candidate = store.find(args.candidate_id)
+            if candidate is None:
+                print(f"error: no maintenance candidate with ID {args.candidate_id}",
+                      file=sys.stderr)
+                return 1
+            if as_json:
+                _emit(candidate.to_dict())
+                return 0
+            print(f"Candidate: {candidate.candidate_id}")
+            print(f"  Kind:        {candidate.kind}")
+            print(f"  Title:       {candidate.title}")
+            print(f"  Detail:      {candidate.detail or '-'}")
+            print(f"  Provenance:  {candidate.provenance}")
+            print(f"  Severity:    {candidate.severity}")
+            print(f"  Confidence:  {candidate.confidence:.2f} from {candidate.sample_size} sample(s)")
+            print(f"  Occurrences: {candidate.occurrence_count} "
+                  f"(first {candidate.first_seen_at}, last {candidate.last_seen_at})")
+            print(f"  State:       {candidate.state}")
+            print(f"  Outcome:     {candidate.outcome}")
+            print(f"  Attempts:    {candidate.attempt_count} ({candidate.failure_count} failed)")
+            print(f"  Action:      {candidate.recommended_action or '-'}")
+            print(f"  Files:       {', '.join(candidate.affected_files) or '-'}")
+            print(f"  Evidence:    {', '.join(candidate.evidence_refs) or '-'}")
+            if candidate.uncertainty:
+                print("  Uncertainty:")
+                for note in candidate.uncertainty:
+                    print(f"    - {note}")
+            if candidate.metrics:
+                print("  Metrics:")
+                for name in sorted(candidate.metrics):
+                    print(f"    - {name}: {candidate.metrics[name]:g}")
+            if candidate.blocked_reasons:
+                print("  Policy notes:")
+                for reason in candidate.blocked_reasons:
+                    print(f"    - {reason}")
+            if candidate.history:
+                print("  History:")
+                for entry in candidate.history[-10:]:
+                    print(f"    - {entry.get('at', '?')} {entry.get('event', '?')}"
+                          f"{': ' + entry['reason'] if entry.get('reason') else ''}")
+            return 0
+
+        if command == "status":
+            latest = store.latest_run()
+            unresolved = [
+                candidate
+                for candidate in store.candidates
+                if candidate.outcome not in {"resolved"}
+            ]
+            if as_json:
+                _emit({
+                    "enabled": enabled,
+                    "latest_run": latest.to_dict() if latest else None,
+                    "unresolved_candidates": len(unresolved),
+                    "unresolved": [c.to_dict() for c in unresolved[:20]],
+                })
+                return 0
+            print("Maintenance Status")
+            print("=" * 18)
+            print(f"  Subsystem enabled: {enabled}")
+            if latest is None:
+                print("  No maintenance run has been recorded for this repository yet.")
+            else:
+                print(f"  Last run:          {latest.run_id} [{latest.status}] "
+                      f"mode={latest.mode} at {latest.started_at}")
+                print(f"  Discovered/selected/executed: {latest.candidates_discovered}/"
+                      f"{latest.candidates_selected}/{latest.execution_attempts}")
+                print(f"  Outcomes:          {latest.outcome_counts or 'none'}")
+                for note in latest.notes:
+                    print(f"    note: {note}")
+            print(f"  Unresolved candidates: {len(unresolved)}")
+            for candidate in unresolved[:10]:
+                print(f"    - [{candidate.severity}] {candidate.kind}: {candidate.title}")
+            return 0
+
+    # -- live scanning / running ------------------------------------------
+
+    if command in {"scan", "dry-run", "recommendations", "run"}:
+        if command == "run" and not enabled:
+            print("error: the maintenance subsystem is disabled. Enable it explicitly with "
+                  "--maintenance true (or AGENT_MAINTENANCE_ENABLED=1) before running it.",
+                  file=sys.stderr)
+            return 1
+        runner, _ = _build_maintenance_runner(config, storage)
+        if command == "scan":
+            mode = RUN_MODE_SCAN
+        elif command == "run" and not getattr(args, "dry_run", False):
+            mode = RUN_MODE_EXECUTE
+        else:
+            mode = RUN_MODE_DRY_RUN
+        result = runner.run(mode=mode)
+
+        enqueued: list[str] = []
+        if command == "run" and getattr(args, "enqueue", False) and result.work_orders:
+            enqueued = _enqueue_work_orders(result, storage)
+
+        if as_json:
+            payload = result.to_dict()
+            payload["enqueued_task_ids"] = enqueued
+            payload["maintenance_enabled"] = enabled
+            _emit(payload)
+            return 0
+
+        if command == "recommendations":
+            print("Maintenance Recommendations (ranked)")
+            print("=" * 36)
+            if not result.ranked:
+                print("  No maintenance candidates detected in this repository.")
+                return 0
+            for candidate, explanation in result.ranked:
+                verdict = result.verdicts.get(candidate.candidate_id)
+                print(f"\n  [{explanation.severity}] {candidate.title}")
+                print(f"    id:         {candidate.candidate_id}")
+                print(f"    kind:       {candidate.kind} (from {candidate.provenance})")
+                print(f"    priority:   {explanation.score:.3f} "
+                      f"(severity band {explanation.severity_rank} decides ordering first)")
+                print(f"    action:     {candidate.recommended_action or '-'}")
+                print(f"    files:      {', '.join(candidate.affected_files) or '-'}")
+                print("    why ranked here:")
+                for reason in explanation.reasons:
+                    print(f"      - {reason}")
+                if verdict is not None:
+                    print(f"    autonomy:   {verdict.granted_tier} "
+                          f"({describe_tier(verdict.granted_tier)})")
+                    for reason in verdict.blocking_reasons:
+                        print(f"      BLOCKED: {reason}")
+                    for reason in verdict.cap_reasons:
+                        print(f"      capped: {reason}")
+            return 0
+
+        record = result.record
+        title = {
+            "scan": "Maintenance Scan",
+            "dry-run": "Maintenance Dry Run",
+            "run": "Maintenance Run",
+        }[command]
+        print(title)
+        print("=" * len(title))
+        print(f"  Run id:            {record.run_id} [{record.status}] mode={record.mode}")
+        print(f"  Autonomy ceiling:  {record.configured_tier}")
+        print(f"  Discovered:        {record.candidates_discovered}")
+        print(f"  Rejected/capped:   {record.candidates_rejected}")
+        print(f"  Selected:          {record.candidates_selected}")
+        print(f"  Execution attempts:{record.execution_attempts} "
+              f"({record.executions_succeeded} ok / {record.executions_failed} failed)")
+        print(f"  Reassessments:     {record.reassessments}")
+        print(f"  Elapsed:           {record.elapsed_seconds:.2f}s")
+        if result.analysis.degraded:
+            print("  NOTE: this scan was degraded (a source was unavailable or an "
+                  "extractor failed); absence of a signal is not evidence it is gone.")
+        for name, error in sorted(result.analysis.extractor_errors.items()):
+            print(f"    extractor {name} failed: {error}")
+        for name, reason in sorted(result.analysis.skipped.items()):
+            print(f"    extractor {name}: {reason}")
+        if result.batches:
+            print(f"  Parallel batches:  {len(result.batches)} "
+                  f"(widths {[len(b) for b in result.batches]}; overlapping "
+                  "candidates are serialised)")
+        if result.work_orders:
+            print(f"\n  Planned work orders ({len(result.work_orders)}):")
+            for candidate_id in sorted(result.work_orders):
+                order = result.work_orders[candidate_id]
+                print(f"    - {candidate_id}: {order.objective}")
+                print(f"      scope: {', '.join(order.scope_files) or '-'}")
+                print(f"      tier:  {order.granted_tier}")
+        if command == "run" and not result.record.execution_attempts:
+            print("\n  Nothing was executed. This build wires no direct maintenance "
+                  "executor: use --enqueue to create ordinary pending tasks that the "
+                  "existing scheduler will execute through the normal pipeline.")
+        if enqueued:
+            print(f"\n  Enqueued {len(enqueued)} task(s) for the existing scheduler:")
+            for task_id in enqueued:
+                print(f"    - {task_id}")
+        for note in record.notes:
+            print(f"  note: {note}")
+        for error in record.errors:
+            print(f"  error: {error}")
+        return 0
+
+    print(f"error: unknown maintenance subcommand '{command}'", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -533,6 +966,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "validation":
             return _handle_validation_command(args, config, storage)
+
+        if args.command == "maintenance":
+            return _handle_maintenance_command(args, config, storage)
 
         if args.command == "analyze":
             _print_context(RepositoryIntelligence(config.project).scan())

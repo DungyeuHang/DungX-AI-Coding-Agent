@@ -163,6 +163,43 @@ class AgentConfig:
     #: data may never narrow validation.
     validation_lifecycle_min_samples: int = 10
 
+    # -- Phase 4.21: continuous autonomous maintenance ---------------------
+    #
+    # Every setting below is inert while ``maintenance_enabled`` is False,
+    # which is the default. Nothing on the ordinary task-execution path reads
+    # any of them: with maintenance disabled, planning, routing, approval,
+    # validation and execution behave exactly as they did before this phase.
+    #: Master switch for the maintenance subsystem.
+    maintenance_enabled: bool = False
+    #: How much autonomy maintenance may be granted. This is a *ceiling*: the
+    #: execution policy can only lower it, never raise it. ``observe_only``
+    #: means the agent records what it found and does nothing else.
+    maintenance_autonomy_tier: str = "observe_only"
+    #: Maximum candidates retained in the bounded persistent store.
+    maintenance_retention: int = 300
+    #: Maximum run records retained.
+    maintenance_run_retention: int = 50
+    #: Minimum executed maintenance attempts before the advisory actionability
+    #: statistics are considered established. Below this they are reported with
+    #: ``data_sufficient=False``; nothing consumes them either way.
+    maintenance_min_samples: int = 5
+    # Hierarchical budgets. Names match MaintenanceBudget's fields with a
+    # ``maintenance_`` prefix so MaintenanceBudget.from_config can map them
+    # without a second table to keep in sync.
+    maintenance_max_candidates_considered: int = 200
+    maintenance_max_candidates_selected: int = 5
+    maintenance_max_candidates_executed: int = 3
+    maintenance_max_elapsed_seconds: float = 1800.0
+    maintenance_max_estimated_cost_units: float = 100.0
+    maintenance_max_dag_width: int = 2
+    maintenance_max_subtasks_per_candidate: int = 4
+    maintenance_max_changed_files_per_candidate: int = 10
+    maintenance_max_changed_lines_per_candidate: int = 400
+    maintenance_max_repair_iterations_per_candidate: int = 2
+    maintenance_max_tool_steps_per_subtask: int = 40
+    maintenance_max_candidate_iterations: int = 3
+    maintenance_max_validation_commands: int = 12
+
     @property
     def tool_policy(self) -> Any:
         from .models import ToolExecutionPolicy
@@ -268,6 +305,24 @@ class AgentConfig:
             "validation_lifecycle_retention": "AGENT_VALIDATION_LIFECYCLE_RETENTION",
             "validation_lifecycle_max_iterations": "AGENT_VALIDATION_LIFECYCLE_MAX_ITERATIONS",
             "validation_lifecycle_min_samples": "AGENT_VALIDATION_LIFECYCLE_MIN_SAMPLES",
+            "maintenance_enabled": "AGENT_MAINTENANCE_ENABLED",
+            "maintenance_autonomy_tier": "AGENT_MAINTENANCE_AUTONOMY_TIER",
+            "maintenance_retention": "AGENT_MAINTENANCE_RETENTION",
+            "maintenance_run_retention": "AGENT_MAINTENANCE_RUN_RETENTION",
+            "maintenance_min_samples": "AGENT_MAINTENANCE_MIN_SAMPLES",
+            "maintenance_max_candidates_considered": "AGENT_MAINTENANCE_MAX_CANDIDATES_CONSIDERED",
+            "maintenance_max_candidates_selected": "AGENT_MAINTENANCE_MAX_CANDIDATES_SELECTED",
+            "maintenance_max_candidates_executed": "AGENT_MAINTENANCE_MAX_CANDIDATES_EXECUTED",
+            "maintenance_max_elapsed_seconds": "AGENT_MAINTENANCE_MAX_ELAPSED_SECONDS",
+            "maintenance_max_estimated_cost_units": "AGENT_MAINTENANCE_MAX_COST_UNITS",
+            "maintenance_max_dag_width": "AGENT_MAINTENANCE_MAX_DAG_WIDTH",
+            "maintenance_max_subtasks_per_candidate": "AGENT_MAINTENANCE_MAX_SUBTASKS",
+            "maintenance_max_changed_files_per_candidate": "AGENT_MAINTENANCE_MAX_CHANGED_FILES",
+            "maintenance_max_changed_lines_per_candidate": "AGENT_MAINTENANCE_MAX_CHANGED_LINES",
+            "maintenance_max_repair_iterations_per_candidate": "AGENT_MAINTENANCE_MAX_REPAIRS",
+            "maintenance_max_tool_steps_per_subtask": "AGENT_MAINTENANCE_MAX_TOOL_STEPS",
+            "maintenance_max_candidate_iterations": "AGENT_MAINTENANCE_MAX_CANDIDATE_ITERATIONS",
+            "maintenance_max_validation_commands": "AGENT_MAINTENANCE_MAX_VALIDATION_COMMANDS",
         }
 
         def value(name: str, default: object) -> object:
@@ -459,6 +514,72 @@ class AgentConfig:
                 value("validation_lifecycle_min_samples", 10),
                 "validation_lifecycle_min_samples",
             ),
+            maintenance_enabled=_bool(value("maintenance_enabled", False)),
+            maintenance_autonomy_tier=str(
+                value("maintenance_autonomy_tier", "observe_only")
+            ),
+            maintenance_retention=_positive_int(
+                value("maintenance_retention", 300), "maintenance_retention"
+            ),
+            maintenance_run_retention=_positive_int(
+                value("maintenance_run_retention", 50), "maintenance_run_retention"
+            ),
+            maintenance_min_samples=_positive_int(
+                value("maintenance_min_samples", 5), "maintenance_min_samples"
+            ),
+            maintenance_max_candidates_considered=_positive_int(
+                value("maintenance_max_candidates_considered", 200),
+                "maintenance_max_candidates_considered",
+            ),
+            maintenance_max_candidates_selected=_positive_int(
+                value("maintenance_max_candidates_selected", 5),
+                "maintenance_max_candidates_selected",
+            ),
+            # ``minimum=0`` on purpose: a run configured to execute nothing is
+            # a legitimate and maximally-safe configuration.
+            maintenance_max_candidates_executed=_positive_int(
+                value("maintenance_max_candidates_executed", 3),
+                "maintenance_max_candidates_executed",
+                minimum=0,
+            ),
+            maintenance_max_elapsed_seconds=float(
+                value("maintenance_max_elapsed_seconds", 1800.0)
+            ),
+            maintenance_max_estimated_cost_units=float(
+                value("maintenance_max_estimated_cost_units", 100.0)
+            ),
+            maintenance_max_dag_width=_positive_int(
+                value("maintenance_max_dag_width", 2), "maintenance_max_dag_width"
+            ),
+            maintenance_max_subtasks_per_candidate=_positive_int(
+                value("maintenance_max_subtasks_per_candidate", 4),
+                "maintenance_max_subtasks_per_candidate",
+            ),
+            maintenance_max_changed_files_per_candidate=_positive_int(
+                value("maintenance_max_changed_files_per_candidate", 10),
+                "maintenance_max_changed_files_per_candidate",
+            ),
+            maintenance_max_changed_lines_per_candidate=_positive_int(
+                value("maintenance_max_changed_lines_per_candidate", 400),
+                "maintenance_max_changed_lines_per_candidate",
+            ),
+            maintenance_max_repair_iterations_per_candidate=_positive_int(
+                value("maintenance_max_repair_iterations_per_candidate", 2),
+                "maintenance_max_repair_iterations_per_candidate",
+                minimum=0,
+            ),
+            maintenance_max_tool_steps_per_subtask=_positive_int(
+                value("maintenance_max_tool_steps_per_subtask", 40),
+                "maintenance_max_tool_steps_per_subtask",
+            ),
+            maintenance_max_candidate_iterations=_positive_int(
+                value("maintenance_max_candidate_iterations", 3),
+                "maintenance_max_candidate_iterations",
+            ),
+            maintenance_max_validation_commands=_positive_int(
+                value("maintenance_max_validation_commands", 12),
+                "maintenance_max_validation_commands",
+            ),
         )
         if config.approval_mode not in {"never", "plan_review", "always"}:
             raise ValueError("approval_mode must be 'never', 'plan_review', or 'always'")
@@ -516,6 +637,26 @@ class AgentConfig:
             raise ValueError("validation_lifecycle_max_iterations must be positive")
         if self.validation_lifecycle_min_samples < 1:
             raise ValueError("validation_lifecycle_min_samples must be at least 1")
+        # Phase 4.21. The autonomy tier is validated against the single
+        # authoritative tier vocabulary rather than a copy of it, so the two
+        # can never drift apart.
+        from .maintenance_policy import TIER_ORDER
+
+        if self.maintenance_autonomy_tier not in TIER_ORDER:
+            raise ValueError(
+                "maintenance_autonomy_tier must be one of " + ", ".join(TIER_ORDER)
+            )
+        if self.maintenance_retention < 1:
+            raise ValueError("maintenance_retention must be positive")
+        if self.maintenance_run_retention < 1:
+            raise ValueError("maintenance_run_retention must be positive")
+        if self.maintenance_min_samples < 1:
+            raise ValueError("maintenance_min_samples must be at least 1")
+        # Delegate the budget's own consistency rules to the budget, so there
+        # is exactly one place that knows what a coherent budget looks like.
+        from .maintenance import MaintenanceBudget
+
+        MaintenanceBudget.from_config(self).validate()
         # Validate tool policy creation
         _ = self.tool_policy
 
@@ -554,6 +695,9 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--validation-calibration-min-samples", type=int, default=None, help="minimum resolved observations before calibration may raise confidence for an evidence type")
     parser.add_argument("--validation-calibration-max-adjustment", type=float, default=None, help="maximum absolute confidence-score adjustment calibration may propose (0..1)")
     parser.add_argument("--validation-metrics-retention", type=int, default=None, help="maximum decision/observation records retained by the telemetry store")
+    parser.add_argument("--maintenance", type=_bool, default=None, help="enable the continuous maintenance subsystem (true/false; default false)")
+    parser.add_argument("--maintenance-tier", default=None, choices=("observe_only", "recommend", "plan_only", "execute_with_existing_approval", "execute_autonomously"), help="ceiling on maintenance autonomy; the policy may only lower it")
+    parser.add_argument("--maintenance-max-executed", type=int, default=None, help="maximum maintenance candidates a single run may execute (0 disables execution)")
     parser.add_argument("--validation", action="append", default=None, help="explicit validation command")
     parser.add_argument("--log-level", default=None, choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     parser.add_argument("--dry-run", action="store_true", help="generate and display changes without writing files")
@@ -613,6 +757,11 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             ),
             "validation_metrics_retention": getattr(args, "validation_metrics_retention", None),
             "validation_lifecycle_enabled": getattr(args, "validation_lifecycle", None),
+            "maintenance_enabled": getattr(args, "maintenance", None),
+            "maintenance_autonomy_tier": getattr(args, "maintenance_tier", None),
+            "maintenance_max_candidates_executed": getattr(
+                args, "maintenance_max_executed", None
+            ),
             "validation_commands": getattr(args, "validation", None),
             "log_level": args.log_level,
             "dry_run": args.dry_run if args.dry_run else None,
