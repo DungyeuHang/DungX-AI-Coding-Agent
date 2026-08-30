@@ -24,10 +24,15 @@ What it deliberately does not do
 --------------------------------
 * It does not implement anything. Every byte written to a source file is written
   by :class:`~local_agent.coding_agent.CodingAgent`, from a
-  :class:`~local_agent.models.FileOperation` the interactive agent emitted. This
-  module contains no ``write_text``, no ``open(..., "w")``, no ``shutil`` copy
-  and no ``subprocess`` import; the only subprocesses it causes are run by the
-  existing :class:`~local_agent.commands.CommandRunner`.
+  :class:`~local_agent.models.FileOperation` the interactive agent emitted.
+  :class:`MaintenanceExecutor`'s own class body contains no ``write_text``, no
+  ``open``, no ``shutil`` copy and no ``chdir``, and the module imports no
+  ``subprocess``; the only subprocesses it causes are run by the existing
+  :class:`~local_agent.commands.CommandRunner`. The one place in this module
+  that does touch the filesystem is :class:`ExecutionJournal`, which writes
+  bookkeeping files into its own directory and nowhere else - it is a separate
+  class precisely so the AST invariant tests can assert the above about the
+  executor without an exception carved out for it.
 * It does not decide validation scope. That is
   :class:`~local_agent.validation_decision.ValidationDecisionEngine`'s job and
   the executor consumes its answer without amending it downward.
