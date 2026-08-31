@@ -1,4 +1,4 @@
-"""Phase 4.22: the one narrow maintenance execution seam.
+"""Phase 4.22/4.23: the one narrow maintenance execution seam.
 
 Phase 4.21 built a complete maintenance *triage* system - DISCOVER, PRIORITIZE,
 POLICY, PLAN - and then stopped, because
@@ -47,9 +47,24 @@ The supported signal
 --------------------
 Exactly one: :data:`~local_agent.maintenance.MaintenanceSignal.PARSE_FAILURE`.
 
-Why that one, and why not the others, is documented on
-:data:`SUPPORTED_SIGNAL_KINDS`. Everything else is refused with
-``unsupported_signal``, structurally, before any workspace is created.
+Phase 4.23 changed *how* that is decided rather than *what* it decides. The set
+is no longer a literal in this file; it is
+:data:`~local_agent.maintenance_oracle.AUTONOMOUS_SIGNAL_KINDS`, derived from
+the signal inventory and the bound execution oracles. A signal is executable
+only when its inventory entry says so **and** its oracle is deterministic, so a
+future signal cannot be made autonomous by editing a list here - it has to
+bring a machine-checkable success predicate with it. Everything else is refused
+with ``unsupported_signal``, structurally, before any workspace is created.
+
+What Phase 4.23 corrected
+-------------------------
+Phase 4.22's success predicate for a parse failure was "the file now parses",
+checked inline. That is satisfiable by deleting the file's contents - ``pass``
+parses - and an experiment against that build confirmed a sixteen-line module
+could be replaced wholesale with ``pass``, applied to the authoritative tree,
+and reported as ``completed`` with ``signal_resolved=True``. The predicate now
+lives on :class:`~local_agent.maintenance_oracle.ParseOracle` and additionally
+requires that the repair preserved the module's named surface and substance.
 """
 
 from __future__ import annotations
@@ -80,10 +95,17 @@ from .maintenance import (
     BudgetLedger,
     MaintenanceBudget,
     MaintenanceCandidate,
-    MaintenanceSignal,
+    candidate_identity,
     is_protected_relative_path,
     sanitize_relative_path,
     sanitize_text,
+)
+from .maintenance_oracle import (
+    AUTONOMOUS_SIGNAL_KINDS,
+    ORACLE_FRAMEWORK_VERSION,
+    ExecutionOracle,
+    OracleObservation,
+    oracle_for,
 )
 from .maintenance_policy import (
     AutonomyTier,
@@ -109,7 +131,7 @@ LOGGER = logging.getLogger(__name__)
 #: Version stamp for this executor's behaviour. Recorded on every result and
 #: folded into the policy fingerprint, so a work order planned under one
 #: executor generation is not silently executed by another.
-MAINTENANCE_EXECUTOR_VERSION = "4.22.0"
+MAINTENANCE_EXECUTOR_VERSION = "4.23.0"
 
 
 # =============================================================================
@@ -118,51 +140,19 @@ MAINTENANCE_EXECUTOR_VERSION = "4.22.0"
 
 #: The complete set of maintenance signals this build can execute.
 #:
-#: **SUPPORTED SIGNAL:** ``parse_failure``.
+#: **SUPPORTED SIGNAL:** ``parse_failure``, and it is the only one.
 #:
-#: **WHY THIS SIGNAL.** It is the only one of the thirteen that satisfies every
-#: property a first production executor needs:
-#:
-#: * *Deterministic discovery.* It is produced by
-#:   :meth:`~local_agent.maintenance_analysis.MaintenanceAnalyzer._parse_failures`
-#:   from ``SemanticGraph.parse_failures``, which is a direct structural
-#:   observation ("CPython's own parser rejected this file"), not a rate, a
-#:   heuristic or an inference. It cannot be a false positive.
-#: * *Deterministic target.* Exactly one affected file, always, by construction.
-#: * *Small expected diff.* A syntax error is a local defect.
-#: * *Low architectural risk.* A file that does not parse is, by definition,
-#:   imported by nothing that currently works.
-#: * *Trivial success criterion.* The file parses, or it does not. The executor
-#:   re-checks this itself with :func:`compile`, so "did it work" needs no
-#:   model, no heuristic and no judgement call.
-#: * *Conservative refusal is easy.* If the file still fails to parse after the
-#:   change, or any other validation fails, the apply is rolled back.
-#: * *Naturally compatible with the existing pipeline.* The prospective
-#:   validator's cheapest tier is already ``python -m compileall`` over the
-#:   changed files, which is exactly this signal's acceptance test.
-#:
-#: **WHY THE OTHER SIGNALS ARE NOT EXECUTABLE YET.**
-#:
-#: * ``false_confidence``, ``broad_validation_pressure``, ``analysis_degradation``,
-#:   ``architectural_risk``, ``abandoned_work``, ``candidate_instability``,
-#:   ``evidence_reuse_failure`` - all capped at ``recommend`` by
-#:   :data:`~local_agent.maintenance_policy.AUTONOMOUSLY_ACTIONABLE_KINDS`
-#:   (or by having no affected file at all). They describe weaknesses in the
-#:   agent's own analysis or in the development process; there is no code change
-#:   that constitutes "the fix", so an executor would be guessing.
-#: * ``test_gap`` - actionable in principle, but it always carries an explicit
-#:   uncertainty caveat ("direct-import evidence only"), its success criterion
-#:   is "a useful test now exists", which nothing here can verify, and the
-#:   change *creates* a file rather than repairing one.
-#: * ``analyzer_blind_spot`` - the fix is either editing imports across modules
-#:   or extending the resolver; both are multi-file design work.
-#: * ``recurring_defect``, ``repeated_repair``, ``known_failure_pattern`` - these
-#:   are the only kinds that can reach ``execute_autonomously``, and that is
-#:   precisely why they are not first: they are inferential (a Wilson bound over
-#:   lifecycle history), their affected-file sets are unbounded, and their
-#:   success criterion is "the underlying defect is gone", which cannot be
-#:   checked cheaply. Supporting them is a later phase.
-SUPPORTED_SIGNAL_KINDS: frozenset[str] = frozenset({MaintenanceSignal.PARSE_FAILURE})
+#: This is no longer a literal. It is
+#: :data:`~local_agent.maintenance_oracle.AUTONOMOUS_SIGNAL_KINDS`, which is
+#: computed from two independent facts about every signal: its
+#: :class:`~local_agent.maintenance_oracle.SignalInventoryEntry` must declare
+#: ``autonomous_execution``, *and* the oracle bound to it must be
+#: deterministic. Both are required, so making a signal autonomous means
+#: writing an oracle that can mechanically prove remediation - not editing a
+#: set. Every rejected signal's reasoning is recorded, per signal, on its
+#: inventory entry, and the test-suite asserts that the twelve rejected kinds
+#: each carry at least one reason.
+SUPPORTED_SIGNAL_KINDS: frozenset[str] = AUTONOMOUS_SIGNAL_KINDS
 
 #: Autonomy tiers this executor will act at.
 #:
@@ -193,6 +183,77 @@ MAX_DIFF_LINES_CEILING = 400
 
 #: File extensions the executor will touch. A parse failure is a Python fact.
 SUPPORTED_SUFFIXES: frozenset[str] = frozenset({".py"})
+
+
+# =============================================================================
+# Budget enforcement, declared rather than implied
+# =============================================================================
+#
+# Phase 4.21's audit found several maintenance budgets to be decorative. Phase
+# 4.22 wired some and documented others in prose. Prose rots, so Phase 4.23
+# states it as data and the test-suite asserts that these two sets together
+# cover every field of :class:`~local_agent.maintenance.MaintenanceBudget` -
+# a new budget field cannot be added without a deliberate decision about
+# whether this executor honours it.
+
+#: Budget fields this executor genuinely enforces: exceeding one changes the
+#: outcome, and the test-suite proves each with a real refusal.
+ENFORCED_BUDGET_FIELDS: frozenset[str] = frozenset(
+    {
+        # min()-ed into the effective limits, zero-checked, and re-checked
+        # against what the interactive agent actually consumed.
+        "max_tool_steps_per_subtask",
+        "max_candidate_iterations",
+        "max_validation_commands",
+        # Bounds the prepared diff; a breach refuses before the apply.
+        "max_changed_lines_per_candidate",
+        # Caps the tier in the policy, and is now compared against the files
+        # the authoritative apply actually reported.
+        "max_changed_files_per_candidate",
+        # Re-checked before execution and again immediately before the apply.
+        "max_elapsed_seconds",
+        # Zero means "no execution permitted", enforced by the policy.
+        "max_candidates_executed",
+    }
+)
+
+#: Budget fields this executor does **not** enforce, each with the reason.
+#:
+#: They are not silently ignored and they are not pretended to be controls.
+#: Several are enforced elsewhere - the run-level ones belong to
+#: :class:`~local_agent.maintenance_runner.MaintenanceRunner`, which is the
+#: component that selects and batches candidates - and the rest describe
+#: machinery this build does not have.
+UNENFORCED_BUDGET_FIELDS: Mapping[str, str] = {
+    "max_candidates_considered": (
+        "run-level; enforced by MaintenanceRunner during selection, not by a "
+        "single execution"
+    ),
+    "max_candidates_selected": (
+        "run-level; enforced by MaintenanceRunner during selection"
+    ),
+    "max_dag_width": (
+        "run-level; enforced by MaintenanceRunner.plan_execution_batches"
+    ),
+    "max_subtasks_per_candidate": (
+        "PARTIALLY ENFORCED: this executor performs exactly one implementation "
+        "and never decomposes a candidate, so the only value that can bind is "
+        "zero - and a work order permitting no subtask is refused. Above one "
+        "the bound constrains nothing, because there is nothing to count"
+    ),
+    "max_repair_iterations_per_candidate": (
+        "ADVISORY here: this build has no repair loop. A candidate that fails "
+        "prospective validation is refused, not retried, so no repair "
+        "iteration is ever consumed. The bound will become real only when a "
+        "repair loop exists"
+    ),
+    "max_estimated_cost_units": (
+        "NOT ENFORCED ANYWHERE: no component estimates the cost of a "
+        "maintenance action, so there is no quantity to compare against. It is "
+        "carried through configuration and persisted, and it constrains "
+        "nothing"
+    ),
+}
 
 
 # =============================================================================
@@ -233,6 +294,14 @@ class MaintenanceExecutionStatus:
     #: repository's health: this one means the repository is fine and the repair
     #: was ineffective. The change is rolled back either way.
     SIGNAL_NOT_RESOLVED = "signal_not_resolved"
+    #: The apply touched more files than the per-candidate budget allowed. A
+    #: separate status from ``budget_exhausted`` precisely because the tree
+    #: *was* written before the breach was noticed, so it must not appear in
+    #: :data:`NO_MUTATION_STATUSES`. Defence in depth: with
+    #: :data:`MAX_SCOPE_FILES` at one and the scope check upstream this should
+    #: be unreachable, and reaching it means a wiring defect rather than a bad
+    #: candidate - which is why it is not retryable either.
+    POST_APPLY_BUDGET_BREACH = "post_apply_budget_breach"
 
 
 ALL_EXECUTION_STATUSES: tuple[str, ...] = (
@@ -253,6 +322,7 @@ ALL_EXECUTION_STATUSES: tuple[str, ...] = (
     MaintenanceExecutionStatus.APPLY_FAILED,
     MaintenanceExecutionStatus.POST_VALIDATION_FAILED,
     MaintenanceExecutionStatus.SIGNAL_NOT_RESOLVED,
+    MaintenanceExecutionStatus.POST_APPLY_BUDGET_BREACH,
 )
 
 #: Statuses after which the same candidate may legitimately be attempted again
@@ -324,6 +394,22 @@ class MaintenanceExecutionResult:
     reasons: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
+    # -- Phase 4.23 oracle observability ---------------------------------
+    #: Which oracle answered for this signal, and how strong it can ever be.
+    oracle_name: str = ""
+    oracle_class: str = ""
+    #: The BEFORE/AFTER observations, as plain dicts. ``None`` when the stage
+    #: was never reached - never an empty dict standing in for "nothing wrong".
+    oracle_precondition: dict[str, Any] | None = None
+    oracle_postcondition: dict[str, Any] | None = None
+    #: Post-apply commands that genuinely executed, and those that could not.
+    post_apply_executed_commands: list[list[str]] = field(default_factory=list)
+    post_apply_skipped_commands: list[list[str]] = field(default_factory=list)
+    #: True only when at least one post-apply command actually ran. Recorded
+    #: separately from ``validation_passed`` so telemetry can never present
+    #: "nothing ran" as validation coverage.
+    post_apply_executed_any: bool = False
+
     provider: str = ""
     model: str = ""
     tool_steps_used: int = 0
@@ -377,6 +463,17 @@ class MaintenanceExecutionResult:
             "inspected_files": list(self.inspected_files),
             "reasons": list(self.reasons),
             "errors": list(self.errors),
+            "oracle_name": self.oracle_name,
+            "oracle_class": self.oracle_class,
+            "oracle_precondition": self.oracle_precondition,
+            "oracle_postcondition": self.oracle_postcondition,
+            "post_apply_executed_commands": [
+                list(c) for c in self.post_apply_executed_commands
+            ],
+            "post_apply_skipped_commands": [
+                list(c) for c in self.post_apply_skipped_commands
+            ],
+            "post_apply_executed_any": self.post_apply_executed_any,
             "provider": self.provider,
             "model": self.model,
             "tool_steps_used": self.tool_steps_used,
@@ -748,13 +845,44 @@ class MaintenanceExecutor:
         result.signal_kind = candidate.kind
         relative = order.scope_files[0]
 
-        # -- 2. supported signal ------------------------------------------
+        # -- 2. supported signal, and the oracle that will judge it --------
         if candidate.kind not in SUPPORTED_SIGNAL_KINDS:
             return self._refuse(
                 result,
                 MaintenanceExecutionStatus.UNSUPPORTED_SIGNAL,
                 f"signal kind '{candidate.kind}' is not executable by this build; "
                 f"supported: {', '.join(sorted(SUPPORTED_SIGNAL_KINDS))}",
+            )
+        oracle = oracle_for(candidate.kind)
+        result.oracle_name = oracle.name
+        result.oracle_class = oracle.oracle_class
+        # Second, independent gate. ``SUPPORTED_SIGNAL_KINDS`` is already
+        # derived from oracle promotability, so this can only fire if that set
+        # was monkey-patched or the registry was tampered with at run time -
+        # which is exactly the case worth refusing, because a non-deterministic
+        # oracle cannot prove a repair worked.
+        if not oracle.promotable:
+            return self._refuse(
+                result,
+                MaintenanceExecutionStatus.UNSUPPORTED_SIGNAL,
+                f"the oracle bound to '{candidate.kind}' is '{oracle.oracle_class}', "
+                "not deterministic; autonomous execution requires a mechanically "
+                "checkable success predicate",
+            )
+        if Path(relative).suffix.lower() not in oracle.supported_suffixes:
+            return self._refuse(
+                result,
+                MaintenanceExecutionStatus.MALFORMED_WORK_ORDER,
+                f"'{relative}' is not a file type oracle '{oracle.name}' can judge "
+                f"({', '.join(sorted(oracle.supported_suffixes)) or 'none'})",
+            )
+        if len(order.scope_files) > max(0, int(oracle.max_scope_files)):
+            return self._refuse(
+                result,
+                MaintenanceExecutionStatus.SCOPE_VIOLATION,
+                f"oracle '{oracle.name}' can judge at most "
+                f"{oracle.max_scope_files} file(s); the order declares "
+                f"{len(order.scope_files)}",
             )
 
         # -- 3. protected path, early (authoritative check is downstream) --
@@ -800,8 +928,9 @@ class MaintenanceExecutor:
         if limits is None:
             return ""
 
-        # -- 6. freshness / TOCTOU ----------------------------------------
-        if not self._check_freshness(order, relative, result):
+        # -- 6. freshness / TOCTOU, and the oracle's BEFORE observation ----
+        before = self._check_freshness(order, oracle, relative, result)
+        if before is None:
             return ""
 
         # -- 7. idempotency ------------------------------------------------
@@ -817,9 +946,9 @@ class MaintenanceExecutor:
             )
 
         # -- 8. implementation, prospectively validated --------------------
-        plan = self._build_plan(order, relative)
+        plan = self._build_plan(order, oracle, relative)
         implementation, evidence_ledger = self._implement(
-            order, plan, relative, limits, result
+            order, oracle, plan, relative, limits, result
         )
         if implementation is None:
             return key
@@ -866,9 +995,23 @@ class MaintenanceExecutor:
             return key
         result.reasons.append(f"approval boundary: {approval.reason}")
 
+        # -- 11b. last deadline/elapsed check before the authoritative write.
+        # Everything above can take minutes (a provider round-trip, a candidate
+        # rebuild, real subprocesses). Checking the deadline only at the start
+        # would let a run that has already overrun still perform the one action
+        # that mutates the repository.
+        if self._out_of_time():
+            self._refuse(
+                result,
+                MaintenanceExecutionStatus.BUDGET_EXHAUSTED,
+                "the run's time budget was exhausted before the authoritative "
+                "apply; nothing was written",
+            )
+            return key
+
         # -- 12. apply + post-apply validation -----------------------------
         self._apply_and_validate(
-            order, prepared, relative, limits, evidence_ledger, result
+            order, oracle, before, prepared, relative, limits, evidence_ledger, result
         )
         return key
 
@@ -933,6 +1076,26 @@ class MaintenanceExecutor:
                 "the work order's candidate snapshot does not match its candidate id",
             )
             return None
+        # Phase 4.23: re-derive the identity instead of trusting the persisted
+        # one. ``MaintenanceCandidate.__post_init__`` keeps a stored
+        # ``candidate_id`` verbatim and only computes one when it is missing,
+        # so the comparison above proves the snapshot and the order agree with
+        # each other - not that either agrees with the snapshot's *contents*.
+        # Recomputing binds the id to ``(kind, subject)``, so a persisted
+        # record whose kind or subject was edited is refused here rather than
+        # being carried into an execution under a borrowed identity.
+        derived = candidate_identity(
+            candidate.kind, candidate.subject or candidate.title
+        )
+        if derived != candidate.candidate_id:
+            self._refuse(
+                result,
+                MaintenanceExecutionStatus.MALFORMED_WORK_ORDER,
+                "the candidate snapshot's id is not the identity its own kind and "
+                "subject produce; the record has been edited or was written by an "
+                "incompatible schema",
+            )
+            return None
         if sorted(candidate.affected_files) != sorted(order.scope_files):
             self._refuse(
                 result,
@@ -981,6 +1144,18 @@ class MaintenanceExecutor:
                 self.budget.max_changed_lines_per_candidate,
             ),
         }
+        # This executor performs exactly one implementation, so a work order
+        # that permits fewer than one subtask permits nothing. Cheap, exact,
+        # and it means the field is a real gate at the only value where it can
+        # be one rather than a number nobody reads.
+        if int(getattr(order, "max_subtasks", 1) or 0) < 1:
+            self._refuse(
+                result,
+                MaintenanceExecutionStatus.BUDGET_EXHAUSTED,
+                "the work order permits no subtasks, and this executor needs "
+                "exactly one implementation",
+            )
+            return None
         for name, value in sorted(limits.items()):
             if value <= 0:
                 self._refuse(
@@ -989,18 +1164,18 @@ class MaintenanceExecutor:
                     f"effective budget '{name}' is {value}; no execution is permitted",
                 )
                 return None
-        if self.ledger is not None and self.ledger.exhausted("max_elapsed_seconds"):
+        # Routed through ``_out_of_time`` rather than calling the ledger and
+        # the deadline directly. Phase 4.22 called them inline, so a ledger or
+        # deadline that *raised* escaped to the top-level handler and was
+        # reported as an implementation failure - a corrupted budget control
+        # was misfiled as a bug in the repair, and the operator lost the one
+        # signal that says "your budget bookkeeping is broken".
+        if self._out_of_time():
             self._refuse(
                 result,
                 MaintenanceExecutionStatus.BUDGET_EXHAUSTED,
-                "the run's elapsed-time budget is exhausted",
-            )
-            return None
-        if self.deadline is not None and self.deadline():
-            self._refuse(
-                result,
-                MaintenanceExecutionStatus.BUDGET_EXHAUSTED,
-                "the run deadline passed before execution started",
+                "the run's time budget is exhausted, or its budget ledger could "
+                "not be consulted; no execution is permitted",
             )
             return None
         result.reasons.append(
@@ -1012,9 +1187,10 @@ class MaintenanceExecutor:
     def _check_freshness(
         self,
         order: MaintenanceWorkOrder,
+        oracle: ExecutionOracle,
         relative: str,
         result: MaintenanceExecutionResult,
-    ) -> bool:
+    ) -> OracleObservation | None:
         """Refuse to execute a plan made against a different repository state.
 
         Three independent checks, cheapest first:
@@ -1024,9 +1200,17 @@ class MaintenanceExecutor:
            (when the planner supplied one) - this is the general TOCTOU guard
            and reuses :func:`~local_agent.evidence.compute_state_fingerprint`
            rather than inventing a second hashing scheme;
-        3. the signal itself still reproduces. For ``parse_failure`` that is a
-           direct, exact re-observation: the file is compiled, and if it now
-           parses the candidate is stale by definition, whoever fixed it.
+        3. the oracle's *failure predicate* still holds. This is the BEFORE
+           observation, and it is returned rather than discarded: the AFTER
+           observation is evaluated against it, so the post-condition can be
+           "the defect is gone **and** the module survived" rather than the
+           weaker "the defect is gone".
+
+        Returns the BEFORE observation, or ``None`` when execution is refused.
+        An *inconclusive* observation refuses: an oracle that cannot establish
+        the defect is present now will not be able to establish it is gone
+        later, and executing against a repository the oracle cannot read is
+        exactly the case that must fail closed.
         """
         target = self.root / relative
         if not target.is_file():
@@ -1035,7 +1219,7 @@ class MaintenanceExecutor:
                 MaintenanceExecutionStatus.STALE_CANDIDATE,
                 f"'{relative}' no longer exists in the repository",
             )
-            return False
+            return None
 
         expected = str(getattr(order, "scope_fingerprint", "") or "")
         if expected:
@@ -1047,26 +1231,23 @@ class MaintenanceExecutor:
                     f"'{relative}' changed between planning and execution "
                     f"(fingerprint {expected[:12]} -> {observed[:12]})",
                 )
-                return False
+                return None
 
-        still_failing, detail = _python_parse_status(target)
-        if still_failing is None:
+        before = oracle.observe_failure(self.root, relative)
+        result.oracle_precondition = before.to_dict()
+        if not before.failing:
             self._refuse(
                 result,
                 MaintenanceExecutionStatus.STALE_CANDIDATE,
-                f"'{relative}' could not be read for the freshness re-check: {detail}",
+                f"oracle '{oracle.name}' did not re-observe the failure "
+                f"({before.outcome}): {before.detail}",
             )
-            return False
-        if not still_failing:
-            self._refuse(
-                result,
-                MaintenanceExecutionStatus.STALE_CANDIDATE,
-                f"'{relative}' now parses cleanly; the parse-failure signal no "
-                "longer reproduces, so there is nothing to execute",
-            )
-            return False
-        result.reasons.append(f"signal re-observed at execution time: {detail}")
-        return True
+            return None
+        result.reasons.append(
+            f"signal re-observed at execution time by oracle '{oracle.name}': "
+            f"{before.detail}"
+        )
+        return before
 
     def _execution_key(
         self,
@@ -1082,6 +1263,11 @@ class MaintenanceExecutor:
                 "granted_tier": order.granted_tier,
                 "budget": self.budget.to_dict(),
                 "supported_signals": sorted(SUPPORTED_SIGNAL_KINDS),
+                # A changed oracle contract is a changed decision about what
+                # counts as success, so a key minted under one generation must
+                # not be honoured by another.
+                "oracle_framework": ORACLE_FRAMEWORK_VERSION,
+                "oracle": oracle_for(candidate.kind).name,
             }
         )
         tree = compute_state_fingerprint(self.root, [relative])
@@ -1097,33 +1283,35 @@ class MaintenanceExecutor:
         )
         return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:32]
 
-    def _build_plan(self, order: MaintenanceWorkOrder, relative: str) -> Plan:
+    def _build_plan(
+        self, order: MaintenanceWorkOrder, oracle: ExecutionOracle, relative: str
+    ) -> Plan:
         """A plan whose allowed scope is exactly one file.
 
-        ``files_likely_to_create`` is empty on purpose: the executor repairs an
-        existing file and may never create one, and ``CodingAgent.prepare``
-        enforces that from the plan without needing a second rule here.
+        The prose comes from the oracle, so the instructions given to the
+        implementing agent and the predicate that will judge its work are
+        written in one place and cannot drift apart. ``files_likely_to_create``
+        is empty on purpose: the executor repairs an existing file and may
+        never create one, and ``CodingAgent.prepare`` enforces that from the
+        plan without needing a second rule here.
         """
+        fragment = oracle.plan_fragment(relative)
         return Plan(
-            objective=order.objective or f"Repair the parse failure in {relative}",
+            objective=order.objective or str(fragment.get("objective") or relative),
             files_to_inspect=[relative],
             files_likely_to_change=[relative],
             files_likely_to_create=[],
-            steps=[
-                f"Read {relative} and locate the syntax error reported by the parser.",
-                "Correct the syntax with the smallest possible edit.",
-                "Do not change the module's behaviour, public names or imports.",
-            ],
+            steps=[str(step) for step in fragment.get("steps") or ()],
             validation_strategy=[
-                f"{relative} must compile as valid Python.",
-                "Existing validation must continue to pass.",
+                str(item) for item in fragment.get("validation_strategy") or ()
             ],
-            risks=["A syntax repair that changes behaviour would be worse than the defect."],
+            risks=[str(item) for item in fragment.get("risks") or ()],
         )
 
     def _implement(
         self,
         order: MaintenanceWorkOrder,
+        oracle: ExecutionOracle,
         plan: Plan,
         relative: str,
         limits: Mapping[str, int],
@@ -1180,10 +1368,12 @@ class MaintenanceExecutor:
             )
             return None, ledger
 
-        objective = (
-            f"Repair the Python syntax error in {relative} so the file parses. "
-            "Make the smallest possible edit. Do not change behaviour, public "
-            "names, imports or any other file."
+        # The agent-facing objective is the oracle's, so the instruction and
+        # the acceptance predicate are authored together. In particular it is
+        # the oracle that tells the agent a deletion will be rejected.
+        objective = str(
+            oracle.plan_fragment(relative).get("agent_objective")
+            or plan.objective
         )
         try:
             context = self.context_provider()
@@ -1339,6 +1529,8 @@ class MaintenanceExecutor:
     def _apply_and_validate(
         self,
         order: MaintenanceWorkOrder,
+        oracle: ExecutionOracle,
+        before: OracleObservation,
         prepared: list[Any],
         relative: str,
         limits: Mapping[str, int],
@@ -1384,25 +1576,74 @@ class MaintenanceExecutor:
             lifecycle_id, result, LifecycleState.APPLIED, reason="maintenance change applied"
         )
 
-        verdict, executions, decision, impact = self._post_apply_validation(
-            changed, base_contents, limits, result
-        )
+        # Everything from here to the rollback decision runs inside one guard.
+        #
+        # Real defect, inherited from Phase 4.22 and found by injecting an
+        # exception into the post-apply path: the authoritative tree has
+        # already been written at this point, and an exception raised by the
+        # oracle, the impact analyser, the validation engine or the command
+        # runner escaped to ``execute``'s top-level handler - which records a
+        # status but performs no rollback. The run then ended with
+        # ``implementation_failure``, ``applied=True``, ``rolled_back=False``
+        # and the change still on disk. An unreviewed half-applied change is
+        # exactly what this executor exists to prevent, so any failure in here
+        # is now treated as "not passed", which rolls back.
+        overshot = False
+        verdict: bool | None = None
+        executions: list[Any] = []
+        decision = impact = None
+        try:
+            # ``max_changed_files`` was computed, zero-checked and then never
+            # compared to anything in Phase 4.22 - a decorative control. It is
+            # now enforced against what the authoritative apply reported.
+            overshot = len(changed) > int(limits["max_changed_files"])
 
-        # The parse failure's own acceptance criterion, checked directly rather
-        # than inferred from a command's exit code.
-        still_failing, detail = _python_parse_status(self.root / relative)
-        result.signal_resolved = (still_failing is False)
-        if still_failing is not False:
-            result.reasons.append(
-                f"the target file still does not parse after the change: {detail}"
+            verdict, executions, decision, impact = self._post_apply_validation(
+                oracle, changed, base_contents, limits, result
             )
 
-        # ``validation_passed`` is the *validation* verdict and nothing else -
-        # never a blend of "validation passed" and "the signal went away". The
-        # runner's reassessment reads it, and a blended value would tell it the
-        # repository is broken when in fact only the repair was ineffective.
-        result.validation_passed = verdict
-        passed = verdict is True and result.signal_resolved is True
+            # The signal's own acceptance criterion, judged by its oracle
+            # against the BEFORE observation - never inferred from a command's
+            # exit code and never from the agent's own claim of success.
+            after = oracle.observe_success(self.root, relative, before)
+            result.oracle_postcondition = after.to_dict()
+            result.signal_resolved = after.resolved
+            if not after.resolved:
+                result.reasons.append(
+                    f"oracle '{oracle.name}' could not confirm the repair "
+                    f"({after.outcome}): {after.detail}"
+                )
+            if overshot:
+                result.errors.append(
+                    sanitize_text(
+                        f"the apply touched {len(changed)} file(s), over the "
+                        f"{limits['max_changed_files']}-file budget"
+                    )
+                )
+
+            # ``validation_passed`` is the *validation* verdict and nothing
+            # else - never a blend of "validation passed" and "the signal went
+            # away". The runner's reassessment reads it, and a blended value
+            # would tell it the repository is broken when in fact only the
+            # repair was ineffective.
+            result.validation_passed = verdict
+            passed = (
+                verdict is True and result.signal_resolved is True and not overshot
+            )
+        except Exception as exc:  # noqa: BLE001 - must not leave a change behind
+            LOGGER.exception("Post-apply evaluation raised after an authoritative apply")
+            result.errors.append(
+                sanitize_text(
+                    "post-apply evaluation failed after the change was applied "
+                    f"({type(exc).__name__}: {exc}); rolling back"
+                )
+            )
+            # No verdict was established, and ``None`` is the honest value for
+            # that. Leaving a stale ``True`` here would let the runner credit a
+            # resolution that was never validated.
+            result.validation_passed = None
+            result.signal_resolved = False
+            passed = False
 
         self._record_evidence(evidence_ledger, executions, changed, result)
         self._record_telemetry(decision, impact, verdict, executions, result)
@@ -1418,8 +1659,8 @@ class MaintenanceExecutor:
             )
             result.status = MaintenanceExecutionStatus.COMPLETED
             result.reasons.append(
-                "post-apply validation produced a real PASS verdict and the parse "
-                "failure no longer reproduces"
+                "post-apply validation produced a real PASS verdict and oracle "
+                f"'{oracle.name}' confirmed the signal no longer reproduces"
             )
             return
 
@@ -1434,14 +1675,20 @@ class MaintenanceExecutor:
             LifecycleState.FAILED,
             reason="post-apply validation failed; change rolled back",
         )
-        if verdict is True:
+        if overshot:
+            result.status = MaintenanceExecutionStatus.POST_APPLY_BUDGET_BREACH
+            result.reasons.append(
+                "the apply exceeded the per-candidate changed-file budget; the "
+                "change was rolled back rather than credited"
+            )
+        elif verdict is True:
             # Validation was genuinely fine; the change simply did not fix the
             # thing it was authorised to fix. Reporting that as a validation
             # failure would be a lie about the repository's health.
             result.status = MaintenanceExecutionStatus.SIGNAL_NOT_RESOLVED
             result.reasons.append(
-                "post-apply validation passed but the maintenance signal is still "
-                "present; the change was rolled back rather than credited"
+                "post-apply validation passed but the oracle could not confirm the "
+                "repair; the change was rolled back rather than credited"
             )
         else:
             result.status = MaintenanceExecutionStatus.POST_VALIDATION_FAILED
@@ -1453,6 +1700,7 @@ class MaintenanceExecutor:
 
     def _post_apply_validation(
         self,
+        oracle: ExecutionOracle,
         changed: Sequence[str],
         base_contents: Mapping[str, str | None],
         limits: Mapping[str, int],
@@ -1464,9 +1712,10 @@ class MaintenanceExecutor:
 
         The *scope* is chosen by :class:`ValidationDecisionEngine`, never here.
         This method contributes exactly one thing the engine cannot know about:
-        a mandatory ``compileall`` over the changed files, which is this
-        signal's own acceptance criterion. It is additive - it can only cause
-        more validation to run, never less.
+        the oracle's own acceptance commands, which for a parse failure is a
+        mandatory ``compileall`` over the changed files. They are additive and
+        run first - they can only cause more validation to run, never less, and
+        never displace what the engine chose.
 
         ``verdict`` is ``None`` when nothing actually executed. That is not a
         pass, and callers must not treat it as one.
@@ -1516,20 +1765,7 @@ class MaintenanceExecutor:
             result.validation_scope = "broad"
             result.validation_confidence = "low"
 
-        python_files = [
-            path for path in changed if path.lower().endswith(".py") and (self.root / path).is_file()
-        ]
-        commands: list[CommandSpec] = []
-        if python_files:
-            commands.append(
-                CommandSpec(
-                    name="maintenance_compileall",
-                    command=("python", "-m", "compileall", "-q", *sorted(python_files)),
-                    reason="mandatory syntax acceptance check for a parse-failure repair",
-                    category="type_check",
-                    risk="low",
-                )
-            )
+        commands: list[CommandSpec] = list(oracle.acceptance_commands(self.root, changed))
         seen = {tuple(spec.command) for spec in commands}
         for spec in selected:
             if tuple(spec.command) in seen:
@@ -1540,23 +1776,27 @@ class MaintenanceExecutor:
 
         runner = CommandRunner(self.root, self.command_timeout_seconds)
         executions: list[Any] = []
-        executed_any = False
+        executed: list[list[str]] = []
+        skipped: list[list[str]] = []
         verdict: bool | None = None
         for spec in commands:
             try:
                 execution = runner.run(spec)
             except (UnsafeCommandError, PermissionError) as exc:
                 result.reasons.append(f"validation command refused by policy: {exc}")
+                skipped.append(list(spec.command))
                 continue
             executions.append((spec, execution))
-            if execution.exit_code == 127 and "executable not found" in (execution.stderr or ""):
+            if _executable_missing(execution):
                 # A missing runner is not evidence of anything; it cannot pass
-                # and it must not fail the change either.
+                # and it must not fail the change either. Recorded as skipped
+                # so telemetry never presents it as validation coverage.
                 result.reasons.append(
                     f"skipped '{spec.display()}': executable not available"
                 )
+                skipped.append(list(spec.command))
                 continue
-            executed_any = True
+            executed.append(list(spec.command))
             if not execution.succeeded:
                 verdict = False
                 result.errors.append(
@@ -1566,9 +1806,16 @@ class MaintenanceExecutor:
                     )
                 )
                 break
-        if verdict is None and executed_any:
+        if verdict is None and executed:
             verdict = True
-        result.post_apply_commands_run = sum(1 for _, e in executions if e.exit_code != 127)
+        # Phase 4.22 counted "ran" as ``exit_code != 127``, a different
+        # predicate from the skip test above, so a genuine exit-127 failure was
+        # reported as not having run even though it set the verdict. The two
+        # now share one predicate.
+        result.post_apply_executed_commands = executed
+        result.post_apply_skipped_commands = skipped
+        result.post_apply_executed_any = bool(executed)
+        result.post_apply_commands_run = len(executed)
         result.post_apply_commands = [list(spec.command) for spec, _ in executions]
         return verdict, executions, decision, impact
 
@@ -1702,7 +1949,7 @@ class MaintenanceExecutor:
             return
         relevant = sorted({str(path) for path in changed})
         for spec, execution in executions:
-            if execution.exit_code == 127 and "executable not found" in (execution.stderr or ""):
+            if _executable_missing(execution):
                 status = STATUS_SKIPPED
             elif execution.succeeded:
                 status = STATUS_PASSED
@@ -1746,11 +1993,17 @@ class MaintenanceExecutor:
             record = build_decision_record(impact, decision, root=self.root)
             self.telemetry_manager.record_decision(record)
             result.decision_id = record.decision_id
+            # ``ran`` must mean "a command genuinely executed", not "a command
+            # was selected". Phase 4.22 passed ``bool(executions)``, which is
+            # true even when every command was skipped for a missing
+            # executable - telemetry would then have claimed validation
+            # coverage the run did not have.
+            really_ran = bool(result.post_apply_executed_any)
             outcome, quality = classify_outcome(
                 scope=decision.scope,
-                targeted_ran=bool(executions),
+                targeted_ran=really_ran,
                 targeted_failed=verdict is False,
-                broad_ran=bool(executions),
+                broad_ran=really_ran,
                 broad_failed=verdict is False,
             )
             self.telemetry_manager.finalize_decision(
@@ -1765,6 +2018,29 @@ class MaintenanceExecutor:
             LOGGER.warning("Could not record maintenance validation telemetry: %s", exc)
 
     # -- small helpers -----------------------------------------------------
+
+    def _out_of_time(self) -> bool:
+        """Whether the run's time budget is spent, asked fresh.
+
+        Phase 4.21 found the elapsed-time budget double-counted and Phase 4.22
+        fixed the arithmetic, but the executor still only consulted it once,
+        before any work started. Since everything between that check and the
+        apply can take minutes, the check is now repeated immediately before
+        the one action that writes to the repository. A ledger or deadline that
+        raises is treated as exhausted: refusing is always safe.
+        """
+        if self.ledger is not None:
+            try:
+                if self.ledger.exhausted("max_elapsed_seconds"):
+                    return True
+            except Exception:  # noqa: BLE001 - a broken ledger stops the work
+                return True
+        if self.deadline is not None:
+            try:
+                return bool(self.deadline())
+            except Exception:  # noqa: BLE001
+                return True
+        return False
 
     def _refuse(
         self, result: MaintenanceExecutionResult, status: str, reason: str
@@ -1805,23 +2081,26 @@ class ToolRegistryFactory:
         )
 
 
-def _python_parse_status(path: Path) -> tuple[bool | None, str]:
-    """``(still_failing, detail)`` for one Python file.
+#: Exit code :class:`~local_agent.commands.CommandRunner` synthesises when it
+#: cannot find an executable at all.
+_EXECUTABLE_MISSING_EXIT_CODE = 127
 
-    ``None`` means the file could not be read at all, which is neither "parses"
-    nor "does not parse" and must never be collapsed into either.
+
+def _executable_missing(execution: Any) -> bool:
+    """Whether a result means "the tool was not there", not "the tool failed".
+
+    One predicate, used by the verdict, the run counters and the evidence
+    ledger alike. Phase 4.22 had two subtly different tests for the same
+    question, which made a genuine exit-127 failure count as not-run.
+
+    The stderr clause matters: 127 is also a legitimate exit code for a child
+    process, and a real command that fails with 127 must fail the change rather
+    than be silently skipped. Only the runner's own synthesised message means
+    the executable was never found.
     """
-    try:
-        source = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        return None, f"{type(exc).__name__}: {exc}"
-    try:
-        compile(source, str(path), "exec")
-    except SyntaxError as exc:
-        return True, sanitize_text(f"SyntaxError: {exc.msg} (line {exc.lineno})", limit=200)
-    except ValueError as exc:  # e.g. source containing a NUL byte
-        return True, sanitize_text(f"ValueError: {exc}", limit=200)
-    return False, "the file parses as valid Python"
+    if int(getattr(execution, "exit_code", 0) or 0) != _EXECUTABLE_MISSING_EXIT_CODE:
+        return False
+    return "executable not found" in (getattr(execution, "stderr", "") or "")
 
 
 def _timestamp() -> str:

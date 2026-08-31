@@ -412,15 +412,24 @@ class SignalSelectionTests(ExecutorCase):
     def test_widening_the_supported_set_alone_does_not_open_the_gate(self):
         """A future signal cannot silently inherit this executor's authority.
 
-        The supported-signal check is only the first of several kind-specific
-        gates. Even with ``test_gap`` forced into the supported set, the
-        freshness gate - which for this executor means "the file still fails to
-        parse" - refuses, because a test gap says nothing about parseability.
-        This is the defence-in-depth the specification's question T asks about.
+        Two independent gates are proved here, in order, by defeating them one
+        at a time. This is the defence-in-depth the specification's question T
+        asks about, and Phase 4.23 added the first layer.
+
+        Layer 1 (4.23): even with ``test_gap`` forced into the supported set,
+        the executor asks the *oracle registry* whether the signal's oracle is
+        deterministic. ``test_gap``'s is not, so it is refused as an
+        unsupported signal before any file is read.
+
+        Layer 2 (4.22): defeat layer 1 as well, by binding ``test_gap`` to the
+        deterministic parse oracle, and the freshness gate still refuses -
+        because ``healthy.py`` parses, so the oracle's failure predicate does
+        not reproduce. A test gap says nothing about parseability.
         """
         import unittest.mock as mock
 
         from local_agent import maintenance_execution as module
+        from local_agent.maintenance_oracle import ParseOracle
 
         candidate = MaintenanceCandidate(
             kind=MaintenanceSignal.TEST_GAP,
@@ -431,10 +440,24 @@ class SignalSelectionTests(ExecutorCase):
         )
         before = snapshot_tree(self.root)
         widened = frozenset(SUPPORTED_SIGNAL_KINDS | {MaintenanceSignal.TEST_GAP})
+
         with mock.patch.object(module, "SUPPORTED_SIGNAL_KINDS", widened):
-            result = self.executor().execute(self.order(candidate))
-        self.assertNotEqual(result.status, MaintenanceExecutionStatus.COMPLETED)
-        self.assertEqual(result.status, MaintenanceExecutionStatus.STALE_CANDIDATE)
+            layer1 = self.executor().execute(self.order(candidate))
+        self.assertEqual(
+            layer1.status, MaintenanceExecutionStatus.UNSUPPORTED_SIGNAL, layer1.reasons
+        )
+        self.assertIn("not deterministic", " ".join(layer1.reasons))
+        # Nothing was even observed: the refusal came before the target file
+        # was read, which is what "structurally, before any workspace exists"
+        # has to mean.
+        self.assertIsNone(layer1.oracle_precondition)
+        self.assertEqual(snapshot_tree(self.root), before)
+
+        with mock.patch.object(module, "SUPPORTED_SIGNAL_KINDS", widened), \
+                mock.patch.object(module, "oracle_for", lambda _kind: ParseOracle()):
+            layer2 = self.executor().execute(self.order(candidate))
+        self.assertNotEqual(layer2.status, MaintenanceExecutionStatus.COMPLETED)
+        self.assertEqual(layer2.status, MaintenanceExecutionStatus.STALE_CANDIDATE)
         self.assertEqual(snapshot_tree(self.root), before)
 
     def test_the_policy_can_never_grant_the_signal_full_autonomy(self):
@@ -604,10 +627,20 @@ class RefusalTests(ExecutorCase):
         (self.root / "broken.py").write_text(FIXED_SOURCE, encoding="utf-8")
         result = self.executor().execute(order)
         self.assertEqual(result.status, MaintenanceExecutionStatus.STALE_CANDIDATE)
+        # Phase 4.23: the re-check is the oracle's failure predicate rather
+        # than an inline compile, so the wording changed. The substance that
+        # matters - the refusal names the oracle and says the failure was not
+        # re-observed - is asserted here, along with the recorded observation
+        # itself so this is not merely a string test.
         self.assertTrue(
-            any("no longer reproduces" in reason for reason in result.reasons),
+            any(
+                "did not re-observe the failure" in reason for reason in result.reasons
+            ),
             result.reasons,
         )
+        self.assertIsNotNone(result.oracle_precondition)
+        self.assertEqual(result.oracle_precondition["outcome"], "resolved")
+        self.assertEqual(result.oracle_precondition["oracle"], "parse_oracle")
 
     def test_a_vanished_file_is_rejected(self):
         order = self.order()
@@ -758,52 +791,72 @@ class BudgetEnforcementTests(ExecutorCase):
         self.assertEqual(result.status, MaintenanceExecutionStatus.BUDGET_EXHAUSTED)
         self.assertEqual((self.root / "broken.py").read_text(encoding="utf-8"), BROKEN_SOURCE)
 
-    def test_only_the_declared_budgets_are_read_by_the_executor(self):
+    def test_only_the_declared_budgets_are_consumed_by_the_executor(self):
         """Honesty check: a budget this phase does not enforce must not look enforced.
 
         Proved from the AST rather than from prose, so the claim in the module's
         documentation cannot drift away from the code.
+
+        PHASE 4.23 CHANGE, disclosed deliberately. The 4.22 version of this
+        test used "the name does not appear anywhere in the module" as its
+        proxy for "not enforced", and asserted that for seven budget fields.
+        That proxy became wrong, not because enforcement changed, but because
+        4.23 added
+        :data:`~local_agent.maintenance_execution.UNENFORCED_BUDGET_FIELDS` - a
+        declaration whose entire purpose is to name those fields and say, in
+        the module itself, that they are not enforced. Deleting the mention to
+        satisfy the old proxy would have removed the documentation the
+        specification asks for.
+
+        The contract asserted here is therefore the underlying one, and it is
+        strictly stronger than a name search: an unenforced budget may never be
+        *read* (no ``budget.max_x`` attribute access, no string key handed to
+        the ledger), and where its name appears at all it must appear as a key
+        of the declaration that disclaims it.
         """
         import ast as _ast
+
+        from local_agent.maintenance_execution import (
+            ENFORCED_BUDGET_FIELDS,
+            UNENFORCED_BUDGET_FIELDS,
+        )
 
         source = (REPO_ROOT / "local_agent" / "maintenance_execution.py").read_text(
             encoding="utf-8"
         )
         tree = _ast.parse(source)
-        # Both attribute access (``budget.max_x``) and the ledger's string keys
-        # (``ledger.exhausted("max_x")``) count as reading a budget.
-        read = {
+        attributes = {
             node.attr
             for node in _ast.walk(tree)
             if isinstance(node, _ast.Attribute) and node.attr.startswith("max_")
-        } | {
+        }
+        constants = {
             node.value
             for node in _ast.walk(tree)
             if isinstance(node, _ast.Constant)
             and isinstance(node.value, str)
             and node.value.startswith("max_")
         }
-        enforced = {
-            "max_tool_steps_per_subtask",
-            "max_candidate_iterations",
-            "max_validation_commands",
-            "max_changed_files_per_candidate",
-            "max_changed_lines_per_candidate",
-            "max_elapsed_seconds",
-        }
-        self.assertTrue(enforced.issubset(read), sorted(enforced - read))
-        # Budgets this phase explicitly does NOT enforce are not touched at all,
-        # so nobody can mistake a copied value for an enforced one.
-        for not_enforced in (
-            "max_estimated_cost_units",
-            "max_dag_width",
-            "max_subtasks_per_candidate",
-            "max_repair_iterations_per_candidate",
-            "max_candidates_considered",
-            "max_candidates_selected",
-            "max_candidates_executed",
-        ):
-            self.assertNotIn(not_enforced, read, not_enforced)
+        read = attributes | constants
+
+        # Everything the executor claims to enforce, it really does touch.
+        # ``max_candidates_executed`` is enforced through the policy verdict
+        # rather than here, so it is checked in the policy module instead.
+        directly_enforced = set(ENFORCED_BUDGET_FIELDS) - {"max_candidates_executed"}
+        self.assertTrue(
+            directly_enforced.issubset(read), sorted(directly_enforced - read)
+        )
+        policy_source = (REPO_ROOT / "local_agent" / "maintenance_policy.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("max_candidates_executed", policy_source)
+
+        # Nothing it disclaims is ever read, and every mention of one is inside
+        # the disclaimer itself.
+        for not_enforced in sorted(UNENFORCED_BUDGET_FIELDS):
+            self.assertNotIn(not_enforced, attributes, not_enforced)
+            if not_enforced in constants:
+                self.assertIn(not_enforced, UNENFORCED_BUDGET_FIELDS, not_enforced)
 
     def test_all_skipped_validation_commands_produce_no_verdict(self):
         """UNIT-LEVEL: the only way to make every runner unavailable at once.
