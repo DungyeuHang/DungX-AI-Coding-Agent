@@ -454,12 +454,15 @@ class TestSchedulerParallelIntegration(unittest.TestCase):
         task = _make_test_task("task-parallel", TaskPlan(objective="Parallel goal", subtasks=[s1, s2]))
         self.storage.save_task(task)
 
+        s1_done = Subtask(subtask_id="s1", status=SubtaskStatus.COMPLETED, integration_commit="commit-1")
+        s2_done = Subtask(subtask_id="s2", status=SubtaskStatus.COMPLETED, integration_commit="commit-2")
+
         with patch.object(scheduler.coordinator, "execute_parallel_batch") as mock_exec, \
-             patch.object(scheduler.coordinator, "integrate_branches", return_value=([s1, s2], [])), \
+             patch.object(scheduler.coordinator, "integrate_branches", return_value=([s1_done, s2_done], [])), \
              patch.object(scheduler.coordinator, "verify_integration", return_value=True):
             mock_exec.return_value = [
-                (Subtask(subtask_id="s1", status=SubtaskStatus.COMPLETED), MagicMock(completed=True), None),
-                (Subtask(subtask_id="s2", status=SubtaskStatus.COMPLETED), MagicMock(completed=True), None),
+                (s1_done, MagicMock(completed=True), None),
+                (s2_done, MagicMock(completed=True), None),
             ]
             scheduler.run_once()
             self.assertEqual(mock_exec.call_count, 1)

@@ -218,7 +218,7 @@ class TestCrashBoundaryRecovery(unittest.TestCase):
         self.assertFalse(Path(session.worktree_path).exists())
 
     def test_case_c_worker_completed_dirty_worktree_uncommitted(self):
-        """Case C: Worker wrote files, but crashed before committing to branch."""
+        """Case C: Worker modified tracked files, but crashed before committing."""
         s1 = Subtask(subtask_id="sub-c1", title="Feature C1", status=SubtaskStatus.RUNNING)
         task = _make_test_task("task-case-c", TaskPlan(objective="Case C Goal", subtasks=[s1]))
         self.storage.save_task(task)
@@ -226,11 +226,11 @@ class TestCrashBoundaryRecovery(unittest.TestCase):
         session = self.worktree_manager.create_worktree(task.task_id, s1.subtask_id)
         s1.worktree_session = session
 
-        # Worker wrote changes in worktree
+        # Worker modified a tracked file in the worktree (README.md exists from init)
         wt_path = Path(session.worktree_path)
-        (wt_path / "feature_c1.py").write_text("def feature_c1(): return 42\n", encoding="utf-8")
+        (wt_path / "README.md").write_text("# Modified by worker\ndef feature_c1(): return 42\n", encoding="utf-8")
 
-        # Reconcile: coordinator should detect dirty worktree, commit changes, advance to COMPLETED
+        # Reconcile: coordinator should detect dirty worktree, commit tracked changes, advance to COMPLETED
         reconciled_task, report = self.coordinator.reconcile_dag_state(task)
         self.assertEqual(s1.status, SubtaskStatus.COMPLETED)
         self.assertIn("subtask_sub-c1_dirty_worktree_committed", report["actions"])
@@ -522,7 +522,7 @@ class TestDAGTopologyCrashAndResume(unittest.TestCase):
         """
         Diamond DAG: A -> B, A -> C, B -> D, C -> D.
         A completes and integrates. Crash occurs.
-        On resume: B and C run in parallel worktrees, then D runs and completes.
+        On resume: B and C run in parallel, then D runs and completes in a single resume loop.
         """
         sa = Subtask(subtask_id="sa", title="Root A", status=SubtaskStatus.COMPLETED, integration_commit="commit-a")
         sb = Subtask(subtask_id="sb", title="Branch B", dependencies=["sa"], status=SubtaskStatus.PENDING)
@@ -532,40 +532,35 @@ class TestDAGTopologyCrashAndResume(unittest.TestCase):
         task = _make_test_task("task-diamond", TaskPlan(objective="Diamond Goal", subtasks=[sa, sb, sc, sd]))
         self.storage.save_task(task)
 
-        # First resume: B and C are ready in parallel
         with patch.object(self.coordinator, "execute_parallel_batch") as mock_exec, \
              patch.object(self.coordinator, "integrate_branches") as mock_merge, \
              patch.object(self.coordinator, "verify_integration", return_value=True):
 
             sb_done = Subtask(subtask_id="sb", status=SubtaskStatus.COMPLETED, integration_commit="commit-b")
             sc_done = Subtask(subtask_id="sc", status=SubtaskStatus.COMPLETED, integration_commit="commit-c")
-
-            mock_exec.return_value = [
-                (sb_done, MagicMock(completed=True), None),
-                (sc_done, MagicMock(completed=True), None),
-            ]
-            mock_merge.return_value = ([sb_done, sc_done], [])
-
-            res1 = self.coordinator.reconcile_and_resume(task)
-            self.assertEqual(mock_exec.call_count, 1)
-            # Batch executed sb and sc together
-            executed_batch = mock_exec.call_args[0][1]
-            self.assertEqual({s.subtask_id for s in executed_batch}, {"sb", "sc"})
-
-        # Second resume: D is now ready
-        task_after_bc = self.storage.load_task("task-diamond")
-        with patch.object(self.coordinator, "execute_parallel_batch") as mock_exec_d, \
-             patch.object(self.coordinator, "integrate_branches") as mock_merge_d, \
-             patch.object(self.coordinator, "verify_integration", return_value=True):
-
             sd_done = Subtask(subtask_id="sd", status=SubtaskStatus.COMPLETED, integration_commit="commit-d")
-            mock_exec_d.return_value = [(sd_done, MagicMock(completed=True), None)]
-            mock_merge_d.return_value = ([sd_done], [])
 
-            res2 = self.coordinator.reconcile_and_resume(task_after_bc)
-            self.assertEqual(res2.status, TaskStatus.COMPLETED)
-            executed_d_batch = mock_exec_d.call_args[0][1]
-            self.assertEqual([s.subtask_id for s in executed_d_batch], ["sd"])
+            mock_exec.side_effect = [
+                [
+                    (sb_done, MagicMock(completed=True), None),
+                    (sc_done, MagicMock(completed=True), None),
+                ],
+                [
+                    (sd_done, MagicMock(completed=True), None),
+                ],
+            ]
+            mock_merge.side_effect = [
+                ([sb_done, sc_done], []),
+                ([sd_done], []),
+            ]
+
+            res = self.coordinator.reconcile_and_resume(task)
+            self.assertEqual(res.status, TaskStatus.COMPLETED)
+            self.assertEqual(mock_exec.call_count, 2)
+            first_batch = mock_exec.call_args_list[0][0][1]
+            self.assertEqual({s.subtask_id for s in first_batch}, {"sb", "sc"})
+            second_batch = mock_exec.call_args_list[1][0][1]
+            self.assertEqual([s.subtask_id for s in second_batch], ["sd"])
 
     def test_diamond_dag_crash_with_one_unintegrated_branch_recovers_and_integrates(self):
         """
@@ -637,6 +632,230 @@ class TestStorageAtomicWriteFailureAndRecovery(unittest.TestCase):
         # No .tmp file left behind
         tmp_file = target.with_suffix(".json.tmp")
         self.assertFalse(tmp_file.exists())
+
+class TestForensicAuditP0SafetyFixes(unittest.TestCase):
+    """
+    Forensic audit tests for P0 safety defects discovered during
+    Phase 4.15 independent review.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.project_root = Path(self.temp_dir) / "repo"
+        self.project_root.mkdir(parents=True, exist_ok=True)
+        self.git = _init_git_repo(self.project_root)
+
+        self.storage_dir = Path(self.temp_dir) / "storage"
+        self.storage = JsonFileStorage(self.storage_dir)
+
+        self.config = AgentConfig(
+            project=self.project_root,
+            provider="mock",
+            parallel_worktree_execution=True,
+            max_parallel_subtasks=2,
+            knowledge_graph_enabled=True,
+        )
+        self.worktree_manager = WorktreeManager(self.project_root, self.git)
+        self.coordinator = ParallelExecutionCoordinator(
+            self.config,
+            self.storage,
+            worktree_manager=self.worktree_manager,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_dirty_worktree_with_only_untracked_files_must_not_auto_commit(self):
+        """
+        P0-1: If a worktree contains ONLY untracked files (not tracked-dirty),
+        recovery must NOT auto-commit them. Untracked files could be user-owned
+        or foreign artifacts.
+        """
+        s1 = Subtask(subtask_id="sub-untracked", title="Untracked Test", status=SubtaskStatus.RUNNING)
+        task = _make_test_task("task-untracked", TaskPlan(objective="Untracked Test", subtasks=[s1]))
+        self.storage.save_task(task)
+
+        session = self.worktree_manager.create_worktree(task.task_id, s1.subtask_id)
+        s1.worktree_session = session
+
+        # Drop an untracked file into the worktree — but don't modify any tracked file
+        wt_path = Path(session.worktree_path)
+        (wt_path / "foreign_artifact.dat").write_text("foreign data\n", encoding="utf-8")
+
+        # The worktree has untracked files but no tracked-dirty files,
+        # so git diff --name-only will be empty. Recovery should NOT auto-commit.
+        reconciled_task, report = self.coordinator.reconcile_dag_state(task)
+
+        # Subtask must NOT be marked COMPLETED since only untracked files exist
+        self.assertNotEqual(s1.status, SubtaskStatus.COMPLETED)
+        self.assertNotIn("subtask_sub-untracked_dirty_worktree_committed", report["actions"])
+
+    def test_dirty_worktree_with_protected_file_changes_must_be_refused(self):
+        """
+        P0-1: If a worktree has dirty changes touching protected files
+        (tool_engine.py, approval.py), recovery MUST refuse auto-commit.
+        """
+        # Create protected file in base repo first so it is tracked in base_commit
+        (self.project_root / "tool_engine.py").write_text("# base protected\n", encoding="utf-8")
+        self.git.add(["tool_engine.py"])
+        self.git.commit("add base tool_engine")
+
+        s1 = Subtask(subtask_id="sub-protected", title="Protected Test", status=SubtaskStatus.RUNNING)
+        task = _make_test_task("task-protected", TaskPlan(objective="Protected Test", subtasks=[s1]))
+        self.storage.save_task(task)
+
+        session = self.worktree_manager.create_worktree(task.task_id, s1.subtask_id)
+        s1.worktree_session = session
+
+        # Modify the protected file in the worktree without committing
+        wt_path = Path(session.worktree_path)
+        (wt_path / "tool_engine.py").write_text("# MODIFIED BY WORKER\n", encoding="utf-8")
+
+        reconciled_task, report = self.coordinator.reconcile_dag_state(task)
+
+        # Recovery must REFUSE to auto-commit
+        self.assertNotEqual(s1.status, SubtaskStatus.COMPLETED)
+        self.assertIn("subtask_sub-protected_dirty_worktree_protected_files_refused", report["actions"])
+
+    def test_foreign_merge_on_user_branch_must_not_be_aborted(self):
+        """
+        P0-2: If the user has an active merge on a non-DungX branch,
+        recovery must NOT abort it.
+        """
+        base_head = self.git.get_head_commit()
+        s1 = Subtask(subtask_id="sub-fm", title="Foreign Merge", status=SubtaskStatus.PENDING)
+        task = _make_test_task("task-fm", TaskPlan(objective="Foreign Merge Test", subtasks=[s1]))
+        self.storage.save_task(task)
+
+        # Create user branch with change from base_head
+        self.git.ensure_branch("user-feature", start_point=base_head)
+        (self.project_root / "user_file.txt").write_text("user version\n", encoding="utf-8")
+        self.git.add(["user_file.txt"])
+        self.git.commit("user commit")
+
+        # Create another branch from base_head with conflicting change
+        self.git.ensure_branch("user-other", start_point=base_head)
+        (self.project_root / "user_file.txt").write_text("other version\n", encoding="utf-8")
+        self.git.add(["user_file.txt"])
+        self.git.commit("other commit")
+
+        # Start merge on user branch (conflict)
+        self.git.checkout("user-feature")
+        success, _ = self.git.merge_branch("user-other")
+        self.assertFalse(success)
+        self.assertTrue(self.git.is_merge_in_progress())
+
+        # DungX reconcile must NOT abort the user's merge
+        reconciled_task, report = self.coordinator.reconcile_dag_state(task)
+        self.assertTrue(self.git.is_merge_in_progress())
+        self.assertIn("skipped_foreign_active_merge", report["actions"])
+        self.assertNotIn("aborted_active_merge", report["actions"])
+
+        # Clean up the merge for tearDown
+        self.git.merge_abort()
+
+    def test_checkpoint_says_completed_but_git_branch_missing_must_not_fabricate(self):
+        """
+        Git Oracle Case 2: Checkpoint says worker committed, but Git branch does not exist.
+        Recovery must NOT fabricate success.
+        """
+        s1 = Subtask(subtask_id="sub-ghost", title="Ghost Branch", status=SubtaskStatus.COMPLETED)
+        s1.worktree_session = WorktreeSession(
+            session_id="wt-ghost",
+            subtask_id="sub-ghost",
+            worktree_path=str(self.worktree_manager.allocate_worktree_path("task-ghost", "sub-ghost")),
+            branch_name="agent/task_ghost/sub_ghost",
+            base_commit="nonexistent",
+            status="active",
+        )
+        task = _make_test_task("task-ghost", TaskPlan(objective="Ghost Branch", subtasks=[s1]))
+        self.storage.save_task(task)
+
+        # The branch does NOT exist in Git
+        branch_commit = self.git.get_branch_commit("agent/task_ghost/sub_ghost")
+        self.assertIsNone(branch_commit)
+
+        # Reconcile: subtask was COMPLETED but has no Git evidence
+        reconciled_task, report = self.coordinator.reconcile_dag_state(task)
+
+        # Subtask must NOT gain an integration_commit fabricated from nothing
+        self.assertIsNone(s1.integration_commit)
+
+    def test_checkpoint_says_not_integrated_but_branch_is_ancestor(self):
+        """
+        Git Oracle Case 3: Checkpoint says not integrated, but the branch
+        commit is already an ancestor of the integration branch.
+        Expected: recognize as already integrated without merging again.
+        """
+        s1 = Subtask(subtask_id="sub-already", title="Already Merged", status=SubtaskStatus.PENDING)
+        task = _make_test_task("task-already", TaskPlan(objective="Already Integrated", subtasks=[s1]))
+        self.storage.save_task(task)
+
+        integration_branch = f"agent-task/{task.task_id}"
+        self.git.ensure_branch(integration_branch)
+
+        session = self.worktree_manager.create_worktree(task.task_id, s1.subtask_id)
+        wt_path = Path(session.worktree_path)
+        (wt_path / "already.py").write_text("x = 1\n", encoding="utf-8")
+        wt_git = GitIntegration(wt_path)
+        wt_git.add(["already.py"])
+        wt_git.commit("already merged work")
+
+        # Merge into integration branch
+        self.git.checkout(integration_branch)
+        self.git.merge_branch(session.branch_name, message="merge already")
+
+        # Subtask is still PENDING in checkpoint
+        s1.worktree_session = session
+        self.storage.save_task(task)
+
+        reconciled_task, report = self.coordinator.reconcile_dag_state(task)
+        self.assertEqual(s1.status, SubtaskStatus.COMPLETED)
+        self.assertIsNotNone(s1.integration_commit)
+        self.assertIn("subtask_sub-already_already_integrated", report["actions"])
+
+    def test_multi_tier_dag_completes_in_single_resume_call(self):
+        """
+        P1-1: Diamond DAG A→B,C→D must complete all tiers in a single
+        reconcile_and_resume call (the while-loop fix).
+        """
+        sa = Subtask(subtask_id="sa", title="Root A", status=SubtaskStatus.COMPLETED, integration_commit="commit-a")
+        sb = Subtask(subtask_id="sb", title="Branch B", dependencies=["sa"], status=SubtaskStatus.PENDING)
+        sc = Subtask(subtask_id="sc", title="Branch C", dependencies=["sa"], status=SubtaskStatus.PENDING)
+        sd = Subtask(subtask_id="sd", title="Join D", dependencies=["sb", "sc"], status=SubtaskStatus.PENDING)
+
+        task = _make_test_task("task-multi-tier", TaskPlan(objective="Multi-tier", subtasks=[sa, sb, sc, sd]))
+        self.storage.save_task(task)
+
+        call_count = [0]
+
+        with patch.object(self.coordinator, "execute_parallel_batch") as mock_exec, \
+             patch.object(self.coordinator, "integrate_branches") as mock_merge, \
+             patch.object(self.coordinator, "verify_integration", return_value=True):
+
+            def side_effect_exec(task_obj, batch, **kwargs):
+                call_count[0] += 1
+                results = []
+                for s in batch:
+                    s_done = Subtask(subtask_id=s.subtask_id, status=SubtaskStatus.COMPLETED, integration_commit=f"commit-{s.subtask_id}")
+                    results.append((s_done, MagicMock(completed=True), None))
+                return results
+
+            def side_effect_merge(task_obj, subtasks, branch):
+                for s in subtasks:
+                    s.integration_commit = f"commit-{s.subtask_id}"
+                return (subtasks, [])
+
+            mock_exec.side_effect = side_effect_exec
+            mock_merge.side_effect = side_effect_merge
+
+            result = self.coordinator.reconcile_and_resume(task)
+
+            # Must have completed ALL subtasks including D
+            self.assertEqual(result.status, TaskStatus.COMPLETED)
+            # execute_parallel_batch must be called at least twice:
+            # once for [B,C] and once for [D]
+            self.assertGreaterEqual(mock_exec.call_count, 2)
 
 
 if __name__ == "__main__":

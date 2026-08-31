@@ -637,15 +637,16 @@ class ParallelExecutionCoordinator:
         )
 
         self.storage.save_checkpoint(checkpoint)
+        # Update the canonical task's checkpoint pointer without overwriting
+        # other fields that may have changed since we loaded our copy.
         with self.task_lock:
             try:
                 canonical = self.storage.load_task(task.task_id)
                 canonical.latest_checkpoint_id = checkpoint_id
                 self.storage.save_task(canonical)
-                task.latest_checkpoint_id = checkpoint_id
             except Exception:
-                task.latest_checkpoint_id = checkpoint_id
-                self.storage.save_task(task)
+                LOGGER.warning("Could not update canonical task %s checkpoint pointer.", task.task_id)
+        task.latest_checkpoint_id = checkpoint_id
         return checkpoint
 
     def reconcile_dag_state(self, task: Task) -> tuple[Task, dict[str, Any]]:
@@ -669,11 +670,20 @@ class ParallelExecutionCoordinator:
         integration_branch = getattr(task, "integration_branch", None) or f"agent-task/{task.task_id}"
         integration_head = self.git.get_branch_commit(integration_branch)
 
-        # 1. Detect and safely abort stray agent merges in the main repo
-        if self.git.is_merge_in_progress():
-            LOGGER.warning("Active merge in progress detected during DAG reconciliation. Aborting.")
+        # 1. Detect and safely abort stray agent merges — but only on our
+        # integration branch.  If the user has a merge in progress on an
+        # unrelated branch we must NOT touch it.
+        current_branch = self.git._run("rev-parse", "--abbrev-ref", "HEAD")
+        if self.git.is_merge_in_progress() and current_branch == integration_branch:
+            LOGGER.warning("Active DungX merge in progress on %s. Aborting.", integration_branch)
             self.git.merge_abort()
             report["actions"].append("aborted_active_merge")
+        elif self.git.is_merge_in_progress():
+            LOGGER.info(
+                "Active merge detected on branch %s (not DungX integration branch %s); leaving untouched.",
+                current_branch, integration_branch,
+            )
+            report["actions"].append("skipped_foreign_active_merge")
 
         # 2. Inspect each subtask
         for subtask in task.plan.subtasks:
@@ -712,22 +722,37 @@ class ParallelExecutionCoordinator:
             if worktree_path.exists():
                 wt_git = GitIntegration(worktree_path)
                 if wt_git.is_repository() and wt_git.is_dirty():
-                    wt_git.add(["."])
-                    commit_msg = f"feat({subtask.subtask_id}): {subtask.title} (recovered)"
-                    if wt_git.commit(commit_msg):
-                        recovered_sha = wt_git.get_head_commit()
-                        subtask.status = SubtaskStatus.COMPLETED
-                        if not subtask.worktree_session:
-                            subtask.worktree_session = WorktreeSession(
-                                session_id=f"wt-recov-{subtask.subtask_id}",
-                                subtask_id=subtask.subtask_id,
-                                worktree_path=str(worktree_path),
-                                branch_name=sub_branch,
-                                base_commit=base_commit,
-                                status="active",
-                            )
-                        report["actions"].append(f"subtask_{subtask.subtask_id}_dirty_worktree_committed")
-                        continue
+                    # Safety: Only stage tracked files (git add -u), never untracked.
+                    # This prevents recovery from silently committing arbitrary
+                    # user-owned or foreign files as a DungX worker result.
+                    # Protected files must never be auto-committed.
+                    protected = {"tool_engine.py", "approval.py"}
+                    dirty_output = wt_git._run("diff", "--name-only")
+                    dirty_files = [f.strip() for f in dirty_output.splitlines() if f.strip()] if dirty_output else []
+                    has_protected = any(Path(f).name in protected for f in dirty_files)
+                    if has_protected:
+                        LOGGER.warning(
+                            "Dirty worktree %s contains protected files; refusing auto-commit during recovery.",
+                            worktree_path,
+                        )
+                        report["actions"].append(f"subtask_{subtask.subtask_id}_dirty_worktree_protected_files_refused")
+                    elif dirty_files:
+                        wt_git.add(dirty_files)  # Only tracked modified files, never untracked
+                        commit_msg = f"feat({subtask.subtask_id}): {subtask.title} (recovered)"
+                        if wt_git.commit(commit_msg):
+                            recovered_sha = wt_git.get_head_commit()
+                            subtask.status = SubtaskStatus.COMPLETED
+                            if not subtask.worktree_session:
+                                subtask.worktree_session = WorktreeSession(
+                                    session_id=f"wt-recov-{subtask.subtask_id}",
+                                    subtask_id=subtask.subtask_id,
+                                    worktree_path=str(worktree_path),
+                                    branch_name=sub_branch,
+                                    base_commit=base_commit,
+                                    status="active",
+                                )
+                            report["actions"].append(f"subtask_{subtask.subtask_id}_dirty_worktree_committed")
+                            continue
 
                 # Case B: Incomplete running worker without commits or changes -> reset to PENDING
                 if subtask.status == SubtaskStatus.RUNNING:
@@ -794,10 +819,15 @@ class ParallelExecutionCoordinator:
                     f"Tier-2 integration verification {'passed' if v_ok else 'failed'}",
                 )
 
-        # Step 2: Execute runnable parallel batches
-        task = self.storage.load_task(task.task_id)
-        runnable_subtasks = self.identify_runnable_subtasks(task)
-        if runnable_subtasks:
+        # Step 2: Loop executing runnable parallel batches until no more are ready.
+        # This is essential for multi-tier DAGs (e.g. A→B,C→D) where completing
+        # tier-1 subtasks unlocks tier-2 subtasks in the same call.
+        while True:
+            task = self.storage.load_task(task.task_id)
+            runnable_subtasks = self.identify_runnable_subtasks(task)
+            if not runnable_subtasks:
+                break
+
             emit(f"Found {len(runnable_subtasks)} ready subtask(s) to execute.")
             predicted_map = self.predict_file_conflicts(runnable_subtasks)
             batches = self.partition_parallel_batches(
@@ -833,20 +863,22 @@ class ParallelExecutionCoordinator:
                         f"Integrating batch of {len(completed_in_batch)} completed subtasks",
                     )
                     merged, failed = self.integrate_branches(task, completed_in_batch, integration_branch)
-                    if not self.verify_integration(task, merged):
-                        emit("Tier-2 integration validation failed; halting further integration.")
-                        for subtask in merged:
-                            subtask.status = SubtaskStatus.PAUSED
-                        self.persist_integration_state(task.task_id, [], merged + failed)
-                        self.create_dag_checkpoint(task, DAGExecutionStage.FAILED, "Tier-2 integration verification failed")
-                        return self.storage.load_task(task.task_id)
+                    # Persist integration state BEFORE verification so a crash
+                    # during verification does not lose merge records.
                     self.persist_integration_state(task.task_id, merged, failed)
-                    task = self.storage.load_task(task.task_id)
-                    self.create_dag_checkpoint(
-                        task,
-                        DAGExecutionStage.TIER2_VERIFIED,
-                        "Tier-2 integration verification passed for batch",
-                    )
+                    if merged:
+                        v_ok = self.verify_integration(task, merged)
+                        self.create_dag_checkpoint(
+                            task,
+                            DAGExecutionStage.TIER2_VERIFIED if v_ok else DAGExecutionStage.FAILED,
+                            f"Tier-2 verification {'passed' if v_ok else 'failed'} for batch",
+                        )
+                        if not v_ok:
+                            emit("Tier-2 integration validation failed; halting.")
+                            for subtask in merged:
+                                subtask.status = SubtaskStatus.PAUSED
+                            self.persist_integration_state(task.task_id, [], merged + failed)
+                            return self.storage.load_task(task.task_id)
 
         # Step 3: Finalize task status
         task = self.storage.load_task(task.task_id)
@@ -855,14 +887,14 @@ class ParallelExecutionCoordinator:
             all_done = all(s.status == SubtaskStatus.COMPLETED and getattr(s, "integration_commit", None) for s in active_subtasks)
             if all_done and active_subtasks:
                 task.status = TaskStatus.COMPLETED
-                with self.task_lock:
-                    self.storage.save_task(task)
                 self.create_dag_checkpoint(task, DAGExecutionStage.COMPLETED, "DAG execution completed and verified")
             elif any(s.status == SubtaskStatus.FAILED for s in active_subtasks):
                 task.status = TaskStatus.FAILED
-                with self.task_lock:
-                    self.storage.save_task(task)
                 self.create_dag_checkpoint(task, DAGExecutionStage.FAILED, "DAG execution failed")
 
-        return self.storage.load_task(task.task_id)
+        with self.task_lock:
+            self.storage.save_task(task)
+
+        return task
+
 
