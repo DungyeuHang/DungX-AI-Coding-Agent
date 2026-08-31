@@ -37,6 +37,60 @@ from .worktree import WorktreeManager
 LOGGER = logging.getLogger(__name__)
 
 
+class _WorkerScopedStorage:
+    """
+    Storage facade handed to a worker Orchestrator running inside an isolated
+    worktree.
+
+    Two Phase 4.14 invariants depend on this indirection:
+
+    * **No lost updates.** Concurrent workers each run a full
+      read-modify-write cycle over the *same* task record. Letting both write
+      the shared task file means the slower writer silently erases the faster
+      writer's completed subtask. Writes to the worker's own task are therefore
+      buffered in memory; the coordinator merges only that worker's subtask
+      back into the canonical record, under a lock, once the worker returns.
+    * **No premature knowledge promotion.** A worker's findings are
+      branch-local evidence until its branch has been merged and the
+      integrated tree has passed Tier-2 validation. Knowledge-graph writes are
+      buffered here and discarded; ``verify_integration`` performs the
+      authoritative promotion after integration succeeds.
+    """
+
+    def __init__(self, inner: TaskStorage, task: Task):
+        self._inner = inner
+        self._task_id = task.task_id
+        self._task = task
+        self._graph: Any = None
+
+    @property
+    def buffered_task(self) -> Task:
+        return self._task
+
+    def save_task(self, task: Task) -> None:
+        if getattr(task, "task_id", None) == self._task_id:
+            self._task = task
+            return
+        self._inner.save_task(task)
+
+    def load_task(self, task_id: str) -> Task:
+        if task_id == self._task_id:
+            return self._task
+        return self._inner.load_task(task_id)
+
+    def save_knowledge_graph(self, graph: Any) -> None:
+        # Branch-local only: deliberately not forwarded to the shared store.
+        self._graph = graph
+
+    def load_knowledge_graph(self) -> Any:
+        if self._graph is not None:
+            return self._graph
+        return self._inner.load_knowledge_graph()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 class ParallelExecutionCoordinator:
     """
     Coordinates bounded parallel DAG subtask execution in isolated Git worktrees,
@@ -58,30 +112,33 @@ class ParallelExecutionCoordinator:
         self.scheduler = scheduler
         self.repo_lock = repo_lock or threading.Lock()
         self.memory_lock = memory_lock or threading.Lock()
+        # Serialises merge-back of worker results into the canonical task record.
+        self.task_lock = threading.Lock()
         self.git = GitIntegration(base_config.project)
         self.worktree_manager = worktree_manager or WorktreeManager(base_config.project, self.git)
         self.max_workers = max(1, min(getattr(base_config, "max_parallel_subtasks", 1), 4))
         self.impact_analyzer = ChangeImpactAnalyzer(base_config.project)
 
-    def identify_runnable_subtasks(self, task: Task) -> list[Subtask]:
-        """
-        Identifies all active subtasks whose dependencies are completed in the DAG.
-        Returns a deterministically sorted list of runnable subtasks.
-        """
+    def _active_subtasks(self, task: Task) -> list[Subtask]:
         if not task.plan:
             return []
-
-        active_subtasks = getattr(task.plan, "active_subtasks", [
+        return getattr(task.plan, "active_subtasks", [
             s for s in task.plan.subtasks
             if s.status not in {SubtaskStatus.SUPERSEDED, SubtaskStatus.PRUNED}
         ])
-        if not active_subtasks:
-            return []
 
-        completed_ids = {s.subtask_id for s in active_subtasks if s.status == SubtaskStatus.COMPLETED}
+    def dag_order_keys(self, task: Task) -> dict[str, tuple]:
+        """
+        Deterministic ordering key per subtask id: (topological depth, declared
+        creation timestamp, subtask id).
+
+        Every component is a property of the *plan* - its shape and its task
+        identities - so the same DAG always yields the same order regardless of
+        how long any worker took. This is the single source of ordering truth
+        for both readiness dispatch and branch integration.
+        """
+        active_subtasks = self._active_subtasks(task)
         active_map = {s.subtask_id: s for s in active_subtasks}
-
-        # Calculate topological depth for deterministic tie-breaking
         depth_memo: dict[str, int] = {}
 
         def _get_depth(sub_id: str, visiting: set[str]) -> int:
@@ -99,14 +156,32 @@ class ParallelExecutionCoordinator:
             depth_memo[sub_id] = depth
             return depth
 
+        epoch = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        keys: dict[str, tuple] = {}
         for sub in active_subtasks:
-            _get_depth(sub.subtask_id, set())
+            depth = _get_depth(sub.subtask_id, set())
+            keys[sub.subtask_id] = (depth, sub.created_at or epoch, sub.subtask_id)
+        return keys
 
-        def _sort_key(s: Subtask):
-            created_ts = s.created_at or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-            return (depth_memo.get(s.subtask_id, 0), created_ts, s.subtask_id)
+    def identify_runnable_subtasks(self, task: Task) -> list[Subtask]:
+        """
+        Identifies all active subtasks whose dependencies are completed in the DAG.
+        Returns a deterministically sorted list of runnable subtasks.
+        """
+        if not task.plan:
+            return []
 
-        sorted_subtasks = sorted(active_subtasks, key=_sort_key)
+        active_subtasks = self._active_subtasks(task)
+        if not active_subtasks:
+            return []
+
+        completed_ids = {s.subtask_id for s in active_subtasks if s.status == SubtaskStatus.COMPLETED}
+        order_keys = self.dag_order_keys(task)
+        epoch = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        sorted_subtasks = sorted(
+            active_subtasks,
+            key=lambda s: order_keys.get(s.subtask_id, (0, epoch, s.subtask_id)),
+        )
         runnable: list[Subtask] = []
         for subtask in sorted_subtasks:
             if subtask.status in {SubtaskStatus.PENDING, SubtaskStatus.PAUSED}:
@@ -225,10 +300,16 @@ class ParallelExecutionCoordinator:
                 knowledge_graph_enabled=self.base_config.knowledge_graph_enabled,
             )
 
+            # Each worker mutates its own private copy of the task record. The
+            # shared Task object and the shared task file are never touched by
+            # worker threads, so two workers cannot clobber one another.
+            worker_task = Task.from_dict(task.to_dict())
+            worker_storage = _WorkerScopedStorage(self.storage, worker_task)
+
             # Instantiate worker orchestrator
             worker_orchestrator = Orchestrator(
                 worktree_config,
-                self.storage,
+                worker_storage,
                 self.scheduler,
                 self.repo_lock,
                 self.memory_lock,
@@ -236,17 +317,20 @@ class ParallelExecutionCoordinator:
 
             # Execute full lifecycle inside worktree
             report = worker_orchestrator.run(
-                task=task,
+                task=worker_task,
                 subtask_id=subtask.subtask_id,
                 progress=progress,
             )
 
-            # Check if subtask completed successfully in the worker
-            updated_task = self.storage.load_task(task.task_id)
+            # Read the worker's own view of its subtask, then merge exactly that
+            # subtask back into the canonical record under a lock.
+            updated_task = worker_storage.buffered_task
             updated_sub = next(
                 (s for s in (updated_task.plan.subtasks if updated_task.plan else []) if s.subtask_id == subtask.subtask_id),
                 subtask,
             )
+            updated_sub.worktree_session = session
+            self._merge_subtask_into_canonical_task(task.task_id, updated_sub)
 
             # Commit worktree changes to subtask branch if modified
             worktree_git = GitIntegration(session.worktree_path)
@@ -261,6 +345,76 @@ class ParallelExecutionCoordinator:
             LOGGER.exception("Worker execution failed for subtask %s: %s", subtask.subtask_id, exc)
             subtask.status = SubtaskStatus.FAILED
             return subtask, None, exc
+
+    def _merge_subtask_into_canonical_task(self, task_id: str, updated_sub: Subtask) -> None:
+        """
+        Copies one worker's subtask result into the stored task record.
+
+        Held under ``task_lock`` so that concurrent workers serialise their
+        read-modify-write cycles instead of overwriting each other. Only the
+        worker's own subtask is copied - never the whole task - so a worker can
+        never revert a sibling's progress.
+        """
+        with self.task_lock:
+            try:
+                canonical = self.storage.load_task(task_id)
+            except Exception:
+                return
+            if canonical is None or not getattr(canonical, "plan", None):
+                return
+            for index, existing in enumerate(canonical.plan.subtasks):
+                if existing.subtask_id == updated_sub.subtask_id:
+                    canonical.plan.subtasks[index] = updated_sub
+                    break
+            else:
+                return
+            canonical.updated_at = datetime.datetime.now(datetime.timezone.utc)
+            try:
+                self.storage.save_task(canonical)
+            except Exception:
+                LOGGER.exception("Failed to persist worker result for %s", updated_sub.subtask_id)
+
+    def persist_integration_state(
+        self,
+        task_id: str,
+        merged: list[Subtask],
+        failed: list[Subtask],
+    ) -> None:
+        """
+        Durably records the outcome of an integration pass.
+
+        Without this, a merge conflict leaves the subtask marked COMPLETED on
+        disk while its branch was never merged - the task would then be reported
+        as finished and the work silently lost. Persisting both outcomes is what
+        makes resume able to tell integrated work from work still owed.
+        """
+        by_id = {s.subtask_id: s for s in merged}
+        by_id.update({s.subtask_id: s for s in failed})
+        if not by_id:
+            return
+        with self.task_lock:
+            try:
+                canonical = self.storage.load_task(task_id)
+            except Exception:
+                return
+            if canonical is None or not getattr(canonical, "plan", None):
+                return
+            changed = False
+            for existing in canonical.plan.subtasks:
+                source = by_id.get(existing.subtask_id)
+                if source is None:
+                    continue
+                existing.status = source.status
+                existing.integration_commit = source.integration_commit
+                if source.worktree_session is not None:
+                    existing.worktree_session = source.worktree_session
+                changed = True
+            if changed:
+                canonical.updated_at = datetime.datetime.now(datetime.timezone.utc)
+                try:
+                    self.storage.save_task(canonical)
+                except Exception:
+                    LOGGER.exception("Failed to persist integration state for task %s", task_id)
 
     def execute_parallel_batch(
         self,
@@ -317,18 +471,30 @@ class ParallelExecutionCoordinator:
         failed: list[Subtask] = []
 
         if not self.git.is_repository():
-            # In non-git environment, treat as merged directly
-            return completed_subtasks, []
+            # Nothing was branched, so nothing can be integrated. Reporting these
+            # as merged would be a false success.
+            LOGGER.warning(
+                "Refusing to integrate in a non-Git workspace; no branches exist to merge."
+            )
+            return [], list(completed_subtasks)
 
-        # Checkout integration branch
-        self.git.checkout(integration_branch)
+        # Move HEAD onto the integration branch, creating it if needed. If this
+        # fails we must NOT merge, or subtask branches land on whatever branch
+        # the user happened to have checked out.
+        if not self.git.ensure_branch(integration_branch):
+            LOGGER.error(
+                "Could not check out integration branch %s; aborting integration.",
+                integration_branch,
+            )
+            return [], list(completed_subtasks)
 
-        # Deterministic sort: (completed_at, subtask_id)
-        def _merge_sort_key(s: Subtask):
-            ts = s.completed_at or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-            return (ts, s.subtask_id)
-
-        sorted_subtasks = sorted(completed_subtasks, key=_merge_sort_key)
+        # Deterministic order derived from the DAG, never from worker timing.
+        order_keys = self.dag_order_keys(task)
+        epoch = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        sorted_subtasks = sorted(
+            completed_subtasks,
+            key=lambda s: order_keys.get(s.subtask_id, (0, epoch, s.subtask_id)),
+        )
 
         for subtask in sorted_subtasks:
             if not subtask.worktree_session or not subtask.worktree_session.branch_name:

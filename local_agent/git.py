@@ -149,6 +149,29 @@ class GitIntegration:
         """Checks out a branch, tag, or commit."""
         return self._run_for_exit_code("checkout", target) == 0
 
+    def branch_exists(self, branch_name: str) -> bool:
+        """Returns True when the named local branch resolves to a commit."""
+        if not branch_name:
+            return False
+        return self._run_for_exit_code(
+            "rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"
+        ) == 0
+
+    def ensure_branch(self, branch_name: str, start_point: str = "HEAD") -> bool:
+        """
+        Checks out ``branch_name``, creating it from ``start_point`` when it does
+        not yet exist. Returns True only when HEAD ends up on that branch.
+
+        Phase 4.14 integration depends on this: subtask branches must be merged
+        into a dedicated integration branch, never into whichever branch the
+        user happened to have checked out.
+        """
+        if not branch_name:
+            return False
+        if self.branch_exists(branch_name):
+            return self.checkout(branch_name)
+        return self._run_for_exit_code("checkout", "-b", branch_name, start_point) == 0
+
     def get_remote_url(self, remote_name: str) -> str | None:
         return self._run("config", "--get", f"remote.{remote_name}.url")
 

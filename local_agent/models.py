@@ -2042,6 +2042,10 @@ class Task:
     outcome: str = ""
     next_retry_at: datetime.datetime | None = None # Added for Phase 3.10
     assigned_to: str | None = None # Added for Phase 3.10
+    # Phase 4.14: branch that parallel subtask branches are integrated onto.
+    # Persisted so a resumed run rejoins the same integration branch instead of
+    # merging onto whatever branch happens to be checked out.
+    integration_branch: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -2075,6 +2079,7 @@ class Task:
         data["provider_execution_history"] = [ProviderMetric.from_dict(metric_data) for metric_data in data.get("provider_execution_history", [])]
         if data.get("next_retry_at"):
             data["next_retry_at"] = datetime.datetime.fromisoformat(data["next_retry_at"])
+        data.setdefault("integration_branch", None)
         return cls(**data)
 
     @property

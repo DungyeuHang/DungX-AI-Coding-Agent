@@ -197,7 +197,19 @@ class Scheduler:
             return
 
         # Phase 4.14: Parallel Worktree DAG Execution when enabled
-        if getattr(self.base_config, "parallel_worktree_execution", False):
+        # Parallel execution relies on Git worktrees for isolation. Without a
+        # repository there is no isolation and no way to integrate results, so
+        # fall through to the serial path rather than run workers against a
+        # shared directory.
+        parallel_enabled = getattr(self.base_config, "parallel_worktree_execution", False)
+        if parallel_enabled and not self.coordinator.git.is_repository():
+            emit(
+                "Parallel worktree execution requested but the workspace is not a Git "
+                "repository; falling back to serial execution."
+            )
+            parallel_enabled = False
+
+        if parallel_enabled:
             runnable_subtasks = self._find_runnable_subtasks(runnable_task)
             if not runnable_subtasks:
                 self._check_and_complete_task(runnable_task)
@@ -218,8 +230,14 @@ class Scheduler:
                         serialize_overlapping=getattr(self.base_config, "serialize_overlapping_subtasks", True),
                     )
                     integration_branch = getattr(runnable_task, "integration_branch", None) or f"agent-task/{runnable_task.task_id}"
-                    if self.coordinator.git.is_repository() and not self.coordinator.git.branch():
-                        self.coordinator.git.create_branch(integration_branch)
+                    # Subtask branches must never be merged into whichever branch
+                    # the user has checked out; stage them on a dedicated
+                    # integration branch and record it for recovery.
+                    if not self.coordinator.git.ensure_branch(integration_branch):
+                        emit(f"Could not establish integration branch {integration_branch}; aborting parallel run.")
+                        return
+                    runnable_task.integration_branch = integration_branch
+                    self.storage.save_task(runnable_task)
 
                     for batch in batches:
                         emit(f"Executing parallel batch of {len(batch)} subtask(s)...")
@@ -227,7 +245,13 @@ class Scheduler:
                         completed_in_batch = [s for s, rep, err in results if s.status == SubtaskStatus.COMPLETED or (rep and getattr(rep, "completed", False))]
                         if completed_in_batch:
                             merged, failed = self.coordinator.integrate_branches(runnable_task, completed_in_batch, integration_branch)
-                            self.coordinator.verify_integration(runnable_task, merged)
+                            if not self.coordinator.verify_integration(runnable_task, merged):
+                                emit("Tier-2 integration validation failed; halting further integration.")
+                                for subtask in merged:
+                                    subtask.status = SubtaskStatus.PAUSED
+                                self.coordinator.persist_integration_state(runnable_task.task_id, [], merged + failed)
+                                return
+                            self.coordinator.persist_integration_state(runnable_task.task_id, merged, failed)
 
                     final_task = self.storage.load_task(runnable_task.task_id)
                     self._check_and_complete_task(final_task)
