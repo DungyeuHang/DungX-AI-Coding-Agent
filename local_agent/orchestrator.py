@@ -45,7 +45,6 @@ from .models import (
     DAGProposal,
     ExecutionResult,
     FailureAnalysis,
-    FileOperation,
     ImplementationResult,
     ImplementationTurn,
     MultiTurnExecutionReport,
@@ -334,7 +333,6 @@ class Orchestrator:
 
         # Phase 4.5: Autonomous Recovery State
         recovery_state = RecoveryState()
-        evidence_store = CompletionEvidenceStore(self.filesystem.root)
         current_diagnostic_evidence: list[ExecutionResult] = []
         executed_diagnostic_names_this_iteration: list[str] = []
         current_tool_history: list[tuple[ToolCall, ToolResult]] = []
@@ -370,9 +368,9 @@ class Orchestrator:
                         report.completion_assessment = CompletionAssessment.from_dict(raw_completion)
                     raw_evidence = checkpoint.completion_evidence
                     if raw_evidence and isinstance(raw_evidence, dict):
-                        evidence_store = CompletionEvidenceStore.from_dict(raw_evidence)
-                        invalidated = evidence_store.revalidate_against_disk(self.filesystem)
-                        report.completion_evidence = evidence_store.to_dict()
+                        store = CompletionEvidenceStore.from_dict(raw_evidence)
+                        invalidated = store.revalidate_against_disk(self.filesystem)
+                        report.completion_evidence = store.to_dict()
                         # If disk mutation occurred after checkpoint, re-evaluate readiness
                         if invalidated and report.completion_assessment:
                             decision_engine = CompletionDecisionEngine(self.filesystem)
@@ -381,7 +379,7 @@ class Orchestrator:
                                 task=task,
                                 subtask=current_subtask,
                                 plan=plan,
-                                evidence_store=evidence_store,
+                                evidence_store=store,
                                 applied_operations=[FileOperation(action="modify", path=p) for p in checkpoint.files_changed],
                                 current_diff=reconstructed_diff,
                                 last_review=report.review,
@@ -600,9 +598,7 @@ class Orchestrator:
                     reason=f"iteration {iteration} ({stage_name})",
                 )
                 with self.repo_lock: # Acquire lock for file system mutation
-                    applied_files = coding_agent.apply_prepared(prepared)
-                    report.changed_files.extend(applied_files)
-                evidence_store.invalidate_on_file_mutation(report.changed_files)
+                    report.changed_files.extend(coding_agent.apply_prepared(prepared))
                 self._lifecycle_advance(
                     LifecycleState.APPLIED, reason=f"iteration {iteration} applied"
                 )
@@ -666,22 +662,6 @@ class Orchestrator:
                     failed = next((result for result in full_executions if not result.succeeded), None)
                     broad_failed = failed is not None
                     broad_duration = sum(e.duration_seconds for e in full_executions)
-
-                for exec_res in executions:
-                    if exec_res.command:
-                        cmd_tokens = exec_res.command.split() if isinstance(exec_res.command, str) else list(exec_res.command)
-                        evidence_store.record(
-                            task_id=task.task_id,
-                            subtask_id=current_subtask.subtask_id if current_subtask else "main",
-                            turn_number=iteration,
-                            stage="testing",
-                            evidence_type=EvidenceType.TEST_EXECUTION,
-                            source="command_runner",
-                            target_paths=report.changed_files,
-                            command=cmd_tokens,
-                            exit_code=exec_res.exit_code,
-                            payload={"stdout": exec_res.stdout[:400], "stderr": exec_res.stderr[:400]},
-                        )
 
                 self._finalize_validation_decision(
                     report,
@@ -934,9 +914,31 @@ class Orchestrator:
                 if review.verdict == "APPROVED":
                     # Phase 4.19: Authoritative Completion Decision Enforcement
                     current_diff = coding_agent.diff() or self.git.diff()
+                    evidence_store = CompletionEvidenceStore(self.filesystem.root)
+                    if report.completion_evidence:
+                        try:
+                            evidence_store = CompletionEvidenceStore.from_dict(report.completion_evidence)
+                        except Exception:
+                            evidence_store = CompletionEvidenceStore(self.filesystem.root)
 
                     # Revalidate existing evidence against disk
                     evidence_store.revalidate_against_disk(self.filesystem)
+
+                    # Ensure all validation executions from this iteration are recorded as evidence
+                    for exec_res in report.executions:
+                        if exec_res.command:
+                            evidence_store.record(
+                                task_id=task.task_id,
+                                subtask_id=current_subtask.subtask_id if current_subtask else "main",
+                                turn_number=iteration,
+                                stage="testing",
+                                evidence_type=EvidenceType.TEST_EXECUTION,
+                                source="command_runner",
+                                target_paths=report.changed_files,
+                                command=exec_res.command.split() if isinstance(exec_res.command, str) else list(exec_res.command),
+                                exit_code=exec_res.exit_code,
+                                payload={"stdout": exec_res.stdout[:400], "stderr": exec_res.stderr[:400]},
+                            )
 
                     # Ensure all modified python files have syntax verification evidence
                     for p in report.changed_files:

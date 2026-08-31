@@ -493,7 +493,7 @@ class CompletionDecisionEngine:
         # ----------------------------------------------------------------------
         # Gate 2: Workspace Diff Non-Empty (when implementation required)
         # ----------------------------------------------------------------------
-        has_changes = bool(applied_operations or current_diff.strip())
+        has_changes = bool(applied_operations and current_diff.strip())
         no_changes_needed = (not applied_operations and not current_diff.strip() and last_review is not None and last_review.verdict == "APPROVED")
         diff_ev = [e.evidence_id for e in valid_entries if e.evidence_type == EvidenceType.DIFF_INSPECTION.value]
         gates.append(CompletionGateResult(
