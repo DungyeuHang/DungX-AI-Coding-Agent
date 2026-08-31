@@ -53,6 +53,12 @@ class TaskStorage(ABC):
     def load_checkpoint(self, checkpoint_id: str) -> Checkpoint:
         pass
 
+    def list_checkpoints_for_task(self, task_id: str) -> list[Checkpoint]:
+        return []
+
+    def load_latest_checkpoint(self, task_id: str) -> Checkpoint | None:
+        return None
+
     @abstractmethod
     def save_scheduler_state(self, state: SchedulerState) -> None:
         pass
@@ -159,11 +165,19 @@ class JsonFileStorage(TaskStorage):
         temp_path = path.with_suffix(".json.tmp")
         try:
             with temp_path.open("w", encoding="utf-8") as f:
-                                json.dump(data, f, indent=2, ensure_ascii=False, default=_to_jsonable)
+                json.dump(data, f, indent=2, ensure_ascii=False, default=_to_jsonable)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except (AttributeError, OSError):
+                    pass
             os.replace(temp_path, path)
         except Exception:
             if temp_path.exists():
-                temp_path.unlink()
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
             raise
 
     def save_task(self, task: Task) -> None:
@@ -203,6 +217,22 @@ class JsonFileStorage(TaskStorage):
             return Checkpoint.from_dict(data)
         except (json.JSONDecodeError, KeyError) as e:
             raise ValueError(f"Failed to load checkpoint {checkpoint_id} due to malformed data: {e}")
+
+    def list_checkpoints_for_task(self, task_id: str) -> list[Checkpoint]:
+        checkpoints: list[Checkpoint] = []
+        for cp_file in self.checkpoints_dir.glob("*.json"):
+            try:
+                cp = self.load_checkpoint(cp_file.stem)
+                if cp.task_id == task_id:
+                    checkpoints.append(cp)
+            except Exception:
+                pass
+        checkpoints.sort(key=lambda c: (c.timestamp, c.checkpoint_id))
+        return checkpoints
+
+    def load_latest_checkpoint(self, task_id: str) -> Checkpoint | None:
+        cps = self.list_checkpoints_for_task(task_id)
+        return cps[-1] if cps else None
 
     def save_scheduler_state(self, state: SchedulerState) -> None:
         self._atomic_write(self._scheduler_state_path(), state.to_dict())

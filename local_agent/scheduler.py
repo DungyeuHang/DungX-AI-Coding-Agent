@@ -210,56 +210,18 @@ class Scheduler:
             parallel_enabled = False
 
         if parallel_enabled:
-            runnable_subtasks = self._find_runnable_subtasks(runnable_task)
-            if not runnable_subtasks:
-                self._check_and_complete_task(runnable_task)
-                emit(f"No runnable subtasks for task {runnable_task.task_id}.")
+            runnable_task.status = TaskStatus.RUNNING
+            runnable_task.assigned_to = "scheduler"
+            self.storage.save_task(runnable_task)
+
+            try:
+                final_task = self.coordinator.reconcile_and_resume(runnable_task, progress=progress)
+                self._check_and_complete_task(final_task)
                 return
-
-            if len(runnable_subtasks) > 1:
-                emit(f"Parallel worktree execution enabled: {len(runnable_subtasks)} ready subtasks found.")
-                runnable_task.status = TaskStatus.RUNNING
-                runnable_task.assigned_to = "scheduler"
-                self.storage.save_task(runnable_task)
-
-                try:
-                    predicted_map = self.coordinator.predict_file_conflicts(runnable_subtasks)
-                    batches = self.coordinator.partition_parallel_batches(
-                        runnable_subtasks,
-                        predicted_map,
-                        serialize_overlapping=getattr(self.base_config, "serialize_overlapping_subtasks", True),
-                    )
-                    integration_branch = getattr(runnable_task, "integration_branch", None) or f"agent-task/{runnable_task.task_id}"
-                    # Subtask branches must never be merged into whichever branch
-                    # the user has checked out; stage them on a dedicated
-                    # integration branch and record it for recovery.
-                    if not self.coordinator.git.ensure_branch(integration_branch):
-                        emit(f"Could not establish integration branch {integration_branch}; aborting parallel run.")
-                        return
-                    runnable_task.integration_branch = integration_branch
-                    self.storage.save_task(runnable_task)
-
-                    for batch in batches:
-                        emit(f"Executing parallel batch of {len(batch)} subtask(s)...")
-                        results = self.coordinator.execute_parallel_batch(runnable_task, batch, progress=progress)
-                        completed_in_batch = [s for s, rep, err in results if s.status == SubtaskStatus.COMPLETED or (rep and getattr(rep, "completed", False))]
-                        if completed_in_batch:
-                            merged, failed = self.coordinator.integrate_branches(runnable_task, completed_in_batch, integration_branch)
-                            if not self.coordinator.verify_integration(runnable_task, merged):
-                                emit("Tier-2 integration validation failed; halting further integration.")
-                                for subtask in merged:
-                                    subtask.status = SubtaskStatus.PAUSED
-                                self.coordinator.persist_integration_state(runnable_task.task_id, [], merged + failed)
-                                return
-                            self.coordinator.persist_integration_state(runnable_task.task_id, merged, failed)
-
-                    final_task = self.storage.load_task(runnable_task.task_id)
-                    self._check_and_complete_task(final_task)
-                    return
-                finally:
-                    final_task = self.storage.load_task(runnable_task.task_id)
-                    final_task.assigned_to = None
-                    self.storage.save_task(final_task)
+            finally:
+                final_task = self.storage.load_task(runnable_task.task_id)
+                final_task.assigned_to = None
+                self.storage.save_task(final_task)
 
         # Phase 3.11: Find the next runnable subtask
         next_subtask = self._find_next_runnable_subtask(runnable_task)

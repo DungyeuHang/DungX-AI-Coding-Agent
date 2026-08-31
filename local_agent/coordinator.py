@@ -4,6 +4,7 @@ import concurrent.futures
 import datetime
 import logging
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,6 +16,7 @@ from .knowledge import KnowledgeGraphManager
 from .models import (
     ApprovalPolicy,
     Checkpoint,
+    DAGExecutionStage,
     ProjectContext,
     ProjectMemory,
     RunReport,
@@ -502,6 +504,17 @@ class ParallelExecutionCoordinator:
                 continue
 
             branch = subtask.worktree_session.branch_name
+            branch_commit = self.git.get_branch_commit(branch)
+
+            # Check if branch is already merged into HEAD / integration branch
+            if branch_commit and self.git.is_ancestor(branch_commit, "HEAD"):
+                subtask.integration_commit = self.git.get_head_commit()
+                if subtask.worktree_session:
+                    subtask.worktree_session.status = "merged"
+                merged.append(subtask)
+                LOGGER.info("Subtask branch %s is already an ancestor of %s; skipping duplicate merge.", branch, integration_branch)
+                continue
+
             merge_msg = f"merge({subtask.subtask_id}): {subtask.title}"
             success, output = self.git.merge_branch(branch, message=merge_msg)
 
@@ -566,3 +579,290 @@ class ParallelExecutionCoordinator:
                 self.worktree_manager.remove_worktree(subtask.worktree_session, force=True)
 
         return True
+
+    def create_dag_checkpoint(
+        self,
+        task: Task,
+        stage: DAGExecutionStage | str,
+        description: str,
+        *,
+        subtask_id: str = "",
+        integration_branch: str | None = None,
+        extra_context: dict[str, Any] | None = None,
+    ) -> Checkpoint:
+        """
+        Persists a durable, versioned DAG execution checkpoint at a critical state boundary.
+        """
+        checkpoint_id = f"cp-dag-{uuid.uuid4().hex[:12]}"
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stage_str = stage.value if isinstance(stage, DAGExecutionStage) else str(stage)
+
+        active_wts = []
+        subtask_states = {}
+        integrated_subs = []
+        if task.plan:
+            for s in task.plan.subtasks:
+                subtask_states[s.subtask_id] = s.status.value if isinstance(s.status, SubtaskStatus) else str(s.status)
+                if s.worktree_session and s.worktree_session.status == "active":
+                    active_wts.append(s.worktree_session.to_dict())
+                if getattr(s, "integration_commit", None):
+                    integrated_subs.append(s.subtask_id)
+
+        branch = integration_branch or getattr(task, "integration_branch", None) or f"agent-task/{task.task_id}"
+        head_commit = self.git.get_head_commit() if self.git.is_repository() else ""
+
+        checkpoint = Checkpoint(
+            checkpoint_id=checkpoint_id,
+            task_id=task.task_id,
+            subtask_id=subtask_id or (task.plan.subtasks[0].subtask_id if task.plan and task.plan.subtasks else ""),
+            timestamp=now,
+            current_state_description=description,
+            files_changed=[],
+            repository_diff="",
+            validation_state={},
+            last_provider_result=None,
+            next_recommended_action=f"stage:{stage_str}",
+            continuation_context=extra_context or {},
+            active_worktrees=active_wts,
+            integration_branch=branch,
+            schema_version="4.15.0",
+            dag_stage=stage_str,
+            subtask_states=subtask_states,
+            integrated_subtasks=integrated_subs,
+            verified_subtasks=list(getattr(task, "verified_subtasks", []) or []),
+            promoted_subtasks=list(getattr(task, "promoted_subtasks", []) or []),
+            cleaned_worktrees=list(getattr(task, "cleaned_worktrees", []) or []),
+            base_commit=head_commit,
+            integration_commit=head_commit if stage_str in {"integrated", "tier2_verified", "completed"} else None,
+        )
+
+        self.storage.save_checkpoint(checkpoint)
+        with self.task_lock:
+            try:
+                canonical = self.storage.load_task(task.task_id)
+                canonical.latest_checkpoint_id = checkpoint_id
+                self.storage.save_task(canonical)
+                task.latest_checkpoint_id = checkpoint_id
+            except Exception:
+                task.latest_checkpoint_id = checkpoint_id
+                self.storage.save_task(task)
+        return checkpoint
+
+    def reconcile_dag_state(self, task: Task) -> tuple[Task, dict[str, Any]]:
+        """
+        Inspects Git reality, branches, worktrees, and commit ancestry to reconcile
+        durable task state against disk.
+        """
+        report: dict[str, Any] = {
+            "task_id": task.task_id,
+            "reconciled_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "actions": [],
+        }
+
+        if not task.plan:
+            return task, report
+
+        if not self.git.is_repository():
+            # Non-git workspace fallback
+            return task, report
+
+        integration_branch = getattr(task, "integration_branch", None) or f"agent-task/{task.task_id}"
+        integration_head = self.git.get_branch_commit(integration_branch)
+
+        # 1. Detect and safely abort stray agent merges in the main repo
+        if self.git.is_merge_in_progress():
+            LOGGER.warning("Active merge in progress detected during DAG reconciliation. Aborting.")
+            self.git.merge_abort()
+            report["actions"].append("aborted_active_merge")
+
+        # 2. Inspect each subtask
+        for subtask in task.plan.subtasks:
+            sub_branch = self.worktree_manager.branch_name_for_subtask(task.task_id, subtask.subtask_id)
+            branch_commit = self.git.get_branch_commit(sub_branch)
+            worktree_path = self.worktree_manager.allocate_worktree_path(task.task_id, subtask.subtask_id)
+            base_commit = subtask.worktree_session.base_commit if subtask.worktree_session else (self.git.get_head_commit() or "HEAD")
+
+            # Case A/E/F: Check if branch is already merged into integration_branch
+            if integration_head and branch_commit and self.git.is_ancestor(branch_commit, integration_head):
+                subtask.status = SubtaskStatus.COMPLETED
+                subtask.integration_commit = integration_head
+                if subtask.worktree_session:
+                    subtask.worktree_session.status = "merged"
+                report["actions"].append(f"subtask_{subtask.subtask_id}_already_integrated")
+                continue
+
+            # Case C/D: Check if branch exists with a new worker commit ahead of base_commit
+            if branch_commit and branch_commit != base_commit:
+                commits_ahead = self.git.count_commits_between(base_commit, branch_commit)
+                if commits_ahead > 0:
+                    subtask.status = SubtaskStatus.COMPLETED
+                    if not subtask.worktree_session:
+                        subtask.worktree_session = WorktreeSession(
+                            session_id=f"wt-recov-{subtask.subtask_id}",
+                            subtask_id=subtask.subtask_id,
+                            worktree_path=str(worktree_path),
+                            branch_name=sub_branch,
+                            base_commit=base_commit,
+                            status="active",
+                        )
+                    report["actions"].append(f"subtask_{subtask.subtask_id}_worker_commit_recovered")
+                    continue
+
+            # Case C: Check if worktree directory exists and is dirty
+            if worktree_path.exists():
+                wt_git = GitIntegration(worktree_path)
+                if wt_git.is_repository() and wt_git.is_dirty():
+                    wt_git.add(["."])
+                    commit_msg = f"feat({subtask.subtask_id}): {subtask.title} (recovered)"
+                    if wt_git.commit(commit_msg):
+                        recovered_sha = wt_git.get_head_commit()
+                        subtask.status = SubtaskStatus.COMPLETED
+                        if not subtask.worktree_session:
+                            subtask.worktree_session = WorktreeSession(
+                                session_id=f"wt-recov-{subtask.subtask_id}",
+                                subtask_id=subtask.subtask_id,
+                                worktree_path=str(worktree_path),
+                                branch_name=sub_branch,
+                                base_commit=base_commit,
+                                status="active",
+                            )
+                        report["actions"].append(f"subtask_{subtask.subtask_id}_dirty_worktree_committed")
+                        continue
+
+                # Case B: Incomplete running worker without commits or changes -> reset to PENDING
+                if subtask.status == SubtaskStatus.RUNNING:
+                    self.worktree_manager.remove_worktree(worktree_path, force=True)
+                    subtask.status = SubtaskStatus.PENDING
+                    report["actions"].append(f"subtask_{subtask.subtask_id}_incomplete_worker_reset")
+                    continue
+
+            # Case A/B: Stale RUNNING marker without active worktree or branch
+            if subtask.status == SubtaskStatus.RUNNING:
+                subtask.status = SubtaskStatus.PENDING
+                report["actions"].append(f"subtask_{subtask.subtask_id}_stale_running_reset")
+
+        with self.task_lock:
+            self.storage.save_task(task)
+
+        return task, report
+
+    def reconcile_and_resume(
+        self,
+        task: Task,
+        progress: Callable[[str], None] | None = None,
+    ) -> Task:
+        """
+        Recovers and resumes a parallel DAG execution from durable checkpoint and Git state.
+        Executes ready subtasks concurrently in worktrees, checkpoints at every state boundary,
+        integrates branches deterministically, and validates Tier-2 integration.
+        """
+        def emit(msg: str) -> None:
+            if progress:
+                progress(msg)
+            LOGGER.info("[DAG Resume] %s", msg)
+
+        emit(f"Reconciling DAG execution state for task {task.task_id}...")
+        task, report = self.reconcile_dag_state(task)
+        integration_branch = getattr(task, "integration_branch", None) or f"agent-task/{task.task_id}"
+
+        if self.git.is_repository() and not self.git.branch_exists(integration_branch):
+            self.git.ensure_branch(integration_branch)
+
+        self.create_dag_checkpoint(
+            task,
+            DAGExecutionStage.READY,
+            "Reconciled DAG state from durable Git truth and checkpoints",
+            integration_branch=integration_branch,
+            extra_context={"reconciliation_report": report},
+        )
+
+        # Step 1: Check for any already-completed subtasks that need integration
+        completed_unmerged = [
+            s for s in (task.plan.subtasks if task.plan else [])
+            if s.status == SubtaskStatus.COMPLETED and not getattr(s, "integration_commit", None)
+        ]
+        if completed_unmerged:
+            emit(f"Integrating {len(completed_unmerged)} recovered completed subtask(s)...")
+            self.create_dag_checkpoint(task, DAGExecutionStage.INTEGRATING, "Integrating completed subtasks")
+            merged, failed = self.integrate_branches(task, completed_unmerged, integration_branch)
+            self.persist_integration_state(task.task_id, merged, failed)
+            if merged:
+                v_ok = self.verify_integration(task, merged)
+                self.create_dag_checkpoint(
+                    task,
+                    DAGExecutionStage.TIER2_VERIFIED if v_ok else DAGExecutionStage.FAILED,
+                    f"Tier-2 integration verification {'passed' if v_ok else 'failed'}",
+                )
+
+        # Step 2: Execute runnable parallel batches
+        task = self.storage.load_task(task.task_id)
+        runnable_subtasks = self.identify_runnable_subtasks(task)
+        if runnable_subtasks:
+            emit(f"Found {len(runnable_subtasks)} ready subtask(s) to execute.")
+            predicted_map = self.predict_file_conflicts(runnable_subtasks)
+            batches = self.partition_parallel_batches(
+                runnable_subtasks,
+                predicted_map,
+                serialize_overlapping=getattr(self.base_config, "serialize_overlapping_subtasks", True),
+            )
+
+            for batch in batches:
+                emit(f"Executing batch of {len(batch)} parallel subtask(s)...")
+                self.create_dag_checkpoint(
+                    task,
+                    DAGExecutionStage.RUNNING,
+                    f"Executing parallel batch of {len(batch)} subtasks: {[s.subtask_id for s in batch]}",
+                )
+                results = self.execute_parallel_batch(task, batch, progress=progress)
+
+                # Checkpoint after worker execution
+                self.create_dag_checkpoint(
+                    task,
+                    DAGExecutionStage.WORKER_COMMITTED,
+                    f"Completed worker execution for batch: {[s.subtask_id for s, _, _ in results]}",
+                )
+
+                completed_in_batch = [
+                    s for s, rep, err in results
+                    if s.status == SubtaskStatus.COMPLETED or (rep and getattr(rep, "completed", False))
+                ]
+                if completed_in_batch:
+                    self.create_dag_checkpoint(
+                        task,
+                        DAGExecutionStage.INTEGRATING,
+                        f"Integrating batch of {len(completed_in_batch)} completed subtasks",
+                    )
+                    merged, failed = self.integrate_branches(task, completed_in_batch, integration_branch)
+                    if not self.verify_integration(task, merged):
+                        emit("Tier-2 integration validation failed; halting further integration.")
+                        for subtask in merged:
+                            subtask.status = SubtaskStatus.PAUSED
+                        self.persist_integration_state(task.task_id, [], merged + failed)
+                        self.create_dag_checkpoint(task, DAGExecutionStage.FAILED, "Tier-2 integration verification failed")
+                        return self.storage.load_task(task.task_id)
+                    self.persist_integration_state(task.task_id, merged, failed)
+                    task = self.storage.load_task(task.task_id)
+                    self.create_dag_checkpoint(
+                        task,
+                        DAGExecutionStage.TIER2_VERIFIED,
+                        "Tier-2 integration verification passed for batch",
+                    )
+
+        # Step 3: Finalize task status
+        task = self.storage.load_task(task.task_id)
+        if task.plan:
+            active_subtasks = self._active_subtasks(task)
+            all_done = all(s.status == SubtaskStatus.COMPLETED and getattr(s, "integration_commit", None) for s in active_subtasks)
+            if all_done and active_subtasks:
+                task.status = TaskStatus.COMPLETED
+                with self.task_lock:
+                    self.storage.save_task(task)
+                self.create_dag_checkpoint(task, DAGExecutionStage.COMPLETED, "DAG execution completed and verified")
+            elif any(s.status == SubtaskStatus.FAILED for s in active_subtasks):
+                task.status = TaskStatus.FAILED
+                with self.task_lock:
+                    self.storage.save_task(task)
+                self.create_dag_checkpoint(task, DAGExecutionStage.FAILED, "DAG execution failed")
+
+        return self.storage.load_task(task.task_id)
+

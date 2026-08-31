@@ -764,6 +764,22 @@ class ValidationPlan:
             risk_level=data.get("risk_level", "low"),
         )
 
+class DAGExecutionStage(str, Enum):
+    INIT = "init"
+    PLANNED = "planned"
+    READY = "ready"
+    RUNNING = "running"
+    WORKER_COMMITTED = "worker_committed"
+    INTEGRATING = "integrating"
+    INTEGRATED = "integrated"
+    TIER2_VERIFIED = "tier2_verified"
+    KNOWLEDGE_PROMOTED = "knowledge_promoted"
+    CLEANED = "cleaned"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    RECOVERY_BLOCKED = "recovery_blocked"
+
+
 @dataclass
 class Checkpoint:
     checkpoint_id: str
@@ -779,18 +795,43 @@ class Checkpoint:
     continuation_context: dict[str, Any] = field(default_factory=dict)
     active_worktrees: list[dict[str, Any]] = field(default_factory=list)
     integration_branch: str | None = None
+    schema_version: str = "4.15.0"
+    dag_stage: str = "init"
+    subtask_states: dict[str, str] = field(default_factory=dict)
+    integrated_subtasks: list[str] = field(default_factory=list)
+    verified_subtasks: list[str] = field(default_factory=list)
+    promoted_subtasks: list[str] = field(default_factory=list)
+    cleaned_worktrees: list[str] = field(default_factory=list)
+    base_commit: str = ""
+    integration_commit: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        data["timestamp"] = self.timestamp.isoformat()
+        data["timestamp"] = self.timestamp.isoformat() if isinstance(self.timestamp, datetime.datetime) else str(self.timestamp)
         return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
         d = dict(data)
-        d["timestamp"] = datetime.datetime.fromisoformat(d["timestamp"]) if isinstance(d["timestamp"], str) else d["timestamp"]
+        raw_ts = d.get("timestamp")
+        if isinstance(raw_ts, str):
+            try:
+                d["timestamp"] = datetime.datetime.fromisoformat(raw_ts)
+            except Exception:
+                d["timestamp"] = datetime.datetime.now(datetime.timezone.utc)
+        elif not isinstance(raw_ts, datetime.datetime):
+            d["timestamp"] = datetime.datetime.now(datetime.timezone.utc)
         d.setdefault("active_worktrees", [])
         d.setdefault("integration_branch", None)
+        d.setdefault("schema_version", "4.15.0")
+        d.setdefault("dag_stage", "init")
+        d.setdefault("subtask_states", {})
+        d.setdefault("integrated_subtasks", [])
+        d.setdefault("verified_subtasks", [])
+        d.setdefault("promoted_subtasks", [])
+        d.setdefault("cleaned_worktrees", [])
+        d.setdefault("base_commit", "")
+        d.setdefault("integration_commit", None)
         return cls(**d)
 
 # Phase 4.10 / Phase 4.11: Cross-Subtask Semantic Contract & Behavioral Verification Models

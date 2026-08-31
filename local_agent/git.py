@@ -272,3 +272,34 @@ class GitIntegration:
             return result.returncode == 0, out
         except (OSError, subprocess.TimeoutExpired) as e:
             return False, str(e)
+
+    def is_ancestor(self, ancestor_ref: str, descendant_ref: str) -> bool:
+        """Returns True if ancestor_ref is an ancestor of descendant_ref in git commit graph."""
+        if not ancestor_ref or not descendant_ref:
+            return False
+        return self._run_for_exit_code("merge-base", "--is-ancestor", ancestor_ref, descendant_ref) == 0
+
+    def is_merge_in_progress(self) -> bool:
+        """Checks if a git merge is currently in progress (e.g. MERGE_HEAD exists)."""
+        merge_head = self.root / ".git" / "MERGE_HEAD"
+        if merge_head.exists():
+            return True
+        return self._run_for_exit_code("rev-parse", "-q", "--verify", "MERGE_HEAD") == 0
+
+    def get_branch_commit(self, branch_name: str) -> str | None:
+        """Returns the commit SHA of the named local branch, or None if not found."""
+        if not branch_name:
+            return None
+        sha = self._run("rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}")
+        return sha if sha else None
+
+    def count_commits_between(self, base_ref: str, target_ref: str) -> int:
+        """Counts the number of commits in target_ref that are not in base_ref."""
+        if not base_ref or not target_ref:
+            return 0
+        out = self._run("rev-list", "--count", f"{base_ref}..{target_ref}")
+        try:
+            return int(out.strip()) if out else 0
+        except ValueError:
+            return 0
+
