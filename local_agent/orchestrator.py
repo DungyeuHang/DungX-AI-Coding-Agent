@@ -1591,6 +1591,10 @@ class Orchestrator:
 
                 if report is not None:
                     report.multi_turn_report = multi_report
+                    if multi_report.completion_assessment is not None:
+                        report.completion_assessment = multi_report.completion_assessment
+                    if multi_report.completion_evidence:
+                        report.completion_evidence = multi_report.completion_evidence
                     if multi_report.tool_metrics:
                         report.tool_metrics.extend(multi_report.tool_metrics)
 

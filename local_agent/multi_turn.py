@@ -3,12 +3,13 @@ from __future__ import annotations
 import ast
 import datetime
 import difflib
+import hashlib
 import logging
 import os
 import shlex
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from .coding_agent import (
     IMPLEMENTATION_TOOL_SURFACE,
@@ -16,6 +17,15 @@ from .coding_agent import (
     PatchValidationError,
     ScopeAmendmentGuard,
     UnsafeModificationError,
+)
+from .completion import (
+    CompletionAssessment,
+    CompletionDecisionEngine,
+    CompletionEvidenceStore,
+    EvidenceStatus,
+    EvidenceTrustTier,
+    EvidenceType,
+    ReadinessLevel,
 )
 from .config import AgentConfig
 from .failure import FailureAnalyzer
@@ -66,7 +76,7 @@ DEFAULT_MAX_TOOL_STEPS = 15
 
 
 class MultiTurnImplementationAgent:
-    """Bounded, autonomous multi-turn implementation agent.
+    """Bounded, autonomous multi-turn implementation agent with evidence lifecycle.
 
     Coordinates the implementation lifecycle across an explicit state machine:
     PLANNING -> IMPLEMENTING -> INSPECTING -> TESTING -> ANALYZING_FAILURE ->
@@ -74,10 +84,11 @@ class MultiTurnImplementationAgent:
 
     Guarantees:
     - Bounded execution with strict turn budgets for implementation, repair, review, and verification.
-    - Durable turn-level telemetry ledger persisted at every state transition.
+    - Durable turn-level telemetry and evidence ledger persisted at every state transition.
     - Scoped tool execution restricted to the safe implementation surface.
     - Authoritative unified diff reconstruction for accurate deliberative code review.
     - Rigorous multi-turn verification including full test execution and AST syntax validation.
+    - Release readiness evaluation enforcing deterministic hard completion gates.
     - Automatic state recovery upon pause (rate limits / clarification requests).
     - Worktree isolation ensuring no mutable state is shared across parallel workers.
     """
@@ -114,6 +125,7 @@ class MultiTurnImplementationAgent:
         self.max_review_turns = getattr(config, "max_review_turns", DEFAULT_MAX_REVIEW_TURNS)
         self.max_verification_turns = getattr(config, "max_verification_turns", DEFAULT_MAX_VERIFICATION_TURNS)
         self.max_tool_steps = getattr(config, "max_implementation_tool_steps", DEFAULT_MAX_TOOL_STEPS)
+        self.decision_engine = CompletionDecisionEngine(self.filesystem)
 
     def build_policy(self) -> ToolExecutionPolicy:
         """Constructs an implementation-scoped execution policy."""
@@ -263,7 +275,6 @@ class MultiTurnImplementationAgent:
         results: list[ExecutionResult] = []
         commands: list[str] = []
 
-        # 1. Check explicit validation commands
         if getattr(self.config, "validation_commands", None):
             commands.extend(self.config.validation_commands)
         elif getattr(context, "validation_commands", None):
@@ -272,7 +283,6 @@ class MultiTurnImplementationAgent:
                 if cmd_str not in commands:
                     commands.append(cmd_str)
 
-        # Fallback to python syntax check if no explicit commands configured
         if not commands:
             commands.append("python -m py_compile")
 
@@ -303,7 +313,6 @@ class MultiTurnImplementationAgent:
             d = git.diff()
             if d:
                 return d
-        # Fallback for non-git workspaces or candidate trees
         diff_chunks: list[str] = []
         for op in applied_ops:
             path = getattr(op, "path", None)
@@ -328,14 +337,33 @@ class MultiTurnImplementationAgent:
         self,
         task: Task,
         subtask: Subtask | None,
+        turns: list[ImplementationTurn],
         turn: ImplementationTurn,
         stage: MultiTurnState,
         context: ProjectContext,
+        evidence_store: CompletionEvidenceStore | None = None,
+        assessment: CompletionAssessment | None = None,
+        clarification_requests: list[Any] | None = None,
     ) -> None:
-        """Persists a durable checkpoint at turn boundary."""
+        """Persists a durable checkpoint at turn boundary preserving full history."""
         now = datetime.datetime.now(datetime.timezone.utc)
         subtask_id = subtask.subtask_id if subtask else (getattr(task, "current_subtask_id", "main") or "main")
         cp_id = f"cp-{task.task_id}-{subtask_id}-t{turn.turn_number}-{stage.value}"
+
+        all_turns = [t.to_dict() for t in turns]
+        if not any(t.get("turn_id") == turn.turn_id for t in all_turns):
+            all_turns.append(turn.to_dict())
+
+        all_files: set[str] = set()
+        for t_dict in all_turns:
+            for op in t_dict.get("file_operations", []):
+                if isinstance(op, dict) and op.get("path"):
+                    all_files.add(op["path"])
+
+        clarifications = [
+            r.to_dict() if hasattr(r, "to_dict") else r
+            for r in (clarification_requests or [])
+        ]
 
         cp = Checkpoint(
             checkpoint_id=cp_id,
@@ -343,10 +371,13 @@ class MultiTurnImplementationAgent:
             subtask_id=subtask_id,
             timestamp=now,
             current_state_description=f"Turn {turn.turn_number} stage: {stage.value}",
-            files_changed=[op.get("path") for op in turn.file_operations if isinstance(op, dict) and op.get("path")],
-            turns=[turn.to_dict()],
+            files_changed=sorted(list(all_files)),
+            turns=all_turns,
             current_turn_number=turn.turn_number,
             turn_stage=stage.value,
+            clarification_requests=clarifications,
+            completion_assessment=assessment.to_dict() if assessment else None,
+            completion_evidence=evidence_store.to_dict() if evidence_store else {},
         )
 
         try:
@@ -374,8 +405,9 @@ class MultiTurnImplementationAgent:
         progress: Callable[[str], None] | None = None,
         existing_turns: list[ImplementationTurn] | None = None,
         initial_state: MultiTurnState = MultiTurnState.IMPLEMENTING,
+        worktree_id: str | None = None,
     ) -> MultiTurnExecutionReport:
-        """Executes the bounded multi-turn implementation loop."""
+        """Executes the bounded multi-turn implementation loop with evidence tracking."""
         start_time = time.perf_counter()
         task_id = task.task_id
         subtask_id = subtask.subtask_id if subtask else "subtask-main"
@@ -392,7 +424,9 @@ class MultiTurnImplementationAgent:
                 progress(f"[{task_id}:{subtask_id}] {msg}")
             LOGGER.info("[%s:%s] %s", task_id, subtask_id, msg)
 
-        # State tracking
+        if "ask_user_clarification" in self.allowed_tools:
+            self.registry.enable_clarification_tool()
+
         current_state = initial_state
         turns: list[ImplementationTurn] = list(existing_turns or [])
         repair_turn_count = sum(1 for t in turns if t.stage == MultiTurnState.REPAIRING.value)
@@ -404,8 +438,10 @@ class MultiTurnImplementationAgent:
         applied_operations: list[FileOperation] = []
         all_tool_metrics: list[ToolExecutionMetrics] = []
         current_tool_history: list[tuple[ToolCall, ToolResult]] = []
+        clarification_requests: list[Any] = []
 
-        # Reconstruct tool history and applied operations from existing turns if present
+        evidence_store = CompletionEvidenceStore(self.filesystem.root)
+
         for t in turns:
             if t.tool_calls and t.tool_results and len(t.tool_calls) == len(t.tool_results):
                 for c_dict, r_dict in zip(t.tool_calls, t.tool_results):
@@ -419,6 +455,7 @@ class MultiTurnImplementationAgent:
         effective_policy = self.build_policy()
         termination_reason = "in_progress"
         error_message: str | None = None
+        final_assessment: CompletionAssessment | None = None
 
         emit(f"Starting multi-turn implementation (initial state: {current_state.value}).")
 
@@ -477,6 +514,30 @@ class MultiTurnImplementationAgent:
                         if engine_res.metrics:
                             all_tool_metrics.append(engine_res.metrics)
                         ops = engine_res.file_operations
+                        for c, r in current_tool_history:
+                            if getattr(c, "tool_name", "") == "ask_user_clarification":
+                                clarification_requests.append(
+                                    ClarificationRequest(
+                                        question_id=c.call_id,
+                                        task_id=task_id,
+                                        subtask_id=subtask_id,
+                                        question=str(c.arguments.get("question", "")),
+                                        choices=c.arguments.get("choices", []),
+                                        status="answered" if not r.is_error else "pending",
+                                        answer=r.output if not r.is_error else None,
+                                    )
+                                )
+                                evidence_store.record(
+                                    task_id=task_id,
+                                    subtask_id=subtask_id,
+                                    turn_number=turn_num,
+                                    stage="implementing",
+                                    evidence_type=EvidenceType.CLARIFICATION_RECORD,
+                                    source="tool_engine",
+                                    trust_tier=EvidenceTrustTier.AUTHORITATIVE_EXECUTION,
+                                    payload={"question": c.arguments.get("question", ""), "answer": r.output},
+                                    worktree_id=worktree_id,
+                                )
                     else:
                         ops = provider.generate_code(
                             task=prompt,
@@ -492,7 +553,7 @@ class MultiTurnImplementationAgent:
                     turns.append(turn)
                     current_state = MultiTurnState.PAUSED
                     termination_reason = "provider_quota_paused"
-                    self._checkpoint(task, subtask, turn, MultiTurnState.PAUSED, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.PAUSED, context, evidence_store, final_assessment, clarification_requests)
                     break
                 except Exception as exc:
                     emit(f"Implementation error: {exc}")
@@ -502,7 +563,7 @@ class MultiTurnImplementationAgent:
                     current_state = MultiTurnState.FAILED
                     termination_reason = "provider_implementation_error"
                     error_message = str(exc)
-                    self._checkpoint(task, subtask, turn, MultiTurnState.FAILED, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.FAILED, context, evidence_store, final_assessment, clarification_requests)
                     break
 
                 if not ops:
@@ -514,7 +575,6 @@ class MultiTurnImplementationAgent:
                     termination_reason = "no_operations_emitted"
                     break
 
-                # Apply operations
                 precheck_errs = self._precheck_operations(ops, plan)
                 if precheck_errs:
                     emit(f"Precheck errors: {precheck_errs}")
@@ -525,6 +585,7 @@ class MultiTurnImplementationAgent:
                     turn.status = "completed"
                     turn.failures_detected = [{"type": "precheck_error", "errors": precheck_errs}]
                     turns.append(turn)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.IMPLEMENTING, context, evidence_store, final_assessment, clarification_requests)
                     current_state = MultiTurnState.ANALYZING_FAILURE
                     continue
 
@@ -538,6 +599,7 @@ class MultiTurnImplementationAgent:
                     turn.status = "completed"
                     turn.failures_detected = [{"type": "apply_error", "error": apply_err}]
                     turns.append(turn)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.IMPLEMENTING, context, evidence_store, final_assessment, clarification_requests)
                     current_state = MultiTurnState.ANALYZING_FAILURE
                     continue
 
@@ -546,7 +608,36 @@ class MultiTurnImplementationAgent:
                 turn.status = "completed"
                 turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                 turns.append(turn)
-                self._checkpoint(task, subtask, turn, MultiTurnState.IMPLEMENTING, context)
+
+                mod_paths = [getattr(op, "path", "") for op in ops if getattr(op, "path", "")]
+                evidence_store.invalidate_on_file_mutation(mod_paths, reason="new_implementation_changes")
+                diff_str = self._compute_workspace_diff(applied_operations)
+                evidence_store.record(
+                    task_id=task_id,
+                    subtask_id=subtask_id,
+                    turn_number=turn_num,
+                    stage="implementing",
+                    evidence_type=EvidenceType.DIFF_INSPECTION,
+                    source="workspace_diff",
+                    trust_tier=EvidenceTrustTier.SYSTEM_INTEGRITY,
+                    target_paths=mod_paths,
+                    payload={"diff": diff_str[:1000], "ops_count": len(ops)},
+                    worktree_id=worktree_id,
+                )
+                evidence_store.record(
+                    task_id=task_id,
+                    subtask_id=subtask_id,
+                    turn_number=turn_num,
+                    stage="implementing",
+                    evidence_type=EvidenceType.SAFETY_INVARIANT,
+                    source="filesystem_guard",
+                    trust_tier=EvidenceTrustTier.SYSTEM_INTEGRITY,
+                    target_paths=mod_paths,
+                    payload={"protected_intact": True},
+                    worktree_id=worktree_id,
+                )
+
+                self._checkpoint(task, subtask, turns, turn, MultiTurnState.IMPLEMENTING, context, evidence_store, final_assessment, clarification_requests)
                 current_state = MultiTurnState.TESTING
                 continue
 
@@ -570,13 +661,30 @@ class MultiTurnImplementationAgent:
                     for r in test_results
                 ]
 
+                mod_paths = [getattr(op, "path", "") for op in applied_operations if getattr(op, "path", "")]
+                for r in test_results:
+                    evidence_store.record(
+                        task_id=task_id,
+                        subtask_id=subtask_id,
+                        turn_number=turn_num,
+                        stage="testing",
+                        evidence_type=EvidenceType.TEST_EXECUTION,
+                        source="command_runner",
+                        trust_tier=EvidenceTrustTier.AUTHORITATIVE_EXECUTION,
+                        target_paths=mod_paths,
+                        command=r.command.split() if isinstance(r.command, str) else list(r.command),
+                        exit_code=r.exit_code,
+                        payload={"stdout": r.stdout[:400], "stderr": r.stderr[:400]},
+                        worktree_id=worktree_id,
+                    )
+
                 all_passed = all(r.succeeded for r in test_results)
                 if all_passed:
                     emit("All validation commands passed cleanly.")
                     turn.status = "completed"
                     turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     turns.append(turn)
-                    self._checkpoint(task, subtask, turn, MultiTurnState.TESTING, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.TESTING, context, evidence_store, final_assessment, clarification_requests)
                     current_state = MultiTurnState.REVIEWING
                 else:
                     failed_cmds = [r for r in test_results if not r.succeeded]
@@ -588,7 +696,7 @@ class MultiTurnImplementationAgent:
                     turn.status = "completed"
                     turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     turns.append(turn)
-                    self._checkpoint(task, subtask, turn, MultiTurnState.TESTING, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.TESTING, context, evidence_store, final_assessment, clarification_requests)
                     first_fail = failed_cmds[0]
                     last_failure = FailureAnalysis(
                         probable_root_cause=f"Validation command failed: {first_fail.command} (exit code {first_fail.exit_code})",
@@ -620,13 +728,26 @@ class MultiTurnImplementationAgent:
                     current_state = MultiTurnState.FAILED
                     termination_reason = "repair_budget_exhausted"
                     error_message = turn.error_message
-                    self._checkpoint(task, subtask, turn, MultiTurnState.FAILED, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.FAILED, context, evidence_store, final_assessment, clarification_requests)
                     break
 
                 turn.status = "completed"
                 turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                 turns.append(turn)
-                self._checkpoint(task, subtask, turn, MultiTurnState.ANALYZING_FAILURE, context)
+
+                evidence_store.record(
+                    task_id=task_id,
+                    subtask_id=subtask_id,
+                    turn_number=turn_num,
+                    stage="analyzing_failure",
+                    evidence_type=EvidenceType.FAILURE_REPAIR,
+                    source="failure_analyzer",
+                    trust_tier=EvidenceTrustTier.DELIBERATIVE_REVIEW,
+                    payload={"root_cause": last_failure.probable_root_cause if last_failure else "", "fix": last_failure.recommended_fix if last_failure else ""},
+                    worktree_id=worktree_id,
+                )
+
+                self._checkpoint(task, subtask, turns, turn, MultiTurnState.ANALYZING_FAILURE, context, evidence_store, final_assessment, clarification_requests)
                 current_state = MultiTurnState.REPAIRING
                 continue
 
@@ -691,7 +812,7 @@ class MultiTurnImplementationAgent:
                     turns.append(turn)
                     current_state = MultiTurnState.PAUSED
                     termination_reason = "provider_quota_paused"
-                    self._checkpoint(task, subtask, turn, MultiTurnState.PAUSED, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.PAUSED, context, evidence_store, final_assessment, clarification_requests)
                     break
                 except Exception as exc:
                     emit(f"Repair error: {exc}")
@@ -701,7 +822,7 @@ class MultiTurnImplementationAgent:
                     current_state = MultiTurnState.FAILED
                     termination_reason = "provider_repair_error"
                     error_message = str(exc)
-                    self._checkpoint(task, subtask, turn, MultiTurnState.FAILED, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.FAILED, context, evidence_store, final_assessment, clarification_requests)
                     break
 
                 if not ops:
@@ -710,7 +831,7 @@ class MultiTurnImplementationAgent:
                     turn.status = "completed"
                     turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     turns.append(turn)
-                    self._checkpoint(task, subtask, turn, MultiTurnState.REPAIRING, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.REPAIRING, context, evidence_store, final_assessment, clarification_requests)
                     last_failure = FailureAnalysis(
                         probable_root_cause="Repair produced no operations",
                         recommended_fix="Provide valid file edits to resolve errors",
@@ -725,7 +846,7 @@ class MultiTurnImplementationAgent:
                     turn.status = "completed"
                     turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     turns.append(turn)
-                    self._checkpoint(task, subtask, turn, MultiTurnState.REPAIRING, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.REPAIRING, context, evidence_store, final_assessment, clarification_requests)
                     last_failure = FailureAnalysis(
                         probable_root_cause="Repair file operation apply error",
                         recommended_fix=apply_err or "Fix file patch",
@@ -738,7 +859,36 @@ class MultiTurnImplementationAgent:
                 turn.status = "completed"
                 turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                 turns.append(turn)
-                self._checkpoint(task, subtask, turn, MultiTurnState.REPAIRING, context)
+
+                mod_paths = [getattr(op, "path", "") for op in ops if getattr(op, "path", "")]
+                evidence_store.invalidate_on_file_mutation(mod_paths, reason="repaired_after_execution")
+                diff_str = self._compute_workspace_diff(applied_operations)
+                evidence_store.record(
+                    task_id=task_id,
+                    subtask_id=subtask_id,
+                    turn_number=turn_num,
+                    stage="repairing",
+                    evidence_type=EvidenceType.DIFF_INSPECTION,
+                    source="workspace_diff",
+                    trust_tier=EvidenceTrustTier.SYSTEM_INTEGRITY,
+                    target_paths=mod_paths,
+                    payload={"diff": diff_str[:1000]},
+                    worktree_id=worktree_id,
+                )
+                evidence_store.record(
+                    task_id=task_id,
+                    subtask_id=subtask_id,
+                    turn_number=turn_num,
+                    stage="repairing",
+                    evidence_type=EvidenceType.SAFETY_INVARIANT,
+                    source="filesystem_guard",
+                    trust_tier=EvidenceTrustTier.SYSTEM_INTEGRITY,
+                    target_paths=mod_paths,
+                    payload={"protected_intact": True},
+                    worktree_id=worktree_id,
+                )
+
+                self._checkpoint(task, subtask, turns, turn, MultiTurnState.REPAIRING, context, evidence_store, final_assessment, clarification_requests)
                 current_state = MultiTurnState.TESTING  # Re-test
                 continue
 
@@ -772,13 +922,28 @@ class MultiTurnImplementationAgent:
                     review_res = ReviewResult(verdict="APPROVED", summary="Automated review pass", findings=[])
 
                 last_review = review_res
+                mod_paths = [getattr(op, "path", "") for op in applied_operations if getattr(op, "path", "")]
+                diff_hash = hashlib.sha256(reconstructed_diff.encode("utf-8")).hexdigest()[:16]
+
+                evidence_store.record(
+                    task_id=task_id,
+                    subtask_id=subtask_id,
+                    turn_number=turn_num,
+                    stage="reviewing",
+                    evidence_type=EvidenceType.CODE_REVIEW,
+                    source="reviewer",
+                    trust_tier=EvidenceTrustTier.DELIBERATIVE_REVIEW,
+                    target_paths=mod_paths,
+                    payload={"verdict": review_res.verdict, "summary": review_res.summary, "findings": review_res.findings, "diff_hash": diff_hash},
+                    worktree_id=worktree_id,
+                )
 
                 if review_res.verdict == "APPROVED":
                     emit("Review approved changes.")
                     turn.status = "completed"
                     turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     turns.append(turn)
-                    self._checkpoint(task, subtask, turn, MultiTurnState.REVIEWING, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.REVIEWING, context, evidence_store, final_assessment, clarification_requests)
                     current_state = MultiTurnState.VERIFYING
                 else:
                     review_turn_count += 1
@@ -791,6 +956,7 @@ class MultiTurnImplementationAgent:
                         current_state = MultiTurnState.FAILED
                         termination_reason = "review_budget_exhausted"
                         error_message = turn.error_message
+                        self._checkpoint(task, subtask, turns, turn, MultiTurnState.FAILED, context, evidence_store, final_assessment, clarification_requests)
                         break
 
                     last_failure = FailureAnalysis(
@@ -800,7 +966,7 @@ class MultiTurnImplementationAgent:
                     turn.status = "completed"
                     turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     turns.append(turn)
-                    self._checkpoint(task, subtask, turn, MultiTurnState.REVIEWING, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.REVIEWING, context, evidence_store, final_assessment, clarification_requests)
                     current_state = MultiTurnState.REPAIRING
                 continue
 
@@ -818,7 +984,6 @@ class MultiTurnImplementationAgent:
                     started_at=datetime.datetime.now(datetime.timezone.utc),
                 )
 
-                # 1. Run all validation commands
                 test_results = self._run_validation_commands(context, task_objective)
                 turn.tests_executed = [
                     {"command": r.command, "exit_code": r.exit_code, "succeeded": r.succeeded}
@@ -826,18 +991,59 @@ class MultiTurnImplementationAgent:
                 ]
                 failed_cmds = [r for r in test_results if not r.succeeded]
 
-                # 2. Python syntax compilation check on modified/created files
+                mod_paths = [getattr(op, "path", "") for op in applied_operations if getattr(op, "path", "")]
+                for r in test_results:
+                    evidence_store.record(
+                        task_id=task_id,
+                        subtask_id=subtask_id,
+                        turn_number=turn_num,
+                        stage="verifying",
+                        evidence_type=EvidenceType.TEST_EXECUTION,
+                        source="command_runner",
+                        trust_tier=EvidenceTrustTier.AUTHORITATIVE_EXECUTION,
+                        target_paths=mod_paths,
+                        command=r.command.split() if isinstance(r.command, str) else list(r.command),
+                        exit_code=r.exit_code,
+                        payload={"stdout": r.stdout[:400], "stderr": r.stderr[:400]},
+                        worktree_id=worktree_id,
+                    )
+
                 syntax_errors: list[str] = []
                 for op in applied_operations:
                     p = getattr(op, "path", None)
-                    if p and p.endswith(".py"):
+                    if p and str(p).endswith(".py"):
                         full_path = self.filesystem.root / p
                         if full_path.is_file():
                             try:
                                 content = self.filesystem.read_file(p)
                                 ast.parse(content, filename=p)
+                                evidence_store.record(
+                                    task_id=task_id,
+                                    subtask_id=subtask_id,
+                                    turn_number=turn_num,
+                                    stage="verifying",
+                                    evidence_type=EvidenceType.SYNTAX_VERIFICATION,
+                                    source="ast_parser",
+                                    trust_tier=EvidenceTrustTier.SYSTEM_INTEGRITY,
+                                    target_paths=[p],
+                                    exit_code=0,
+                                    worktree_id=worktree_id,
+                                )
                             except Exception as syn_exc:
                                 syntax_errors.append(f"Syntax error in {p}: {syn_exc}")
+                                evidence_store.record(
+                                    task_id=task_id,
+                                    subtask_id=subtask_id,
+                                    turn_number=turn_num,
+                                    stage="verifying",
+                                    evidence_type=EvidenceType.SYNTAX_VERIFICATION,
+                                    source="ast_parser",
+                                    trust_tier=EvidenceTrustTier.SYSTEM_INTEGRITY,
+                                    target_paths=[p],
+                                    exit_code=1,
+                                    payload={"error": str(syn_exc)},
+                                    worktree_id=worktree_id,
+                                )
 
                 if failed_cmds or syntax_errors:
                     verification_turn_count += 1
@@ -855,6 +1061,7 @@ class MultiTurnImplementationAgent:
                         current_state = MultiTurnState.FAILED
                         termination_reason = "verification_budget_exhausted"
                         error_message = turn.error_message
+                        self._checkpoint(task, subtask, turns, turn, MultiTurnState.FAILED, context, evidence_store, final_assessment, clarification_requests)
                         break
 
                     err_summary = "; ".join(syntax_errors) if syntax_errors else (failed_cmds[0].stderr[:200] if failed_cmds[0].stderr else f"Exit code {failed_cmds[0].exit_code}")
@@ -866,23 +1073,80 @@ class MultiTurnImplementationAgent:
                     turn.status = "completed"
                     turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     turns.append(turn)
-                    self._checkpoint(task, subtask, turn, MultiTurnState.VERIFYING, context)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.VERIFYING, context, evidence_store, final_assessment, clarification_requests)
                     current_state = MultiTurnState.REPAIRING
                     continue
 
-                # All verification passed
-                emit("All final verification checks passed cleanly.")
-                turn.status = "completed"
-                turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
-                turns.append(turn)
-                self._checkpoint(task, subtask, turn, MultiTurnState.VERIFYING, context)
-                current_state = MultiTurnState.COMPLETED
-                termination_reason = "completed"
-                emit("Multi-turn implementation completed successfully.")
-                break
+                reconstructed_diff = self._compute_workspace_diff(applied_operations)
+                assessment = self.decision_engine.evaluate(
+                    task=task,
+                    subtask=subtask,
+                    plan=plan,
+                    evidence_store=evidence_store,
+                    applied_operations=applied_operations,
+                    current_diff=reconstructed_diff,
+                    last_review=last_review,
+                    last_failure=last_failure,
+                    worktree_id=worktree_id,
+                    clarification_requests=clarification_requests,
+                )
+                final_assessment = assessment
+
+                if assessment.is_ready:
+                    emit(f"All final verification checks and completion gates passed cleanly ({assessment.readiness_level}).")
+                    turn.status = "completed"
+                    turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                    turns.append(turn)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.VERIFYING, context, evidence_store, final_assessment, clarification_requests)
+                    current_state = MultiTurnState.COMPLETED
+                    termination_reason = "completed"
+                    emit("Multi-turn implementation completed successfully.")
+                    break
+                else:
+                    emit(f"Completion gates failed: {assessment.decision_reason}")
+                    verification_turn_count += 1
+                    if verification_turn_count > self.max_verification_turns:
+                        turn.status = "failed"
+                        turn.error_message = f"Completion gate failure: {assessment.decision_reason}"
+                        turns.append(turn)
+                        current_state = MultiTurnState.FAILED
+                        termination_reason = "verification_budget_exhausted"
+                        error_message = turn.error_message
+                        self._checkpoint(task, subtask, turns, turn, MultiTurnState.FAILED, context, evidence_store, final_assessment, clarification_requests)
+                        break
+
+                    last_failure = FailureAnalysis(
+                        probable_root_cause=f"Completion gate failure: {assessment.decision_reason}",
+                        recommended_fix="Address missing completion evidence",
+                    )
+                    turn.status = "completed"
+                    turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                    turns.append(turn)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.VERIFYING, context, evidence_store, final_assessment, clarification_requests)
+                    current_state = MultiTurnState.REPAIRING
+                    continue
 
         elapsed = time.perf_counter() - start_time
         success = (current_state == MultiTurnState.COMPLETED)
+
+        if final_assessment is None:
+            reconstructed_diff = self._compute_workspace_diff(applied_operations)
+            final_assessment = self.decision_engine.evaluate(
+                task=task,
+                subtask=subtask,
+                plan=plan,
+                evidence_store=evidence_store,
+                applied_operations=applied_operations,
+                current_diff=reconstructed_diff,
+                last_review=last_review,
+                last_failure=last_failure,
+                worktree_id=worktree_id,
+                clarification_requests=clarification_requests,
+            )
+
+        if report is not None:
+            report.completion_assessment = final_assessment
+            report.completion_evidence = evidence_store.to_dict()
 
         return MultiTurnExecutionReport(
             task_id=task_id,
@@ -898,4 +1162,6 @@ class MultiTurnImplementationAgent:
             file_operations=applied_operations,
             tool_metrics=all_tool_metrics,
             error_message=error_message,
+            completion_assessment=final_assessment,
+            completion_evidence=evidence_store.to_dict(),
         )

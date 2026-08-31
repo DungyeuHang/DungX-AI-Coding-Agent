@@ -154,36 +154,36 @@ class ToolRegistry:
                 },
             ),
         }
-        if clarification_handler is not None:
-            self.enable_clarification_tool(clarification_handler)
 
-    def enable_clarification_tool(self, handler: Any | None = None) -> None:
-        """Enables the interactive user clarification tool."""
-        if handler is not None:
-            self.clarification_handler = handler
-        self._definitions["ask_user_clarification"] = ToolDefinition(
-            name="ask_user_clarification",
-            description="Requests user clarification or answers to design questions when requirements are ambiguous.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "The clarifying question to ask the user.",
-                    },
-                    "choices": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional list of distinct choices or options for the user.",
-                    },
-                },
-                "required": ["question"],
-            },
-        )
+        if self.clarification_handler is not None:
+            self.enable_clarification_tool()
 
     def definitions(self) -> list[ToolDefinition]:
         """Return the list of tool definitions available in the registry."""
         return list(self._definitions.values())
+
+    def enable_clarification_tool(self) -> None:
+        """Explicitly enables or ensures ask_user_clarification is registered."""
+        if "ask_user_clarification" not in self._definitions:
+            self._definitions["ask_user_clarification"] = ToolDefinition(
+                name="ask_user_clarification",
+                description="Requests user clarification or answers to design questions when requirements are ambiguous.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The clarifying question to ask the user.",
+                        },
+                        "choices": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of distinct choices or options for the user.",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            )
 
     def get_definition(self, name: str) -> ToolDefinition | None:
         """Lookup a specific tool definition by name."""
