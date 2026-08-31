@@ -780,6 +780,187 @@ class DAGExecutionStage(str, Enum):
     RECOVERY_BLOCKED = "recovery_blocked"
 
 
+# Phase 4.16: Multi-Turn Interactive Implementation State Machine and Models
+class MultiTurnState(str, Enum):
+    IDLE = "idle"
+    PLANNING = "planning"
+    IMPLEMENTING = "implementing"
+    INSPECTING = "inspecting"
+    TESTING = "testing"
+    ANALYZING_FAILURE = "analyzing_failure"
+    REPAIRING = "repairing"
+    REVIEWING = "reviewing"
+    VERIFYING = "verifying"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    PAUSED = "paused"
+
+    @classmethod
+    def valid_transitions(cls) -> dict[MultiTurnState, set[MultiTurnState]]:
+        return {
+            cls.IDLE: {cls.PLANNING, cls.IMPLEMENTING, cls.FAILED, cls.PAUSED},
+            cls.PLANNING: {cls.IMPLEMENTING, cls.FAILED, cls.PAUSED},
+            cls.IMPLEMENTING: {cls.INSPECTING, cls.TESTING, cls.REVIEWING, cls.FAILED, cls.PAUSED},
+            cls.INSPECTING: {cls.IMPLEMENTING, cls.TESTING, cls.FAILED, cls.PAUSED},
+            cls.TESTING: {cls.ANALYZING_FAILURE, cls.REVIEWING, cls.VERIFYING, cls.COMPLETED, cls.FAILED, cls.PAUSED},
+            cls.ANALYZING_FAILURE: {cls.REPAIRING, cls.FAILED, cls.PAUSED},
+            cls.REPAIRING: {cls.INSPECTING, cls.TESTING, cls.FAILED, cls.PAUSED},
+            cls.REVIEWING: {cls.VERIFYING, cls.REPAIRING, cls.COMPLETED, cls.FAILED, cls.PAUSED},
+            cls.VERIFYING: {cls.COMPLETED, cls.REPAIRING, cls.FAILED, cls.PAUSED},
+            cls.PAUSED: {cls.PLANNING, cls.IMPLEMENTING, cls.REPAIRING, cls.TESTING, cls.REVIEWING, cls.VERIFYING, cls.FAILED},
+            cls.COMPLETED: set(),
+            cls.FAILED: set(),
+        }
+
+    @classmethod
+    def can_transition(cls, from_state: MultiTurnState | str, to_state: MultiTurnState | str) -> bool:
+        try:
+            src = cls(from_state) if isinstance(from_state, str) else from_state
+            dst = cls(to_state) if isinstance(to_state, str) else to_state
+            return dst in cls.valid_transitions().get(src, set())
+        except ValueError:
+            return False
+
+
+@dataclass
+class ImplementationTurn:
+    turn_id: str
+    task_id: str
+    subtask_id: str
+    turn_number: int
+    stage: str = "idle"
+    provider: str = ""
+    model: str = ""
+    prompt_summary: str = ""
+    prompt_metadata: dict[str, Any] = field(default_factory=dict)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_results: list[dict[str, Any]] = field(default_factory=list)
+    tests_executed: list[dict[str, Any]] = field(default_factory=list)
+    failures_detected: list[dict[str, Any]] = field(default_factory=list)
+    repair_reason: str | None = None
+    started_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+    completed_at: datetime.datetime | None = None
+    status: str = "running"
+    file_operations: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    error_message: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "turn_id": self.turn_id,
+            "task_id": self.task_id,
+            "subtask_id": self.subtask_id,
+            "turn_number": self.turn_number,
+            "stage": self.stage,
+            "provider": self.provider,
+            "model": self.model,
+            "prompt_summary": self.prompt_summary,
+            "prompt_metadata": dict(self.prompt_metadata),
+            "tool_calls": list(self.tool_calls),
+            "tool_results": list(self.tool_results),
+            "tests_executed": list(self.tests_executed),
+            "failures_detected": list(self.failures_detected),
+            "repair_reason": self.repair_reason,
+            "started_at": self.started_at.isoformat() if isinstance(self.started_at, datetime.datetime) else str(self.started_at),
+            "completed_at": self.completed_at.isoformat() if isinstance(self.completed_at, datetime.datetime) else (str(self.completed_at) if self.completed_at else None),
+            "status": self.status,
+            "file_operations": list(self.file_operations),
+            "metadata": dict(self.metadata),
+            "error_message": self.error_message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ImplementationTurn:
+        if not isinstance(data, dict):
+            return cls(turn_id="", task_id="", subtask_id="", turn_number=0)
+        raw_start = data.get("started_at")
+        started_at = datetime.datetime.fromisoformat(raw_start) if isinstance(raw_start, str) else (raw_start or datetime.datetime.now(datetime.timezone.utc))
+        raw_comp = data.get("completed_at")
+        completed_at = datetime.datetime.fromisoformat(raw_comp) if isinstance(raw_comp, str) else raw_comp
+        return cls(
+            turn_id=str(data.get("turn_id", "")),
+            task_id=str(data.get("task_id", "")),
+            subtask_id=str(data.get("subtask_id", "")),
+            turn_number=int(data.get("turn_number", 0)),
+            stage=str(data.get("stage", "idle")),
+            provider=str(data.get("provider", "")),
+            model=str(data.get("model", "")),
+            prompt_summary=str(data.get("prompt_summary", "")),
+            prompt_metadata=dict(data.get("prompt_metadata") or {}),
+            tool_calls=list(data.get("tool_calls") or []),
+            tool_results=list(data.get("tool_results") or []),
+            tests_executed=list(data.get("tests_executed") or []),
+            failures_detected=list(data.get("failures_detected") or []),
+            repair_reason=data.get("repair_reason"),
+            started_at=started_at,
+            completed_at=completed_at,
+            status=str(data.get("status", "running")),
+            file_operations=list(data.get("file_operations") or []),
+            metadata=dict(data.get("metadata") or {}),
+            error_message=data.get("error_message"),
+        )
+
+
+@dataclass
+class MultiTurnExecutionReport:
+    task_id: str = ""
+    subtask_id: str = ""
+    success: bool = False
+    turns: list[ImplementationTurn] = field(default_factory=list)
+    total_turns: int = 0
+    repair_turns: int = 0
+    review_turns: int = 0
+    final_state: str = "idle"
+    termination_reason: str = "none"
+    elapsed_time_seconds: float = 0.0
+    file_operations: list[FileOperation] = field(default_factory=list)
+    tool_metrics: list[ToolExecutionMetrics] = field(default_factory=list)
+    error_message: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "subtask_id": self.subtask_id,
+            "success": self.success,
+            "turns": [t.to_dict() if hasattr(t, "to_dict") else t for t in self.turns],
+            "total_turns": self.total_turns,
+            "repair_turns": self.repair_turns,
+            "review_turns": self.review_turns,
+            "final_state": self.final_state,
+            "termination_reason": self.termination_reason,
+            "elapsed_time_seconds": round(self.elapsed_time_seconds, 4),
+            "file_operations": [op.to_dict() if hasattr(op, "to_dict") else (op.__dict__ if hasattr(op, "__dict__") else op) for op in self.file_operations],
+            "tool_metrics": [m.to_dict() if hasattr(m, "to_dict") else m for m in self.tool_metrics],
+            "error_message": self.error_message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MultiTurnExecutionReport:
+        if not isinstance(data, dict):
+            return cls()
+        raw_turns = data.get("turns") or []
+        turns = [ImplementationTurn.from_dict(t) if isinstance(t, dict) else t for t in raw_turns]
+        raw_ops = data.get("file_operations") or []
+        file_ops = [FileOperation(**op) if isinstance(op, dict) else op for op in raw_ops]
+        raw_metrics = data.get("tool_metrics") or []
+        tool_metrics = [ToolExecutionMetrics.from_dict(m) if isinstance(m, dict) else m for m in raw_metrics]
+        return cls(
+            task_id=str(data.get("task_id", "")),
+            subtask_id=str(data.get("subtask_id", "")),
+            success=bool(data.get("success", False)),
+            turns=turns,
+            total_turns=int(data.get("total_turns", len(turns))),
+            repair_turns=int(data.get("repair_turns", 0)),
+            review_turns=int(data.get("review_turns", 0)),
+            final_state=str(data.get("final_state", "idle")),
+            termination_reason=str(data.get("termination_reason", "none")),
+            elapsed_time_seconds=float(data.get("elapsed_time_seconds", 0.0)),
+            file_operations=file_ops,
+            tool_metrics=tool_metrics,
+            error_message=data.get("error_message"),
+        )
+
+
 @dataclass
 class Checkpoint:
     checkpoint_id: str
@@ -804,6 +985,9 @@ class Checkpoint:
     cleaned_worktrees: list[str] = field(default_factory=list)
     base_commit: str = ""
     integration_commit: str | None = None
+    turns: list[dict[str, Any]] = field(default_factory=list)
+    current_turn_number: int = 0
+    turn_stage: str = "idle"
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -832,6 +1016,9 @@ class Checkpoint:
         d.setdefault("cleaned_worktrees", [])
         d.setdefault("base_commit", "")
         d.setdefault("integration_commit", None)
+        d.setdefault("turns", [])
+        d.setdefault("current_turn_number", 0)
+        d.setdefault("turn_stage", "idle")
         return cls(**d)
 
 # Phase 4.10 / Phase 4.11: Cross-Subtask Semantic Contract & Behavioral Verification Models
@@ -2320,6 +2507,8 @@ class RunReport:
     # existing Phase 4.18 tests that call it directly and compare its return
     # value to a plain command list are unaffected.
     validation_reuse_attempts: list[Any] = field(default_factory=list, repr=False)
+    # Phase 4.16: multi-turn interactive implementation execution report
+    multi_turn_report: MultiTurnExecutionReport | None = None
 
 
 class ProviderError(RuntimeError):

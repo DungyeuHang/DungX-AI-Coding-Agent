@@ -95,7 +95,13 @@ class AgentConfig:
     # Phase 4.15: interactive, tool-assisted implementation loop
     interactive_implementation: bool = False
     max_implementation_tool_steps: int = 15
-    # Phase 4.16: staged overlay sandbox + prospective candidate validation
+    # Phase 4.16: multi-turn interactive tool-assisted implementation agent
+    multi_turn_implementation: bool = False
+    max_implementation_turns: int = 10
+    max_repair_turns: int = 3
+    max_review_turns: int = 2
+    max_verification_turns: int = 2
+    # Prospective validation
     prospective_validation_enabled: bool = False
     max_candidate_iterations: int = 2
     candidate_validation_timeout_seconds: int = 120
@@ -285,6 +291,11 @@ class AgentConfig:
             "serialize_overlapping_subtasks": "AGENT_SERIALIZE_OVERLAPPING_SUBTASKS",
             "interactive_implementation": "AGENT_INTERACTIVE_IMPLEMENTATION",
             "max_implementation_tool_steps": "AGENT_MAX_IMPLEMENTATION_TOOL_STEPS",
+            "multi_turn_implementation": "AGENT_MULTI_TURN_IMPLEMENTATION",
+            "max_implementation_turns": "AGENT_MAX_IMPLEMENTATION_TURNS",
+            "max_repair_turns": "AGENT_MAX_REPAIR_TURNS",
+            "max_review_turns": "AGENT_MAX_REVIEW_TURNS",
+            "max_verification_turns": "AGENT_MAX_VERIFICATION_TURNS",
             "prospective_validation_enabled": "AGENT_PROSPECTIVE_VALIDATION",
             "max_candidate_iterations": "AGENT_MAX_CANDIDATE_ITERATIONS",
             "candidate_validation_timeout_seconds": "AGENT_CANDIDATE_VALIDATION_TIMEOUT",
@@ -478,6 +489,11 @@ class AgentConfig:
             serialize_overlapping_subtasks=_bool(value("serialize_overlapping_subtasks", True)),
             interactive_implementation=_bool(value("interactive_implementation", False)),
             max_implementation_tool_steps=_positive_int(value("max_implementation_tool_steps", 15), "max_implementation_tool_steps"),
+            multi_turn_implementation=_bool(value("multi_turn_implementation", False)),
+            max_implementation_turns=_positive_int(value("max_implementation_turns", 10), "max_implementation_turns"),
+            max_repair_turns=_positive_int(value("max_repair_turns", 3), "max_repair_turns", minimum=0),
+            max_review_turns=_positive_int(value("max_review_turns", 2), "max_review_turns", minimum=0),
+            max_verification_turns=_positive_int(value("max_verification_turns", 2), "max_verification_turns", minimum=0),
             prospective_validation_enabled=_bool(value("prospective_validation_enabled", False)),
             max_candidate_iterations=_positive_int(value("max_candidate_iterations", 2), "max_candidate_iterations"),
             candidate_validation_timeout_seconds=_positive_int(value("candidate_validation_timeout_seconds", 120), "candidate_validation_timeout_seconds"),
@@ -610,9 +626,15 @@ class AgentConfig:
             raise ValueError("max_parallel_subtasks must be at least 1")
         if self.max_parallel_subtasks > 4:
             raise ValueError("max_parallel_subtasks cannot exceed 4")
-        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats", "max_knowledge_context_chars", "max_knowledge_symbols", "max_implementation_tool_steps", "max_candidate_iterations", "candidate_validation_timeout_seconds", "max_impact_depth", "max_affected_symbols", "max_affected_tests"):
+        for name in ("max_context_files", "max_context_file_bytes", "max_context_tokens", "planning_context_bytes", "implementation_context_bytes", "repair_context_bytes", "review_context_bytes", "max_retry_wait_seconds", "max_diagnostic_output_bytes", "max_tool_steps", "max_tool_output_bytes", "total_tool_budget_bytes", "max_consecutive_repeats", "max_knowledge_context_chars", "max_knowledge_symbols", "max_implementation_tool_steps", "max_implementation_turns", "max_candidate_iterations", "candidate_validation_timeout_seconds", "max_impact_depth", "max_affected_symbols", "max_affected_tests"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
+        if self.max_repair_turns < 0:
+            raise ValueError("max_repair_turns cannot be negative")
+        if self.max_review_turns < 0:
+            raise ValueError("max_review_turns cannot be negative")
+        if self.max_verification_turns < 0:
+            raise ValueError("max_verification_turns cannot be negative")
         if self.provider_max_retries < 0:
             raise ValueError("provider_max_retries cannot be negative")
         if self.dependency_depth < 0:
@@ -680,6 +702,11 @@ def add_common_arguments(parser: argparse.ArgumentParser, include_provider_args:
     parser.add_argument("--serialize-overlapping-subtasks", type=_bool, default=None, help="serialize execution of subtasks with predicted file overlap (true/false)")
     parser.add_argument("--interactive-implementation", type=_bool, default=None, help="enable interactive tool-assisted implementation loop (true/false)")
     parser.add_argument("--max-implementation-tool-steps", type=int, default=None, help="maximum tool steps for the interactive implementation loop")
+    parser.add_argument("--multi-turn-implementation", type=_bool, default=None, help="enable multi-turn interactive tool-assisted implementation agent (true/false)")
+    parser.add_argument("--max-implementation-turns", type=int, default=None, help="maximum implementation turns per subtask")
+    parser.add_argument("--max-repair-turns", type=int, default=None, help="maximum repair turns per subtask")
+    parser.add_argument("--max-review-turns", type=int, default=None, help="maximum review turns per subtask")
+    parser.add_argument("--max-verification-turns", type=int, default=None, help="maximum verification turns per subtask")
     parser.add_argument("--prospective-validation", type=_bool, default=None, help="validate proposed edits in an isolated candidate tree before finalizing (true/false)")
     parser.add_argument("--max-candidate-iterations", type=int, default=None, help="maximum candidate build/validate iterations per implementation")
     parser.add_argument("--semantic-impact-analysis", type=_bool, default=None, help="select validation targets from the import/call graph instead of filename heuristics (true/false)")
@@ -738,6 +765,11 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
             "serialize_overlapping_subtasks": getattr(args, "serialize_overlapping_subtasks", None),
             "interactive_implementation": getattr(args, "interactive_implementation", None),
             "max_implementation_tool_steps": getattr(args, "max_implementation_tool_steps", None),
+            "multi_turn_implementation": getattr(args, "multi_turn_implementation", None),
+            "max_implementation_turns": getattr(args, "max_implementation_turns", None),
+            "max_repair_turns": getattr(args, "max_repair_turns", None),
+            "max_review_turns": getattr(args, "max_review_turns", None),
+            "max_verification_turns": getattr(args, "max_verification_turns", None),
             "prospective_validation_enabled": getattr(args, "prospective_validation", None),
             "max_candidate_iterations": getattr(args, "max_candidate_iterations", None),
             "semantic_impact_analysis_enabled": getattr(args, "semantic_impact_analysis", None),

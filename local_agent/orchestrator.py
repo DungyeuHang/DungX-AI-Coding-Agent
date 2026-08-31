@@ -1524,6 +1524,62 @@ class Orchestrator:
         capability = ProviderCapability.REPAIR if failure else ProviderCapability.IMPLEMENTATION
 
         def _action(provider: AIProvider) -> tuple[list[FileOperation], list[tuple[ToolCall, ToolResult]]]:
+            # Phase 4.16: multi-turn interactive tool-assisted implementation agent.
+            if getattr(self.config, "multi_turn_implementation", False):
+                from .multi_turn import MultiTurnImplementationAgent
+                registry = ToolRegistry(
+                    self.config.project,
+                    filesystem=self.filesystem,
+                    command_runner=self.runner,
+                    semantic_index=_context_semantic_index(context),
+                )
+                multi_agent = MultiTurnImplementationAgent(
+                    config=self.config,
+                    filesystem=self.filesystem,
+                    registry=registry,
+                    storage=self.storage,
+                    runner=self.runner,
+                    policy=getattr(self.config, "tool_policy", None),
+                )
+                raw_contracts = context.metadata.get("upstream_contracts")
+                upstream_contracts = [
+                    SubtaskContract.from_dict(c) if isinstance(c, dict) else c
+                    for c in raw_contracts
+                ] if raw_contracts else None
+
+                active_subtask = subtask or next(
+                    (
+                        s for s in (task.plan.subtasks if task.plan else [])
+                        if s.subtask_id == getattr(task, "current_subtask_id", None)
+                    ),
+                    None,
+                )
+
+                multi_report = multi_agent.execute(
+                    task=task,
+                    subtask=active_subtask,
+                    plan=plan,
+                    context=context,
+                    provider=provider,
+                    upstream_contracts=upstream_contracts,
+                    failure=failure,
+                    review=review,
+                    report=report,
+                )
+
+                if report is not None:
+                    report.multi_turn_report = multi_report
+                    if multi_report.tool_metrics:
+                        report.tool_metrics.extend(multi_report.tool_metrics)
+
+                if not multi_report.success or not multi_report.file_operations:
+                    raise ProviderError(
+                        f"Multi-turn implementation failed [{multi_report.final_state}/{multi_report.termination_reason}]: "
+                        f"{multi_report.error_message or 'No file operations produced'}"
+                    )
+
+                return multi_report.file_operations, list(tool_history or [])
+
             # Phase 4.15: interactive, tool-assisted implementation loop.
             # Runs against self.config.project / self.filesystem, which the
             # ParallelExecutionCoordinator rebinds to the isolated worktree path

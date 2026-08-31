@@ -738,21 +738,20 @@ class ParallelExecutionCoordinator:
                         report["actions"].append(f"subtask_{subtask.subtask_id}_dirty_worktree_protected_files_refused")
                     elif dirty_files:
                         wt_git.add(dirty_files)  # Only tracked modified files, never untracked
-                        commit_msg = f"feat({subtask.subtask_id}): {subtask.title} (recovered)"
-                        if wt_git.commit(commit_msg):
-                            recovered_sha = wt_git.get_head_commit()
-                            subtask.status = SubtaskStatus.COMPLETED
-                            if not subtask.worktree_session:
-                                subtask.worktree_session = WorktreeSession(
-                                    session_id=f"wt-recov-{subtask.subtask_id}",
-                                    subtask_id=subtask.subtask_id,
-                                    worktree_path=str(worktree_path),
-                                    branch_name=sub_branch,
-                                    base_commit=base_commit,
-                                    status="active",
-                                )
-                            report["actions"].append(f"subtask_{subtask.subtask_id}_dirty_worktree_committed")
-                            continue
+                        wt_git.commit(f"recover({subtask.subtask_id}): persist uncommitted worktree changes")
+                        recovered_sha = wt_git.get_head_commit()
+                        subtask.status = SubtaskStatus.COMPLETED
+                        if not subtask.worktree_session:
+                            subtask.worktree_session = WorktreeSession(
+                                session_id=f"wt-recov-{subtask.subtask_id}",
+                                subtask_id=subtask.subtask_id,
+                                worktree_path=str(worktree_path),
+                                branch_name=sub_branch,
+                                base_commit=base_commit,
+                                status="active",
+                            )
+                        report["actions"].append(f"subtask_{subtask.subtask_id}_dirty_worktree_committed")
+                        continue
 
                 # Case B: Incomplete running worker without commits or changes -> reset to PENDING
                 if subtask.status == SubtaskStatus.RUNNING:
