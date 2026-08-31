@@ -117,15 +117,30 @@ def compute_state_fingerprint(root: str | Path, paths: Iterable[str]) -> str:
     ``path:<missing>``). A file that cannot be read is recorded as missing
     rather than skipped, so an unreadable file invalidates reuse instead of
     silently matching.
+
+    ``paths`` is scoped to ``root``: an absolute path, a ``..`` traversal, or a
+    symlink/junction that resolves outside ``root`` is treated exactly like a
+    missing file rather than followed. Without this, evidence recorded against
+    an out-of-root path would be fingerprinted off content this workspace does
+    not control, so it could never be invalidated by any real mutation inside
+    the workspace -- silently defeating stale-evidence invalidation.
     """
-    base = Path(root)
+    base = Path(root).resolve()
     digest = hashlib.sha256()
     for relative in sorted({str(p).replace("\\", "/") for p in paths if p}):
         candidate = base / relative
         try:
-            marker = hashlib.sha256(candidate.read_bytes()).hexdigest() if candidate.is_file() \
-                else MISSING_MARKER
+            resolved = candidate.resolve()
+            in_root = resolved == base or base in resolved.parents
         except OSError:
+            in_root = False
+        if in_root:
+            try:
+                marker = hashlib.sha256(resolved.read_bytes()).hexdigest() if resolved.is_file() \
+                    else MISSING_MARKER
+            except OSError:
+                marker = MISSING_MARKER
+        else:
             marker = MISSING_MARKER
         digest.update(relative.encode("utf-8", "replace"))
         digest.update(b"\0")

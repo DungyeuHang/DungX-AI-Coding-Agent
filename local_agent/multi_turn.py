@@ -925,8 +925,12 @@ class MultiTurnImplementationAgent:
                         report=report,
                     )
                 except Exception as exc:
-                    LOGGER.warning("Review evaluation error, accepting default approval: %s", exc)
-                    review_res = ReviewResult(verdict="APPROVED", summary="Automated review pass", findings=[])
+                    LOGGER.warning("Review evaluation error, failing closed (no approval): %s", exc)
+                    review_res = ReviewResult(
+                        verdict="CHANGES_REQUIRED",
+                        summary="Review could not be completed due to an internal error; treated as not approved",
+                        findings=[f"Reviewer error: {exc}"],
+                    )
 
                 last_review = review_res
                 mod_paths = [getattr(op, "path", "") for op in applied_operations if getattr(op, "path", "")]

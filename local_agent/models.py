@@ -916,6 +916,8 @@ class MultiTurnExecutionReport:
     file_operations: list[FileOperation] = field(default_factory=list)
     tool_metrics: list[ToolExecutionMetrics] = field(default_factory=list)
     error_message: str | None = None
+    completion_assessment: Any | None = None
+    completion_evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -932,6 +934,8 @@ class MultiTurnExecutionReport:
             "file_operations": [op.to_dict() if hasattr(op, "to_dict") else (op.__dict__ if hasattr(op, "__dict__") else op) for op in self.file_operations],
             "tool_metrics": [m.to_dict() if hasattr(m, "to_dict") else m for m in self.tool_metrics],
             "error_message": self.error_message,
+            "completion_assessment": self.completion_assessment.to_dict() if hasattr(self.completion_assessment, "to_dict") else self.completion_assessment,
+            "completion_evidence": dict(self.completion_evidence) if self.completion_evidence else {},
         }
 
     @classmethod
@@ -958,6 +962,8 @@ class MultiTurnExecutionReport:
             file_operations=file_ops,
             tool_metrics=tool_metrics,
             error_message=data.get("error_message"),
+            completion_assessment=data.get("completion_assessment"),
+            completion_evidence=dict(data.get("completion_evidence") or {}),
         )
 
 
@@ -1053,6 +1059,8 @@ class Checkpoint:
     current_turn_number: int = 0
     turn_stage: str = "idle"
     clarification_requests: list[dict[str, Any]] = field(default_factory=list)
+    completion_assessment: Any | None = None
+    completion_evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -1085,6 +1093,8 @@ class Checkpoint:
         d.setdefault("current_turn_number", 0)
         d.setdefault("turn_stage", "idle")
         d.setdefault("clarification_requests", [])
+        d.setdefault("completion_assessment", None)
+        d.setdefault("completion_evidence", {})
         return cls(**d)
 # Phase 4.10 / Phase 4.11: Cross-Subtask Semantic Contract & Behavioral Verification Models
 @dataclass
@@ -2574,6 +2584,9 @@ class RunReport:
     validation_reuse_attempts: list[Any] = field(default_factory=list, repr=False)
     # Phase 4.16: multi-turn interactive implementation execution report
     multi_turn_report: MultiTurnExecutionReport | None = None
+    # Phase 4.18 / Phase 4.19: Completion and release readiness decision & evidence
+    completion_assessment: Any | None = None
+    completion_evidence: dict[str, Any] = field(default_factory=dict)
 
 
 class ProviderError(RuntimeError):

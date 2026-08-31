@@ -166,7 +166,20 @@ class StructuredEvidence:
                 stage="",
                 evidence_type=EvidenceType.TEST_EXECUTION.value,
                 source="unknown",
+                status=EvidenceStatus.INVALIDATED.value,
+                invalidation_reason="malformed_evidence_data",
             )
+        # A record missing its "status" key entirely is not a freshly recorded
+        # observation (record() always sets one) -- it is deserialized,
+        # possibly-incomplete/corrupted state. Defaulting that to VALID would
+        # let a stripped-down or hand-crafted entry masquerade as observed
+        # evidence merely by omitting the field, so an absent status fails
+        # closed instead of granting trust.
+        raw_status = data.get("status")
+        status = str(raw_status) if raw_status else EvidenceStatus.INVALIDATED.value
+        invalidation_reason = str(data.get("invalidation_reason", ""))
+        if not raw_status:
+            invalidation_reason = invalidation_reason or "missing_status_on_deserialization"
         return cls(
             evidence_id=str(data.get("evidence_id", "")),
             task_id=str(data.get("task_id", "")),
@@ -176,8 +189,8 @@ class StructuredEvidence:
             evidence_type=str(data.get("evidence_type", EvidenceType.TEST_EXECUTION.value)),
             source=str(data.get("source", "unknown")),
             trust_tier=int(data.get("trust_tier", EvidenceTrustTier.AUTHORITATIVE_EXECUTION.value) or EvidenceTrustTier.AUTHORITATIVE_EXECUTION.value),
-            status=str(data.get("status", EvidenceStatus.VALID.value)),
-            invalidation_reason=str(data.get("invalidation_reason", "")),
+            status=status,
+            invalidation_reason=invalidation_reason,
             workspace_root=str(data.get("workspace_root", "")),
             worktree_id=data.get("worktree_id"),
             target_paths=[str(p) for p in (data.get("target_paths") or [])],
@@ -493,7 +506,7 @@ class CompletionDecisionEngine:
         # ----------------------------------------------------------------------
         # Gate 2: Workspace Diff Non-Empty (when implementation required)
         # ----------------------------------------------------------------------
-        has_changes = bool(applied_operations and current_diff.strip())
+        has_changes = bool(applied_operations or current_diff.strip())
         no_changes_needed = (not applied_operations and not current_diff.strip() and last_review is not None and last_review.verdict == "APPROVED")
         diff_ev = [e.evidence_id for e in valid_entries if e.evidence_type == EvidenceType.DIFF_INSPECTION.value]
         gates.append(CompletionGateResult(
@@ -550,6 +563,16 @@ class CompletionDecisionEngine:
             e for e in valid_entries
             if e.evidence_type == EvidenceType.TEST_EXECUTION.value and e.exit_code != 0
         ]
+        # A test suite was attempted at some point for this evidence store if any
+        # TEST_EXECUTION entry exists at all, valid or not. Once that is true, a
+        # workspace mutation that invalidates the passing evidence (Attack C: stale
+        # test evidence) must never be allowed to silently fall back to the
+        # "no automated test suite configured" shortcut below -- that shortcut is
+        # only safe when tests were genuinely never run for this task/subtask.
+        test_ever_attempted = any(
+            e.evidence_type == EvidenceType.TEST_EXECUTION.value
+            for e in evidence_store.all_entries()
+        )
 
         if test_fail_ev:
             test_passed = False
@@ -557,6 +580,9 @@ class CompletionDecisionEngine:
         elif test_ev:
             test_passed = True
             val_reason = f"{len(test_ev)} valid test execution(s) passed cleanly on current workspace"
+        elif test_ever_attempted:
+            test_passed = False
+            val_reason = "Prior test evidence invalidated by workspace mutation; no fresh passing validation on current state"
         elif syntax_passed and applied_operations:
             test_passed = True
             val_reason = "No automated test suite configured; syntax verified cleanly"
@@ -595,9 +621,17 @@ class CompletionDecisionEngine:
                 if not matching_hash:
                     review_diff_matches = False
 
+        # A live ReviewResult AND a corresponding recorded evidence entry are both
+        # required -- neither one alone is sufficient. Evidence-store entries are
+        # durable records of a past observation, not a substitute for the current
+        # call's live review outcome (an attacker or stale checkpoint could plant
+        # a matching CODE_REVIEW entry with no real review having occurred), and a
+        # live "APPROVED" object with no corroborating evidence trail is likewise
+        # an unverified assertion.
         review_passed = (
-            (last_review is None or last_review.verdict == "APPROVED")
-            and (len(review_ev) > 0 or last_review is not None)
+            last_review is not None
+            and last_review.verdict == "APPROVED"
+            and len(review_ev) > 0
             and review_diff_matches
         )
 
