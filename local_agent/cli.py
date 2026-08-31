@@ -849,6 +849,9 @@ def _print_execution_report(executor, want_execute: bool, want_apply: bool, resu
         print(f"    - {entry.candidate_id} [{entry.signal_kind}] -> {entry.status}")
         print(f"        applied={entry.applied} rolled_back={entry.rolled_back} "
               f"post-apply validation={_verdict_text(entry.validation_passed)}")
+        if entry.semantic_verified is not None:
+            sem_text = "PASSED" if entry.semantic_verified else f"FAILED ({entry.semantic_failure_category or 'rejected'})"
+            print(f"        semantic verification: {sem_text}")
         if entry.oracle_name:
             print(f"        oracle: {entry.oracle_name} ({entry.oracle_class})")
             for label, observation in (
@@ -903,6 +906,7 @@ def _print_signal_inventory(emit_json) -> int:
         inventory_rows,
         oracle_for,
     )
+    from .semantic_verification import verifier_for
 
     if emit_json is not None:
         emit_json({
@@ -920,6 +924,7 @@ def _print_signal_inventory(emit_json) -> int:
     print("  live; neither can be granted by configuration or persisted state.")
     for row in inventory_rows():
         oracle = oracle_for(row["signal"])
+        sem_ver = verifier_for(row["signal"])
         marker = "AUTONOMOUS" if row["autonomous_execution"] else "gated"
         print()
         print(f"  {row['signal']}  [{marker}]")
@@ -928,6 +933,7 @@ def _print_signal_inventory(emit_json) -> int:
         print(f"    evidence:      {row['evidence_source']}")
         print(f"    confidence:    {row['confidence_source']}")
         print(f"    oracle:        {oracle.name} ({row['oracle_class']})")
+        print(f"    semantic ver:  {sem_ver.verifier_name} ({sem_ver.confidence_class})")
         print(f"    failure test:  {oracle.describe_failure_predicate()}")
         print(f"    success test:  {oracle.describe_success_predicate()}")
         print(f"    policy ceiling:{row['policy_max_tier']}")

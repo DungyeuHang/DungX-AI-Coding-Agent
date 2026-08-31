@@ -201,6 +201,7 @@ class MaintenanceExecutionOutcome:
 
     succeeded: bool = False
     validation_passed: bool | None = None
+    semantic_verified: bool | None = None
     changed_files: list[str] = field(default_factory=list)
     task_id: str = ""
     error: str = ""
@@ -212,6 +213,8 @@ class MaintenanceExecutionOutcome:
         self.task_id = sanitize_text(self.task_id, limit=64)
         self.error = sanitize_text(self.error)
         self.notes = sanitize_string_list(self.notes)
+        if self.semantic_verified is not None:
+            self.semantic_verified = bool(self.semantic_verified)
         try:
             self.elapsed_seconds = max(0.0, float(self.elapsed_seconds))
         except (TypeError, ValueError):
@@ -221,6 +224,7 @@ class MaintenanceExecutionOutcome:
         return {
             "succeeded": self.succeeded,
             "validation_passed": self.validation_passed,
+            "semantic_verified": self.semantic_verified,
             "changed_files": list(self.changed_files),
             "task_id": self.task_id,
             "error": self.error,
@@ -382,6 +386,7 @@ def reassess(
     *,
     executed: bool,
     validation_passed: bool | None,
+    semantic_verified: bool | None = None,
     rescan_degraded: bool = False,
 ) -> ReassessmentVerdict:
     """Compare a candidate before and after maintenance work.
@@ -404,8 +409,13 @@ def reassess(
        is gone" plus "we do not know whether the repository still works" is not
        a resolution. This mirrors the runner's own rule that an unknown
        validation result is never assumed to be a pass.
-    4. **Signal absent and validation passed** -> ``RESOLVED``. This is the only
-       path to RESOLVED, and it requires 1-3b to have passed first.
+    3c. **Semantic verification failed** -> ``PERSISTING``. Even if validation
+       commands exited 0 and the rescan did not flag the file, a repair that
+       failed semantic verification (e.g. gutted bodies or corrupted structure)
+       cannot be credited as resolved.
+    4. **Signal absent, validation passed, and semantic verification passed** ->
+       ``RESOLVED``. This is the only path to RESOLVED, and it requires 1-3c to
+       have passed first.
     5. **Severity increased, or the fingerprint changed for the worse** ->
        ``REGRESSED``.
     6. **Severity decreased** -> ``PARTIALLY_RESOLVED``.
@@ -438,6 +448,12 @@ def reassess(
             "validation failed, so no fix can be credited regardless of the signal"
         )
         return verdict
+    if semantic_verified is False:
+        verdict.outcome = ReassessmentOutcome.PERSISTING
+        verdict.reasons.append(
+            "semantic verification rejected the repair, so resolution cannot be credited"
+        )
+        return verdict
     if after is None and validation_passed is None:
         verdict.outcome = ReassessmentOutcome.INCONCLUSIVE
         verdict.reasons.append(
@@ -449,7 +465,7 @@ def reassess(
         verdict.outcome = ReassessmentOutcome.RESOLVED
         verdict.reasons.append(
             "a fresh scan no longer produces this signal, and the work that "
-            "preceded the rescan validated cleanly"
+            "preceded the rescan validated cleanly and passed semantic verification"
         )
         return verdict
 
@@ -1052,7 +1068,13 @@ class MaintenanceRunner:
             candidate.failure_count += 1
 
         # REASSESS
-        reassessment = self._reassess(candidate, executed=True, validation_passed=validation_passed)
+        semantic_verified = outcome.semantic_verified if outcome is not None else None
+        reassessment = self._reassess(
+            candidate,
+            executed=True,
+            validation_passed=validation_passed,
+            semantic_verified=semantic_verified,
+        )
         result.reassessments[candidate.candidate_id] = reassessment
         result.record.reassessments += 1
         if succeeded is False and reassessment.outcome == ReassessmentOutcome.RESOLVED:
@@ -1084,6 +1106,7 @@ class MaintenanceRunner:
         *,
         executed: bool,
         validation_passed: bool | None,
+        semantic_verified: bool | None = None,
     ) -> ReassessmentVerdict:
         self._emit(f"[{STAGE_REASSESS}] {candidate.candidate_id}")
         try:
@@ -1112,6 +1135,7 @@ class MaintenanceRunner:
             after,
             executed=executed,
             validation_passed=validation_passed,
+            semantic_verified=semantic_verified,
             rescan_degraded=fresh.degraded,
         )
 

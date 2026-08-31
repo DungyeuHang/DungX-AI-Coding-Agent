@@ -1166,6 +1166,7 @@ class CandidateRunOutcome:
     outcome: str = ReassessmentOutcome.PENDING
     executed: bool = False
     validation_passed: bool | None = None
+    semantic_verified: bool | None = None
     reasons: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     changed_files: list[str] = field(default_factory=list)
@@ -1188,6 +1189,8 @@ class CandidateRunOutcome:
         self.executed = bool(self.executed)
         if self.validation_passed is not None:
             self.validation_passed = bool(self.validation_passed)
+        if self.semantic_verified is not None:
+            self.semantic_verified = bool(self.semantic_verified)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1200,6 +1203,7 @@ class CandidateRunOutcome:
             "outcome": self.outcome,
             "executed": self.executed,
             "validation_passed": self.validation_passed,
+            "semantic_verified": self.semantic_verified,
             "reasons": list(self.reasons),
             "errors": list(self.errors),
             "changed_files": list(self.changed_files),
@@ -1222,6 +1226,7 @@ class CandidateRunOutcome:
                 "outcome",
                 "executed",
                 "validation_passed",
+                "semantic_verified",
                 "reasons",
                 "errors",
                 "changed_files",

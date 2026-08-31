@@ -116,6 +116,15 @@ from .maintenance_runner import MaintenanceExecutionOutcome, MaintenanceWorkOrde
 from .models import CommandSpec, FileOperation, Plan, ProjectContext
 from .patching import PatchApplicationError
 from .sandbox import CandidateWorkspace, ProspectiveValidator
+from .semantic_verification import (
+    SEMANTIC_VERIFICATION_SCHEMA_VERSION,
+    DefectIdentity,
+    FailureCategory,
+    SemanticVerificationStatus,
+    SemanticVerifier,
+    VerificationEvidence,
+    verifier_for,
+)
 from .validation_decision import ValidationDecisionEngine
 from .validation_lifecycle import (
     RESULT_FAILED,
@@ -131,7 +140,7 @@ LOGGER = logging.getLogger(__name__)
 #: Version stamp for this executor's behaviour. Recorded on every result and
 #: folded into the policy fingerprint, so a work order planned under one
 #: executor generation is not silently executed by another.
-MAINTENANCE_EXECUTOR_VERSION = "4.23.0"
+MAINTENANCE_EXECUTOR_VERSION = "4.24.0"
 
 
 # =============================================================================
@@ -294,6 +303,10 @@ class MaintenanceExecutionStatus:
     #: repository's health: this one means the repository is fine and the repair
     #: was ineffective. The change is rolled back either way.
     SIGNAL_NOT_RESOLVED = "signal_not_resolved"
+    #: Post-apply validation and structural oracle passed, but semantic
+    #: verification rejected the repair (e.g. gutted/stubbed function bodies,
+    #: unbroken AST blocks mutated, dropped imports, line degradation).
+    SEMANTIC_VERIFICATION_FAILED = "semantic_verification_failed"
     #: The apply touched more files than the per-candidate budget allowed. A
     #: separate status from ``budget_exhausted`` precisely because the tree
     #: *was* written before the breach was noticed, so it must not appear in
@@ -322,6 +335,7 @@ ALL_EXECUTION_STATUSES: tuple[str, ...] = (
     MaintenanceExecutionStatus.APPLY_FAILED,
     MaintenanceExecutionStatus.POST_VALIDATION_FAILED,
     MaintenanceExecutionStatus.SIGNAL_NOT_RESOLVED,
+    MaintenanceExecutionStatus.SEMANTIC_VERIFICATION_FAILED,
     MaintenanceExecutionStatus.POST_APPLY_BUDGET_BREACH,
 )
 
@@ -340,6 +354,7 @@ RETRYABLE_STATUSES: frozenset[str] = frozenset(
         MaintenanceExecutionStatus.PROSPECTIVE_VALIDATION_FAILED,
         MaintenanceExecutionStatus.BUDGET_EXHAUSTED,
         MaintenanceExecutionStatus.APPROVAL_REQUIRED,
+        MaintenanceExecutionStatus.SEMANTIC_VERIFICATION_FAILED,
     }
 )
 
@@ -410,6 +425,11 @@ class MaintenanceExecutionResult:
     #: "nothing ran" as validation coverage.
     post_apply_executed_any: bool = False
 
+    #: Phase 4.24: Post-execution semantic verification evidence and status.
+    semantic_verification: dict[str, Any] | None = None
+    semantic_verified: bool | None = None
+    semantic_failure_category: str = ""
+
     provider: str = ""
     model: str = ""
     tool_steps_used: int = 0
@@ -432,7 +452,7 @@ class MaintenanceExecutionResult:
 
     @property
     def succeeded(self) -> bool:
-        """True only for a change that applied *and* post-validated.
+        """True only for a change that applied, post-validated, and semantically verified.
 
         A successful write is not successful maintenance, and ``no_change`` -
         the agent legitimately concluding there was nothing to do - is not a
@@ -442,6 +462,7 @@ class MaintenanceExecutionResult:
             self.status == MaintenanceExecutionStatus.COMPLETED
             and self.applied
             and self.validation_passed is True
+            and self.semantic_verified is not False
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -457,6 +478,9 @@ class MaintenanceExecutionResult:
             "validation_passed": self.validation_passed,
             "prospective_validation_passed": self.prospective_validation_passed,
             "signal_resolved": self.signal_resolved,
+            "semantic_verified": self.semantic_verified,
+            "semantic_failure_category": self.semantic_failure_category,
+            "semantic_verification": self.semantic_verification,
             "succeeded": self.succeeded,
             "retryable": self.retryable,
             "changed_files": list(self.changed_files),
@@ -505,9 +529,14 @@ class MaintenanceExecutionResult:
             notes.append("change applied to the authoritative tree")
         if self.rolled_back:
             notes.append("apply was rolled back after post-apply validation failed")
+        if self.semantic_verified is True:
+            notes.append("semantic verification PASSED: defect resolved and body integrity preserved")
+        elif self.semantic_verified is False:
+            notes.append(f"semantic verification FAILED ({self.semantic_failure_category})")
         return MaintenanceExecutionOutcome(
             succeeded=self.succeeded,
             validation_passed=self.validation_passed,
+            semantic_verified=self.semantic_verified,
             changed_files=list(self.changed_files) if not self.rolled_back else [],
             task_id=self.lifecycle_id,
             error="; ".join(self.errors[:3]),
@@ -929,9 +958,10 @@ class MaintenanceExecutor:
             return ""
 
         # -- 6. freshness / TOCTOU, and the oracle's BEFORE observation ----
-        before = self._check_freshness(order, oracle, relative, result)
-        if before is None:
+        freshness = self._check_freshness(order, oracle, relative, result)
+        if freshness is None:
             return ""
+        before, before_identity = freshness
 
         # -- 7. idempotency ------------------------------------------------
         key = self._execution_key(order, candidate, relative)
@@ -1009,9 +1039,9 @@ class MaintenanceExecutor:
             )
             return key
 
-        # -- 12. apply + post-apply validation -----------------------------
+        # -- 12. apply + post-apply validation + semantic verification ------
         self._apply_and_validate(
-            order, oracle, before, prepared, relative, limits, evidence_ledger, result
+            order, oracle, before, before_identity, prepared, relative, limits, evidence_ledger, result
         )
         return key
 
@@ -1105,6 +1135,17 @@ class MaintenanceExecutor:
             return None
         return candidate
 
+    def _resolve_candidate(
+        self, order: MaintenanceWorkOrder
+    ) -> MaintenanceCandidate | None:
+        snapshot = getattr(order, "candidate_snapshot", None)
+        if isinstance(snapshot, Mapping) and snapshot:
+            try:
+                return MaintenanceCandidate.from_dict(snapshot)
+            except Exception:
+                pass
+        return None
+
     def _effective_limits(
         self, order: MaintenanceWorkOrder, result: MaintenanceExecutionResult
     ) -> dict[str, int] | None:
@@ -1190,7 +1231,7 @@ class MaintenanceExecutor:
         oracle: ExecutionOracle,
         relative: str,
         result: MaintenanceExecutionResult,
-    ) -> OracleObservation | None:
+    ) -> tuple[OracleObservation, DefectIdentity | None] | None:
         """Refuse to execute a plan made against a different repository state.
 
         Three independent checks, cheapest first:
@@ -1205,8 +1246,10 @@ class MaintenanceExecutor:
            observation is evaluated against it, so the post-condition can be
            "the defect is gone **and** the module survived" rather than the
            weaker "the defect is gone".
+        4. (Phase 4.24) Capture immutable before-state defect identity for
+           deep semantic verification.
 
-        Returns the BEFORE observation, or ``None`` when execution is refused.
+        Returns (before_obs, before_identity), or ``None`` when execution is refused.
         An *inconclusive* observation refuses: an oracle that cannot establish
         the defect is present now will not be able to establish it is gone
         later, and executing against a repository the oracle cannot read is
@@ -1247,7 +1290,15 @@ class MaintenanceExecutor:
             f"signal re-observed at execution time by oracle '{oracle.name}': "
             f"{before.detail}"
         )
-        return before
+
+        candidate = self._resolve_candidate(order)
+        sem_verifier = verifier_for(candidate.kind if candidate else result.signal_kind)
+        before_identity = sem_verifier.capture_before_evidence(
+            self.root,
+            relative,
+            candidate or MaintenanceCandidate(candidate_id=order.candidate_id, kind=result.signal_kind),
+        )
+        return before, before_identity
 
     def _execution_key(
         self,
@@ -1531,6 +1582,7 @@ class MaintenanceExecutor:
         order: MaintenanceWorkOrder,
         oracle: ExecutionOracle,
         before: OracleObservation,
+        before_identity: DefectIdentity | None,
         prepared: list[Any],
         relative: str,
         limits: Mapping[str, int],
@@ -1621,6 +1673,25 @@ class MaintenanceExecutor:
                     )
                 )
 
+            # Phase 4.24: Post-execution semantic verification.
+            candidate = self._resolve_candidate(order)
+            sem_verifier = verifier_for(candidate.kind if candidate else result.signal_kind)
+            sem_evidence = sem_verifier.verify(
+                self.root,
+                relative,
+                before_identity,
+                validation_evidence=evidence_ledger,
+                candidate=candidate,
+            )
+            result.semantic_verification = sem_evidence.to_dict()
+            result.semantic_verified = sem_evidence.passed
+            result.semantic_failure_category = sem_evidence.failure_category
+            if not sem_evidence.passed:
+                result.reasons.append(
+                    f"semantic verifier '{sem_verifier.verifier_name}' rejected repair "
+                    f"({sem_evidence.failure_category}): {'; '.join(sem_evidence.failure_reasons)}"
+                )
+
             # ``validation_passed`` is the *validation* verdict and nothing
             # else - never a blend of "validation passed" and "the signal went
             # away". The runner's reassessment reads it, and a blended value
@@ -1628,7 +1699,10 @@ class MaintenanceExecutor:
             # repair was ineffective.
             result.validation_passed = verdict
             passed = (
-                verdict is True and result.signal_resolved is True and not overshot
+                verdict is True
+                and result.signal_resolved is True
+                and not overshot
+                and result.semantic_verified is True
             )
         except Exception as exc:  # noqa: BLE001 - must not leave a change behind
             LOGGER.exception("Post-apply evaluation raised after an authoritative apply")
@@ -1643,6 +1717,7 @@ class MaintenanceExecutor:
             # resolution that was never validated.
             result.validation_passed = None
             result.signal_resolved = False
+            result.semantic_verified = False
             passed = False
 
         self._record_evidence(evidence_ledger, executions, changed, result)
@@ -1659,8 +1734,9 @@ class MaintenanceExecutor:
             )
             result.status = MaintenanceExecutionStatus.COMPLETED
             result.reasons.append(
-                "post-apply validation produced a real PASS verdict and oracle "
-                f"'{oracle.name}' confirmed the signal no longer reproduces"
+                "post-apply validation produced a real PASS verdict, oracle "
+                f"'{oracle.name}' confirmed the signal no longer reproduces, and "
+                "semantic verification confirmed defect resolution without body gutting"
             )
             return
 
@@ -1680,6 +1756,12 @@ class MaintenanceExecutor:
             result.reasons.append(
                 "the apply exceeded the per-candidate changed-file budget; the "
                 "change was rolled back rather than credited"
+            )
+        elif verdict is True and result.signal_resolved is True and not result.semantic_verified:
+            result.status = MaintenanceExecutionStatus.SEMANTIC_VERIFICATION_FAILED
+            result.reasons.append(
+                "post-apply validation and structural oracle passed, but semantic "
+                "verification rejected the repair; the change was rolled back rather than credited"
             )
         elif verdict is True:
             # Validation was genuinely fine; the change simply did not fix the
