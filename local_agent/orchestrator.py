@@ -35,6 +35,9 @@ from .models import (
     ExecutionResult,
     FailureAnalysis,
     ImplementationResult,
+    ImplementationTurn,
+    MultiTurnExecutionReport,
+    MultiTurnState,
     Plan,
     PlanAmendment,
     PlanProposal,
@@ -1555,6 +1558,23 @@ class Orchestrator:
                     None,
                 )
 
+                # Checkpoint rehydration for durable resume recovery
+                existing_turns: list[ImplementationTurn] = []
+                initial_state = MultiTurnState.IMPLEMENTING
+                latest_cp = self.storage.load_latest_checkpoint(task.task_id)
+                if latest_cp and getattr(latest_cp, "turns", None):
+                    sub_match = not active_subtask or latest_cp.subtask_id == active_subtask.subtask_id
+                    if sub_match:
+                        existing_turns = [
+                            ImplementationTurn.from_dict(t) if isinstance(t, dict) else t
+                            for t in latest_cp.turns
+                        ]
+                        if latest_cp.turn_stage:
+                            try:
+                                initial_state = MultiTurnState(latest_cp.turn_stage)
+                            except ValueError:
+                                initial_state = MultiTurnState.IMPLEMENTING
+
                 multi_report = multi_agent.execute(
                     task=task,
                     subtask=active_subtask,
@@ -1565,6 +1585,8 @@ class Orchestrator:
                     failure=failure,
                     review=review,
                     report=report,
+                    existing_turns=existing_turns,
+                    initial_state=initial_state,
                 )
 
                 if report is not None:

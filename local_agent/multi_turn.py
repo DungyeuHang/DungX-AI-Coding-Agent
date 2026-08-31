@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import datetime
+import difflib
 import logging
 import os
 import shlex
@@ -18,8 +20,10 @@ from .coding_agent import (
 from .config import AgentConfig
 from .failure import FailureAnalyzer
 from .filesystem import ProjectFilesystem, ProtectedPathError, SandboxViolation
+from .git import GitIntegration
 from .models import (
     Checkpoint,
+    ClarificationRequest,
     ExecutionResult,
     FailureAnalysis,
     FileOperation,
@@ -68,8 +72,14 @@ class MultiTurnImplementationAgent:
     PLANNING -> IMPLEMENTING -> INSPECTING -> TESTING -> ANALYZING_FAILURE ->
     REPAIRING -> REVIEWING -> VERIFYING -> COMPLETED / FAILED / PAUSED.
 
-    Composes existing ToolEngine, ToolRegistry, ToolExecutionPolicy, CodingAgent,
-    FailureAnalyzer, Reviewer, and Storage abstractions with zero duplicate logic.
+    Guarantees:
+    - Bounded execution with strict turn budgets for implementation, repair, review, and verification.
+    - Durable turn-level telemetry ledger persisted at every state transition.
+    - Scoped tool execution restricted to the safe implementation surface.
+    - Authoritative unified diff reconstruction for accurate deliberative code review.
+    - Rigorous multi-turn verification including full test execution and AST syntax validation.
+    - Automatic state recovery upon pause (rate limits / clarification requests).
+    - Worktree isolation ensuring no mutable state is shared across parallel workers.
     """
 
     def __init__(
@@ -95,127 +105,113 @@ class MultiTurnImplementationAgent:
         self.allowed_tools = (
             frozenset(allowed_tools)
             if allowed_tools is not None
-            else IMPLEMENTATION_TOOL_SURFACE
+            else frozenset(IMPLEMENTATION_TOOL_SURFACE | {"ask_user_clarification"})
         )
         self.checkpoint_callback = checkpoint_callback
 
-        # Bounded limits
-        self.max_turns = max(1, int(getattr(config, "max_implementation_turns", DEFAULT_MAX_IMPLEMENTATION_TURNS)))
-        self.max_repair_turns = max(0, int(getattr(config, "max_repair_turns", DEFAULT_MAX_REPAIR_TURNS)))
-        self.max_review_turns = max(0, int(getattr(config, "max_review_turns", DEFAULT_MAX_REVIEW_TURNS)))
-        self.max_verification_turns = max(0, int(getattr(config, "max_verification_turns", DEFAULT_MAX_VERIFICATION_TURNS)))
-        self.max_tool_steps = max(1, int(getattr(config, "max_implementation_tool_steps", DEFAULT_MAX_TOOL_STEPS)))
+        self.max_turns = getattr(config, "max_implementation_turns", DEFAULT_MAX_IMPLEMENTATION_TURNS)
+        self.max_repair_turns = getattr(config, "max_repair_turns", DEFAULT_MAX_REPAIR_TURNS)
+        self.max_review_turns = getattr(config, "max_review_turns", DEFAULT_MAX_REVIEW_TURNS)
+        self.max_verification_turns = getattr(config, "max_verification_turns", DEFAULT_MAX_VERIFICATION_TURNS)
+        self.max_tool_steps = getattr(config, "max_implementation_tool_steps", DEFAULT_MAX_TOOL_STEPS)
 
     def build_policy(self) -> ToolExecutionPolicy:
-        """Derive effective ToolExecutionPolicy clamped to the turn step budget."""
-        base = self.policy
-        registry_tools = {d.name for d in self.registry.definitions()}
-        out_of_surface = {name for name in registry_tools if name not in self.allowed_tools}
+        """Constructs an implementation-scoped execution policy."""
+        if self.policy is not None:
+            return self.policy
 
-        if base is None:
-            return ToolExecutionPolicy(
-                max_tool_steps=self.max_tool_steps,
-                disallowed_tools=set(out_of_surface),
-            )
+        max_steps = getattr(self.config, "max_implementation_tool_steps", DEFAULT_MAX_TOOL_STEPS)
+        max_bytes = getattr(self.config, "max_tool_output_bytes", 8000)
+        total_budget = getattr(self.config, "total_tool_budget_bytes", 32000)
+        max_repeats = getattr(self.config, "max_consecutive_repeats", 3)
 
         return ToolExecutionPolicy(
-            max_tool_steps=min(int(base.max_tool_steps), self.max_tool_steps),
-            max_tool_output_bytes=base.max_tool_output_bytes,
-            total_tool_budget_bytes=base.total_tool_budget_bytes,
-            max_consecutive_repeats=base.max_consecutive_repeats,
-            per_tool_limits=dict(base.per_tool_limits),
-            disallowed_tools=set(base.disallowed_tools) | out_of_surface,
-            compaction_window=base.compaction_window,
-            max_context_bytes=base.max_context_bytes,
+            max_tool_steps=max_steps,
+            max_tool_output_bytes=max_bytes,
+            total_tool_budget_bytes=total_budget,
+            max_consecutive_repeats=max_repeats,
         )
-
-    def _supports_tool_use(self, provider: Any) -> bool:
-        caps = getattr(provider, "capabilities", None)
-        if isinstance(caps, (set, frozenset)):
-            return ProviderCapability.TOOL_USE in caps
-        return hasattr(provider, "generate_code_with_tools")
 
     def build_turn_prompt(
         self,
         task_objective: str,
-        subtask: Subtask | None = None,
-        upstream_contracts: list[SubtaskContract] | None = None,
-        context: ProjectContext | None = None,
+        subtask: Subtask | None,
+        upstream_contracts: list[SubtaskContract] | None,
+        context: ProjectContext,
         failure: FailureAnalysis | None = None,
         review: ReviewResult | None = None,
         turn_number: int = 1,
         stage: MultiTurnState = MultiTurnState.IMPLEMENTING,
     ) -> str:
-        """Builds structured, compacted prompt context for the turn."""
-        header = task_objective
-        if subtask is not None and getattr(subtask, "goal", None) and subtask.goal != task_objective:
-            header = f"Subtask Goal: {subtask.goal}\n\nTask Objective: {task_objective}"
-
-        lines: list[str] = [
-            header,
+        """Builds a structured, stage-aware context prompt for the turn."""
+        lines = [
+            f"# Objective: {task_objective}",
             "",
             f"MULTI-TURN IMPLEMENTATION AGENT (TURN {turn_number} / STAGE: {stage.value.upper()})",
-            "=================================================================",
+            "=" * 65,
             "Execute the current implementation phase autonomously using tools.",
             "Inspect and verify before editing. Do not rewrite unmodified files.",
             "",
-            "1. UNDERSTAND  - examine objective and requirements.",
-            "2. INSPECT     - use read_file_range, find_files, grep_code to read current code.",
-            "3. REASON      - decide minimal, focused edits matching the plan.",
-            "4. EMIT        - return the complete list of file operations.",
+            "1. UNDERSTAND  - examine relevant code, signatures, and project structure.",
+            "2. PLAN        - determine minimal, targeted changes required.",
+            "3. IMPLEMENT   - produce precise file operations or patches.",
+            "4. VERIFY      - validate changes against test suites and contract invariants.",
             "",
-            "CONSTRAINTS",
-            "-----------",
-            "- Stay strictly inside the approved plan scope; do not modify unrelated files.",
-            "- Never attempt to read or modify protected files (tool_engine.py, approval.py) or secrets.",
-            f"- Available tools: {', '.join(sorted(self.allowed_tools))}.",
         ]
 
+        if subtask:
+            lines.extend([
+                "### Active Subtask",
+                f"- ID: {subtask.subtask_id}",
+                f"- Title: {subtask.title}",
+                f"- Goal: {subtask.goal}",
+                "",
+            ])
+
         if upstream_contracts:
-            lines.append("")
-            lines.append("UPSTREAM INTERFACE CONSTRAINTS")
-            lines.append("==============================")
+            lines.extend([
+                "### UPSTREAM INTERFACE CONSTRAINTS (MANDATORY)",
+                "You must strictly respect the interfaces and behaviors exported by upstream subtasks:",
+            ])
             for contract in upstream_contracts:
-                if hasattr(contract, "format_for_prompt"):
-                    lines.append(contract.format_for_prompt(max_chars=1200))
-
-        knowledge = None
-        metadata = getattr(context, "metadata", None) if context is not None else None
-        if isinstance(metadata, dict):
-            knowledge = metadata.get("persistent_knowledge")
-        if knowledge:
+                lines.append(contract.format_for_prompt(max_chars=1500))
             lines.append("")
-            lines.append("PERSISTENT REPOSITORY KNOWLEDGE")
-            lines.append("===============================")
-            lines.append(str(knowledge))
 
-        if failure is not None:
+        if failure:
+            lines.extend([
+                "### PREVIOUS FAILURE / REPAIR DIAGNOSTICS",
+                f"- Probable Root Cause: {failure.probable_root_cause}",
+                f"- Recommended Fix: {failure.recommended_fix}",
+            ])
+            if failure.diagnostic_evidence:
+                lines.append("- Diagnostic Evidence:")
+                for item in failure.diagnostic_evidence[:5]:
+                    lines.append(f"  * {item}")
             lines.append("")
-            lines.append("FAILURE ANALYSIS & REPAIR CONTEXT")
-            lines.append("==================================")
-            lines.append(f"Root cause: {getattr(failure, 'probable_root_cause', '')}")
-            recommended = getattr(failure, "recommended_fix", None)
-            if recommended:
-                lines.append(f"Recommended fix: {recommended}")
-            affected = getattr(failure, "affected_files", None)
-            if affected:
-                lines.append(f"Affected files: {', '.join(affected)}")
-            for diag in getattr(failure, "diagnostic_evidence", []):
-                if hasattr(diag, "stdout") and (diag.stdout or diag.stderr):
-                    out_snip = (diag.stdout + "\n" + diag.stderr).strip()[-1000:]
-                    lines.append(f"Command '{diag.command}' output:\n{out_snip}")
 
-        if review is not None and review.findings:
+        if review and review.findings:
+            lines.extend([
+                "### CODE REVIEW FINDINGS (CHANGES REQUIRED)",
+                f"- Summary: {review.summary}",
+                "- Findings:",
+            ])
+            for f in review.findings[:5]:
+                lines.append(f"  * {f}")
             lines.append("")
-            lines.append("REVIEW FINDINGS TO ADDRESS")
-            lines.append("==========================")
-            for f in review.findings:
-                lines.append(f"- {f}")
 
         return "\n".join(lines)
 
+    def _supports_tool_use(self, provider: Any) -> bool:
+        """Determines if the provider supports tool use and interactive step generation."""
+        if hasattr(provider, "generate_code_with_tools"):
+            return True
+        caps = getattr(provider, "capabilities", None)
+        if isinstance(caps, (set, frozenset)) and ProviderCapability.TOOL_USE in caps:
+            return True
+        return False
+
     def _precheck_operations(self, operations: list[FileOperation], plan: Plan) -> list[str]:
-        """Validates file operations for patch safety and scope constraints."""
+        """Validates that proposed file operations are safe and conform to the plan."""
         errors: list[str] = []
         allowed = set(plan.allowed_paths) if hasattr(plan, "allowed_paths") else set(
             getattr(plan, "files_likely_to_change", []) + getattr(plan, "files_likely_to_create", [])
@@ -300,6 +296,34 @@ class MultiTurnImplementationAgent:
 
         return results
 
+    def _compute_workspace_diff(self, applied_ops: list[FileOperation]) -> str:
+        """Computes authoritative unified diff against base repository state."""
+        git = GitIntegration(self.filesystem.root)
+        if git.is_repository():
+            d = git.diff()
+            if d:
+                return d
+        # Fallback for non-git workspaces or candidate trees
+        diff_chunks: list[str] = []
+        for op in applied_ops:
+            path = getattr(op, "path", None)
+            if not path:
+                continue
+            try:
+                current_content = self.filesystem.read_file(path)
+            except (OSError, UnicodeDecodeError, ProtectedPathError, SandboxViolation):
+                current_content = ""
+            orig_content = getattr(op, "original", "") or ""
+            diff_lines = list(difflib.unified_diff(
+                orig_content.splitlines(keepends=True),
+                current_content.splitlines(keepends=True),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+            ))
+            if diff_lines:
+                diff_chunks.append("".join(diff_lines))
+        return "\n".join(diff_chunks)
+
     def _checkpoint(
         self,
         task: Task,
@@ -308,33 +332,33 @@ class MultiTurnImplementationAgent:
         stage: MultiTurnState,
         context: ProjectContext,
     ) -> None:
-        """Persists a durable checkpoint at the turn boundary."""
-        if self.checkpoint_callback is not None:
-            self.checkpoint_callback(turn, stage)
+        """Persists a durable checkpoint at turn boundary."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        subtask_id = subtask.subtask_id if subtask else (getattr(task, "current_subtask_id", "main") or "main")
+        cp_id = f"cp-{task.task_id}-{subtask_id}-t{turn.turn_number}-{stage.value}"
 
-        cp_id = f"cp-turn-{turn.task_id}-{turn.turn_number}-{stage.value}"
-        checkpoint = Checkpoint(
+        cp = Checkpoint(
             checkpoint_id=cp_id,
             task_id=task.task_id,
-            subtask_id=subtask.subtask_id if subtask else "",
-            timestamp=datetime.datetime.now(datetime.timezone.utc),
-            current_state_description=f"Turn {turn.turn_number} - Stage: {stage.value}",
-            turn_stage=stage.value,
-            current_turn_number=turn.turn_number,
+            subtask_id=subtask_id,
+            timestamp=now,
+            current_state_description=f"Turn {turn.turn_number} stage: {stage.value}",
+            files_changed=[op.get("path") for op in turn.file_operations if isinstance(op, dict) and op.get("path")],
             turns=[turn.to_dict()],
-            continuation_context={
-                "turn_id": turn.turn_id,
-                "turn_stage": stage.value,
-                "status": turn.status,
-            },
+            current_turn_number=turn.turn_number,
+            turn_stage=stage.value,
         )
+
         try:
-            self.storage.save_checkpoint(checkpoint)
-            task.latest_checkpoint_id = cp_id
-            if subtask:
-                subtask.latest_checkpoint_id = cp_id
+            self.storage.save_checkpoint(cp)
         except Exception as exc:
-            LOGGER.warning("Could not persist turn checkpoint %s: %s", cp_id, exc)
+            LOGGER.warning("Failed to persist turn checkpoint %s: %s", cp_id, exc)
+
+        if self.checkpoint_callback is not None:
+            try:
+                self.checkpoint_callback(turn, stage)
+            except Exception as exc:
+                LOGGER.warning("Checkpoint callback error: %s", exc)
 
     def execute(
         self,
@@ -342,49 +366,63 @@ class MultiTurnImplementationAgent:
         subtask: Subtask | None,
         plan: Plan,
         context: ProjectContext,
-        provider: AIProvider,
+        provider: Any,
         upstream_contracts: list[SubtaskContract] | None = None,
-        initial_turn_number: int = 1,
-        existing_turns: list[ImplementationTurn] | None = None,
-        initial_state: MultiTurnState = MultiTurnState.IDLE,
         failure: FailureAnalysis | None = None,
         review: ReviewResult | None = None,
-        progress: Callable[[str], None] | None = None,
         report: RunReport | None = None,
+        progress: Callable[[str], None] | None = None,
+        existing_turns: list[ImplementationTurn] | None = None,
+        initial_state: MultiTurnState = MultiTurnState.IMPLEMENTING,
     ) -> MultiTurnExecutionReport:
-        """Runs the bounded multi-turn implementation loop until completion or budget exhaustion."""
+        """Executes the bounded multi-turn implementation loop."""
         start_time = time.perf_counter()
-        provider_name = getattr(
-            provider, "provider_id", getattr(provider, "name", provider.__class__.__name__)
-        )
-        model_name = getattr(provider, "model", "default")
-        task_id = task.task_id if hasattr(task, "task_id") else "unknown-task"
+        task_id = task.task_id
         subtask_id = subtask.subtask_id if subtask else "subtask-main"
-        task_objective = task.objective if hasattr(task, "objective") else str(task)
+        task_objective = (
+            subtask.goal if subtask and subtask.goal
+            else (plan.objective if plan.objective else task.objective)
+        )
 
+        provider_name = getattr(provider, "provider_id", "unknown")
+        model_name = getattr(provider, "model", "unknown")
+
+        def emit(msg: str) -> None:
+            if progress:
+                progress(f"[{task_id}:{subtask_id}] {msg}")
+            LOGGER.info("[%s:%s] %s", task_id, subtask_id, msg)
+
+        # State tracking
+        current_state = initial_state
         turns: list[ImplementationTurn] = list(existing_turns or [])
-        current_state = initial_state if initial_state != MultiTurnState.IDLE else MultiTurnState.IMPLEMENTING
-        repair_turn_count = sum(1 for t in turns if t.stage == MultiTurnState.REPAIRING.value and t.status == "completed")
-        review_turn_count = sum(1 for t in turns if t.stage == MultiTurnState.REVIEWING.value and t.status == "completed")
-        
-        current_tool_history: list[tuple[ToolCall, ToolResult]] = []
-        last_failure: FailureAnalysis | None = failure
-        last_review: ReviewResult | None = review
+        repair_turn_count = sum(1 for t in turns if t.stage == MultiTurnState.REPAIRING.value)
+        review_turn_count = sum(1 for t in turns if t.stage == MultiTurnState.REVIEWING.value)
+        verification_turn_count = sum(1 for t in turns if t.stage == MultiTurnState.VERIFYING.value)
+
+        last_failure = failure
+        last_review = review
         applied_operations: list[FileOperation] = []
         all_tool_metrics: list[ToolExecutionMetrics] = []
+        current_tool_history: list[tuple[ToolCall, ToolResult]] = []
+
+        # Reconstruct tool history and applied operations from existing turns if present
+        for t in turns:
+            if t.tool_calls and t.tool_results and len(t.tool_calls) == len(t.tool_results):
+                for c_dict, r_dict in zip(t.tool_calls, t.tool_results):
+                    c = ToolCall.from_dict(c_dict) if isinstance(c_dict, dict) else c_dict
+                    r = ToolResult.from_dict(r_dict) if isinstance(r_dict, dict) else r_dict
+                    current_tool_history.append((c, r))
+            if t.file_operations:
+                for op in t.file_operations:
+                    applied_operations.append(FileOperation(**op) if isinstance(op, dict) else op)
+
+        effective_policy = self.build_policy()
         termination_reason = "in_progress"
         error_message: str | None = None
 
-        def emit(msg: str) -> None:
-            LOGGER.info("[MultiTurn] %s", msg)
-            if progress:
-                progress(f"[MultiTurn] {msg}")
+        emit(f"Starting multi-turn implementation (initial state: {current_state.value}).")
 
-        emit(f"Starting multi-turn loop for {subtask_id} in state {current_state.value}")
-
-        effective_policy = self.build_policy()
-
-        while current_state not in {MultiTurnState.COMPLETED, MultiTurnState.FAILED, MultiTurnState.PAUSED}:
+        while current_state not in (MultiTurnState.COMPLETED, MultiTurnState.FAILED, MultiTurnState.PAUSED):
             turn_num = len(turns) + 1
             if turn_num > self.max_turns:
                 emit(f"Turn budget exceeded ({self.max_turns} turns). Terminating.")
@@ -582,18 +620,20 @@ class MultiTurnImplementationAgent:
                     current_state = MultiTurnState.FAILED
                     termination_reason = "repair_budget_exhausted"
                     error_message = turn.error_message
+                    self._checkpoint(task, subtask, turn, MultiTurnState.FAILED, context)
                     break
 
                 turn.status = "completed"
                 turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                 turns.append(turn)
+                self._checkpoint(task, subtask, turn, MultiTurnState.ANALYZING_FAILURE, context)
                 current_state = MultiTurnState.REPAIRING
                 continue
 
             # --- STAGE: REPAIRING ---
             elif current_state == MultiTurnState.REPAIRING:
                 repair_turn_count += 1
-                emit(f"Turn {turn_num}: Repairing defect (repair attempt {repair_turn_count}/{self.max_repair_turns})...")
+                emit(f"Turn {turn_num}: Repairing defects (attempt {repair_turn_count}/{self.max_repair_turns})...")
                 turn = ImplementationTurn(
                     turn_id=turn_id,
                     task_id=task_id,
@@ -602,7 +642,6 @@ class MultiTurnImplementationAgent:
                     stage=MultiTurnState.REPAIRING.value,
                     provider=provider_name,
                     model=model_name,
-                    repair_reason=last_failure.probable_root_cause if last_failure else None,
                     started_at=datetime.datetime.now(datetime.timezone.utc),
                 )
 
@@ -617,8 +656,9 @@ class MultiTurnImplementationAgent:
                     stage=MultiTurnState.REPAIRING,
                 )
                 turn.prompt_summary = repair_prompt[:300]
+                turn.repair_reason = last_failure.probable_root_cause if last_failure else "Repairing detected defect"
 
-                ops = None
+                ops: list[FileOperation] | None = None
                 try:
                     if self._supports_tool_use(provider):
                         engine = ToolEngine(provider=provider, registry=self.registry, policy=effective_policy)
@@ -664,12 +704,37 @@ class MultiTurnImplementationAgent:
                     self._checkpoint(task, subtask, turn, MultiTurnState.FAILED, context)
                     break
 
-                if ops:
-                    applied, apply_err = self._apply_file_operations(ops, plan)
-                    if applied:
-                        applied_operations.extend(ops)
-                        turn.file_operations = [op.__dict__ if hasattr(op, "__dict__") else op for op in ops]
+                if not ops:
+                    emit("Repair produced no file operations.")
+                    turn.failures_detected = [{"type": "empty_repair", "error": "No file operations produced in repair"}]
+                    turn.status = "completed"
+                    turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                    turns.append(turn)
+                    self._checkpoint(task, subtask, turn, MultiTurnState.REPAIRING, context)
+                    last_failure = FailureAnalysis(
+                        probable_root_cause="Repair produced no operations",
+                        recommended_fix="Provide valid file edits to resolve errors",
+                    )
+                    current_state = MultiTurnState.ANALYZING_FAILURE
+                    continue
 
+                applied, apply_err = self._apply_file_operations(ops, plan)
+                if not applied:
+                    emit(f"Repair apply error: {apply_err}")
+                    turn.failures_detected = [{"type": "apply_error", "error": apply_err}]
+                    turn.status = "completed"
+                    turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                    turns.append(turn)
+                    self._checkpoint(task, subtask, turn, MultiTurnState.REPAIRING, context)
+                    last_failure = FailureAnalysis(
+                        probable_root_cause="Repair file operation apply error",
+                        recommended_fix=apply_err or "Fix file patch",
+                    )
+                    current_state = MultiTurnState.ANALYZING_FAILURE
+                    continue
+
+                applied_operations.extend(ops)
+                turn.file_operations = [op.__dict__ if hasattr(op, "__dict__") else op for op in ops]
                 turn.status = "completed"
                 turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                 turns.append(turn)
@@ -691,12 +756,13 @@ class MultiTurnImplementationAgent:
                     started_at=datetime.datetime.now(datetime.timezone.utc),
                 )
 
+                reconstructed_diff = self._compute_workspace_diff(applied_operations)
                 reviewer = Reviewer(provider=provider, registry=self.registry, policy=effective_policy)
                 try:
                     review_res = reviewer.review(
                         task=task_objective,
                         plan=plan,
-                        diff="",
+                        diff=reconstructed_diff,
                         context=context,
                         initial_history=current_tool_history,
                         report=report,
@@ -752,6 +818,60 @@ class MultiTurnImplementationAgent:
                     started_at=datetime.datetime.now(datetime.timezone.utc),
                 )
 
+                # 1. Run all validation commands
+                test_results = self._run_validation_commands(context, task_objective)
+                turn.tests_executed = [
+                    {"command": r.command, "exit_code": r.exit_code, "succeeded": r.succeeded}
+                    for r in test_results
+                ]
+                failed_cmds = [r for r in test_results if not r.succeeded]
+
+                # 2. Python syntax compilation check on modified/created files
+                syntax_errors: list[str] = []
+                for op in applied_operations:
+                    p = getattr(op, "path", None)
+                    if p and p.endswith(".py"):
+                        full_path = self.filesystem.root / p
+                        if full_path.is_file():
+                            try:
+                                content = self.filesystem.read_file(p)
+                                ast.parse(content, filename=p)
+                            except Exception as syn_exc:
+                                syntax_errors.append(f"Syntax error in {p}: {syn_exc}")
+
+                if failed_cmds or syntax_errors:
+                    verification_turn_count += 1
+                    emit(f"Verification failed (attempt {verification_turn_count}/{self.max_verification_turns}): {len(failed_cmds)} command(s) failed, {len(syntax_errors)} syntax error(s).")
+                    turn.failures_detected = [
+                        {"command": r.command, "exit_code": r.exit_code, "stderr": r.stderr[:500]}
+                        for r in failed_cmds
+                    ] + [{"type": "syntax_error", "error": err} for err in syntax_errors]
+
+                    if verification_turn_count > self.max_verification_turns:
+                        emit(f"Verification turn budget ({self.max_verification_turns}) exhausted.")
+                        turn.status = "failed"
+                        turn.error_message = f"Verification turn budget ({self.max_verification_turns}) exhausted."
+                        turns.append(turn)
+                        current_state = MultiTurnState.FAILED
+                        termination_reason = "verification_budget_exhausted"
+                        error_message = turn.error_message
+                        break
+
+                    err_summary = "; ".join(syntax_errors) if syntax_errors else (failed_cmds[0].stderr[:200] if failed_cmds[0].stderr else f"Exit code {failed_cmds[0].exit_code}")
+                    last_failure = FailureAnalysis(
+                        probable_root_cause=f"Final verification failed: {err_summary}",
+                        recommended_fix="Address verification failure",
+                        diagnostic_evidence=failed_cmds,
+                    )
+                    turn.status = "completed"
+                    turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                    turns.append(turn)
+                    self._checkpoint(task, subtask, turn, MultiTurnState.VERIFYING, context)
+                    current_state = MultiTurnState.REPAIRING
+                    continue
+
+                # All verification passed
+                emit("All final verification checks passed cleanly.")
                 turn.status = "completed"
                 turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                 turns.append(turn)

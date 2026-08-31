@@ -49,6 +49,7 @@ class ToolRegistry:
         semantic_index: SemanticIndex | None = None,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_results: int = DEFAULT_MAX_RESULTS,
+        clarification_handler: Any | None = None,
     ):
         self.root = Path(project_root).expanduser().resolve()
         if not self.root.is_dir():
@@ -58,6 +59,7 @@ class ToolRegistry:
         self.semantic_index = semantic_index
         self.max_output_bytes = max_output_bytes
         self.max_results = max_results
+        self.clarification_handler = clarification_handler
 
         self._definitions: dict[str, ToolDefinition] = {
             "read_file_range": ToolDefinition(
@@ -152,6 +154,32 @@ class ToolRegistry:
                 },
             ),
         }
+        if clarification_handler is not None:
+            self.enable_clarification_tool(clarification_handler)
+
+    def enable_clarification_tool(self, handler: Any | None = None) -> None:
+        """Enables the interactive user clarification tool."""
+        if handler is not None:
+            self.clarification_handler = handler
+        self._definitions["ask_user_clarification"] = ToolDefinition(
+            name="ask_user_clarification",
+            description="Requests user clarification or answers to design questions when requirements are ambiguous.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The clarifying question to ask the user.",
+                    },
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of distinct choices or options for the user.",
+                    },
+                },
+                "required": ["question"],
+            },
+        )
 
     def definitions(self) -> list[ToolDefinition]:
         """Return the list of tool definitions available in the registry."""
@@ -585,3 +613,45 @@ class ToolRegistry:
             is_error=is_error,
             truncated=truncated,
         )
+
+    # -------------------------------------------------------------------------
+    # Tool 6: ask_user_clarification
+    # -------------------------------------------------------------------------
+
+    def _tool_ask_user_clarification(self, tool_call: ToolCall) -> ToolResult:
+        args = tool_call.arguments
+        question = str(args.get("question", "")).strip()
+        if not question:
+            return ToolResult(
+                call_id=tool_call.call_id,
+                tool_name=tool_call.tool_name,
+                output="Parameter 'question' cannot be empty.",
+                is_error=True,
+            )
+        choices = args.get("choices")
+        choices_list = [str(c) for c in choices] if isinstance(choices, list) else None
+
+        if self.clarification_handler is not None:
+            try:
+                answer = self.clarification_handler(question, choices_list)
+                return ToolResult(
+                    call_id=tool_call.call_id,
+                    tool_name=tool_call.tool_name,
+                    output=f"User clarification response: {answer}",
+                    is_error=False,
+                )
+            except Exception as exc:
+                return ToolResult(
+                    call_id=tool_call.call_id,
+                    tool_name=tool_call.tool_name,
+                    output=f"Error obtaining clarification: {exc}",
+                    is_error=True,
+                )
+
+        return ToolResult(
+            call_id=tool_call.call_id,
+            tool_name=tool_call.tool_name,
+            output=f"Clarification noted in autonomous mode: '{question}'. Proceeding with standard project conventions.",
+            is_error=False,
+        )
+

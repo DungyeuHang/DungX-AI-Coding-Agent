@@ -962,6 +962,70 @@ class MultiTurnExecutionReport:
 
 
 @dataclass
+class ClarificationRequest:
+    question_id: str
+    task_id: str
+    subtask_id: str
+    question: str
+    choices: list[str] = field(default_factory=list)
+    status: str = "pending"  # "pending", "answered", "skipped"
+    answer: str | None = None
+    created_at: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
+    answered_at: datetime.datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "question_id": self.question_id,
+            "task_id": self.task_id,
+            "subtask_id": self.subtask_id,
+            "question": self.question,
+            "choices": list(self.choices),
+            "status": self.status,
+            "answer": self.answer,
+            "created_at": self.created_at.isoformat() if isinstance(self.created_at, datetime.datetime) else str(self.created_at),
+            "answered_at": self.answered_at.isoformat() if isinstance(self.answered_at, datetime.datetime) else (str(self.answered_at) if self.answered_at else None),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ClarificationRequest:
+        if not isinstance(data, dict):
+            return cls(question_id="", task_id="", subtask_id="", question="")
+        raw_created = data.get("created_at")
+        if isinstance(raw_created, str):
+            try:
+                created_at = datetime.datetime.fromisoformat(raw_created)
+            except Exception:
+                created_at = datetime.datetime.now(datetime.timezone.utc)
+        elif isinstance(raw_created, datetime.datetime):
+            created_at = raw_created
+        else:
+            created_at = datetime.datetime.now(datetime.timezone.utc)
+
+        raw_answered = data.get("answered_at")
+        if isinstance(raw_answered, str):
+            try:
+                answered_at = datetime.datetime.fromisoformat(raw_answered)
+            except Exception:
+                answered_at = None
+        elif isinstance(raw_answered, datetime.datetime):
+            answered_at = raw_answered
+        else:
+            answered_at = None
+
+        return cls(
+            question_id=str(data.get("question_id", "")),
+            task_id=str(data.get("task_id", "")),
+            subtask_id=str(data.get("subtask_id", "")),
+            question=str(data.get("question", "")),
+            choices=[str(c) for c in data.get("choices", [])] if isinstance(data.get("choices"), list) else [],
+            status=str(data.get("status", "pending")),
+            answer=data.get("answer"),
+            created_at=created_at,
+            answered_at=answered_at,
+        )
+
+
+@dataclass
 class Checkpoint:
     checkpoint_id: str
     task_id: str
@@ -988,6 +1052,7 @@ class Checkpoint:
     turns: list[dict[str, Any]] = field(default_factory=list)
     current_turn_number: int = 0
     turn_stage: str = "idle"
+    clarification_requests: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -1019,8 +1084,8 @@ class Checkpoint:
         d.setdefault("turns", [])
         d.setdefault("current_turn_number", 0)
         d.setdefault("turn_stage", "idle")
+        d.setdefault("clarification_requests", [])
         return cls(**d)
-
 # Phase 4.10 / Phase 4.11: Cross-Subtask Semantic Contract & Behavioral Verification Models
 @dataclass
 class ExportedSymbol:
