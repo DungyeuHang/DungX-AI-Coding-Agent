@@ -935,7 +935,7 @@ class MultiTurnExecutionReport:
             "tool_metrics": [m.to_dict() if hasattr(m, "to_dict") else m for m in self.tool_metrics],
             "error_message": self.error_message,
             "completion_assessment": self.completion_assessment.to_dict() if hasattr(self.completion_assessment, "to_dict") else self.completion_assessment,
-            "completion_evidence": dict(self.completion_evidence),
+            "completion_evidence": dict(self.completion_evidence) if self.completion_evidence else {},
         }
 
     @classmethod
@@ -1059,7 +1059,7 @@ class Checkpoint:
     current_turn_number: int = 0
     turn_stage: str = "idle"
     clarification_requests: list[dict[str, Any]] = field(default_factory=list)
-    completion_assessment: dict[str, Any] | None = None
+    completion_assessment: Any | None = None
     completion_evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -2584,7 +2584,7 @@ class RunReport:
     validation_reuse_attempts: list[Any] = field(default_factory=list, repr=False)
     # Phase 4.16: multi-turn interactive implementation execution report
     multi_turn_report: MultiTurnExecutionReport | None = None
-    # Phase 4.18: completion assessment and release readiness decision
+    # Phase 4.18 / Phase 4.19: Completion and release readiness decision & evidence
     completion_assessment: Any | None = None
     completion_evidence: dict[str, Any] = field(default_factory=dict)
 

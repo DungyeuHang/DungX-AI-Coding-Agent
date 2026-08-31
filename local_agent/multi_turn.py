@@ -441,6 +441,13 @@ class MultiTurnImplementationAgent:
         clarification_requests: list[Any] = []
 
         evidence_store = CompletionEvidenceStore(self.filesystem.root)
+        try:
+            latest_cp = self.storage.load_latest_checkpoint(task_id, subtask_id=subtask_id)
+            if latest_cp and latest_cp.completion_evidence:
+                evidence_store = CompletionEvidenceStore.from_dict(latest_cp.completion_evidence)
+                evidence_store.revalidate_against_disk(self.filesystem)
+        except Exception:
+            evidence_store = CompletionEvidenceStore(self.filesystem.root)
 
         for t in turns:
             if t.tool_calls and t.tool_results and len(t.tool_calls) == len(t.tool_results):

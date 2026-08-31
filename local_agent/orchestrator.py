@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import ast
 import datetime
+import hashlib
 import logging
 import shlex
 import uuid
 from pathlib import Path
 from typing import Any
+
+from .completion import (
+    CompletionAssessment,
+    CompletionDecisionEngine,
+    CompletionEvidenceStore,
+    EvidenceTrustTier,
+    EvidenceType,
+    ReadinessLevel,
+)
 
 import threading
 from .approval import ApprovalPolicyEngine, RISK_LEVEL_MAP
@@ -34,6 +45,7 @@ from .models import (
     DAGProposal,
     ExecutionResult,
     FailureAnalysis,
+    FileOperation,
     ImplementationResult,
     ImplementationTurn,
     MultiTurnExecutionReport,
@@ -322,6 +334,7 @@ class Orchestrator:
 
         # Phase 4.5: Autonomous Recovery State
         recovery_state = RecoveryState()
+        evidence_store = CompletionEvidenceStore(self.filesystem.root)
         current_diagnostic_evidence: list[ExecutionResult] = []
         executed_diagnostic_names_this_iteration: list[str] = []
         current_tool_history: list[tuple[ToolCall, ToolResult]] = []
@@ -352,6 +365,29 @@ class Orchestrator:
                     raw_impl_result = checkpoint.continuation_context.get("implementation_result")
                     if isinstance(raw_impl_result, dict):
                         report.implementation_result = ImplementationResult.from_dict(raw_impl_result)
+                    raw_completion = checkpoint.completion_assessment
+                    if raw_completion and isinstance(raw_completion, dict):
+                        report.completion_assessment = CompletionAssessment.from_dict(raw_completion)
+                    raw_evidence = checkpoint.completion_evidence
+                    if raw_evidence and isinstance(raw_evidence, dict):
+                        evidence_store = CompletionEvidenceStore.from_dict(raw_evidence)
+                        invalidated = evidence_store.revalidate_against_disk(self.filesystem)
+                        report.completion_evidence = evidence_store.to_dict()
+                        # If disk mutation occurred after checkpoint, re-evaluate readiness
+                        if invalidated and report.completion_assessment:
+                            decision_engine = CompletionDecisionEngine(self.filesystem)
+                            reconstructed_diff = self.git.diff()
+                            report.completion_assessment = decision_engine.evaluate(
+                                task=task,
+                                subtask=current_subtask,
+                                plan=plan,
+                                evidence_store=evidence_store,
+                                applied_operations=[FileOperation(action="modify", path=p) for p in checkpoint.files_changed],
+                                current_diff=reconstructed_diff,
+                                last_review=report.review,
+                                last_failure=failure,
+                                clarification_requests=getattr(task, "clarification_requests", []),
+                            )
                     raw_task_plan = checkpoint.continuation_context.get("task_plan")
                     if raw_task_plan and isinstance(raw_task_plan, dict) and task.plan:
                         restored_tp = TaskPlan.from_dict(raw_task_plan)
@@ -564,7 +600,9 @@ class Orchestrator:
                     reason=f"iteration {iteration} ({stage_name})",
                 )
                 with self.repo_lock: # Acquire lock for file system mutation
-                    report.changed_files.extend(coding_agent.apply_prepared(prepared))
+                    applied_files = coding_agent.apply_prepared(prepared)
+                    report.changed_files.extend(applied_files)
+                evidence_store.invalidate_on_file_mutation(report.changed_files)
                 self._lifecycle_advance(
                     LifecycleState.APPLIED, reason=f"iteration {iteration} applied"
                 )
@@ -628,6 +666,22 @@ class Orchestrator:
                     failed = next((result for result in full_executions if not result.succeeded), None)
                     broad_failed = failed is not None
                     broad_duration = sum(e.duration_seconds for e in full_executions)
+
+                for exec_res in executions:
+                    if exec_res.command:
+                        cmd_tokens = exec_res.command.split() if isinstance(exec_res.command, str) else list(exec_res.command)
+                        evidence_store.record(
+                            task_id=task.task_id,
+                            subtask_id=current_subtask.subtask_id if current_subtask else "main",
+                            turn_number=iteration,
+                            stage="testing",
+                            evidence_type=EvidenceType.TEST_EXECUTION,
+                            source="command_runner",
+                            target_paths=report.changed_files,
+                            command=cmd_tokens,
+                            exit_code=exec_res.exit_code,
+                            payload={"stdout": exec_res.stdout[:400], "stderr": exec_res.stderr[:400]},
+                        )
 
                 self._finalize_validation_decision(
                     report,
@@ -878,8 +932,87 @@ class Orchestrator:
                 review = report.review
                 recovery_state.completed_iterations = iteration
                 if review.verdict == "APPROVED":
-                    report.completed = True
-                    break
+                    # Phase 4.19: Authoritative Completion Decision Enforcement
+                    current_diff = coding_agent.diff() or self.git.diff()
+
+                    # Revalidate existing evidence against disk
+                    evidence_store.revalidate_against_disk(self.filesystem)
+
+                    # Ensure all modified python files have syntax verification evidence
+                    for p in report.changed_files:
+                        if p.endswith(".py") and self.filesystem.file_exists(p):
+                            try:
+                                content = self.filesystem.read_file(p)
+                                ast.parse(content, filename=p)
+                                evidence_store.record(
+                                    task_id=task.task_id,
+                                    subtask_id=current_subtask.subtask_id if current_subtask else "main",
+                                    turn_number=iteration,
+                                    stage="verifying",
+                                    evidence_type=EvidenceType.SYNTAX_VERIFICATION,
+                                    source="ast_parser",
+                                    target_paths=[p],
+                                    exit_code=0,
+                                )
+                            except Exception as syn_err:
+                                evidence_store.record(
+                                    task_id=task.task_id,
+                                    subtask_id=current_subtask.subtask_id if current_subtask else "main",
+                                    turn_number=iteration,
+                                    stage="verifying",
+                                    evidence_type=EvidenceType.SYNTAX_VERIFICATION,
+                                    source="ast_parser",
+                                    target_paths=[p],
+                                    exit_code=1,
+                                    payload={"error": str(syn_err)},
+                                )
+
+                    # Record review evidence with cryptographic diff hash
+                    diff_hash = hashlib.sha256(current_diff.encode("utf-8")).hexdigest()[:16] if current_diff else ""
+                    evidence_store.record(
+                        task_id=task.task_id,
+                        subtask_id=current_subtask.subtask_id if current_subtask else "main",
+                        turn_number=iteration,
+                        stage="reviewing",
+                        evidence_type=EvidenceType.CODE_REVIEW,
+                        source="reviewer",
+                        trust_tier=EvidenceTrustTier.DELIBERATIVE_REVIEW,
+                        target_paths=report.changed_files,
+                        payload={"verdict": review.verdict, "summary": review.summary, "findings": review.findings, "diff_hash": diff_hash},
+                    )
+
+                    decision_engine = CompletionDecisionEngine(self.filesystem)
+                    applied_ops = [FileOperation(action="modify", path=p) for p in report.changed_files]
+                    assessment = decision_engine.evaluate(
+                        task=task,
+                        subtask=current_subtask,
+                        plan=plan,
+                        evidence_store=evidence_store,
+                        applied_operations=applied_ops,
+                        current_diff=current_diff,
+                        last_review=review,
+                        last_failure=report.failures[-1] if report.failures else None,
+                        clarification_requests=getattr(task, "clarification_requests", []),
+                    )
+
+                    report.completion_assessment = assessment
+                    report.completion_evidence = evidence_store.to_dict()
+
+                    if assessment.is_ready:
+                        report.completed = True
+                        emit(f"[6/7] Release readiness approved ({assessment.readiness_level}).")
+                        break
+                    else:
+                        report.completed = False
+                        emit(f"[6/7] Completion gates failed ({assessment.readiness_level}): {assessment.decision_reason}")
+                        recovery_state.record_failure(FailureAnalysis(
+                            probable_root_cause=f"Completion gate failure: {assessment.decision_reason}",
+                            recommended_fix="Address missing validation evidence or syntax defect",
+                        ))
+                        if iteration >= self.config.max_iterations:
+                            task.outcome = f"COMPLETION_REFUSED: {assessment.decision_reason}"
+                            report.outcome = task.outcome
+                            break
                 else:
                     recovery_state.record_review(review)
                     if len(recovery_state.review_history) >= 3 and all(r.verdict != "APPROVED" for r in recovery_state.review_history[-3:]):
@@ -895,6 +1028,10 @@ class Orchestrator:
 
             # Status setting logic moved outside the loop to ensure it always runs
             if not report.plan_proposal and not getattr(report, "dag_proposal", None):
+                # Ensure completion is strictly guarded by assessment.is_ready if assessment exists
+                if report.completion_assessment is not None and not getattr(report.completion_assessment, "is_ready", False):
+                    report.completed = False
+
                 if report.completed:
                     if current_subtask:
                         current_subtask.status = SubtaskStatus.COMPLETED
@@ -935,6 +1072,9 @@ class Orchestrator:
                         if recovery_state.abort_reason:
                             task.outcome = recovery_state.abort_reason
                             report.outcome = recovery_state.abort_reason
+                        elif report.completion_assessment is not None and not report.completion_assessment.is_ready:
+                            task.outcome = f"COMPLETION_REFUSED: {report.completion_assessment.decision_reason}"
+                            report.outcome = task.outcome
                         elif recovery_state.completed_iterations >= self.config.max_iterations:
                             task.outcome = "MAX_ITERATIONS_EXCEEDED"
                             report.outcome = "MAX_ITERATIONS_EXCEEDED"
@@ -1961,6 +2101,8 @@ class Orchestrator:
             last_provider_result={"outcome": report.outcome} if report.outcome else None,
             next_recommended_action=continuation_context["next_recommended_action"],
             continuation_context=continuation_context,
+            completion_assessment=report.completion_assessment.to_dict() if hasattr(report.completion_assessment, "to_dict") else report.completion_assessment,
+            completion_evidence=dict(report.completion_evidence) if report.completion_evidence else {},
         )
         self.storage.save_checkpoint(checkpoint)
         task.latest_checkpoint_id = checkpoint_id
@@ -2078,8 +2220,23 @@ class Orchestrator:
                     if isinstance(raw_impl, dict):
                         implementation_result = ImplementationResult.from_dict(raw_impl)
                     specialist_routing_state = checkpoint.continuation_context.get("specialist_routing_state", {})
+                if checkpoint and checkpoint.completion_assessment:
+                    raw_ass = checkpoint.completion_assessment
+                    completion_assessment = CompletionAssessment.from_dict(raw_ass) if isinstance(raw_ass, dict) else raw_ass
+                else:
+                    completion_assessment = None
+                if checkpoint and checkpoint.completion_evidence:
+                    raw_ev = checkpoint.completion_evidence
+                    store = CompletionEvidenceStore.from_dict(raw_ev) if isinstance(raw_ev, dict) else CompletionEvidenceStore(self.filesystem.root)
+                    store.revalidate_against_disk(self.filesystem)
+                    completion_evidence = store.to_dict()
+                else:
+                    completion_evidence = {}
             except FileNotFoundError:
                 pass # Checkpoint might be missing if task is new or corrupted
+        else:
+            completion_assessment = None
+            completion_evidence = {}
 
         # Extract executions and failures from task.execution_history
         executions = []
@@ -2114,5 +2271,7 @@ class Orchestrator:
             review_consensus=review_consensus,
             specialist_routing_state=specialist_routing_state,
             implementation_result=implementation_result,
+            completion_assessment=completion_assessment,
+            completion_evidence=completion_evidence,
         )
 
