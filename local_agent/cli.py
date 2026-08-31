@@ -334,6 +334,21 @@ def _print_report(report) -> None:
         for finding in report.review.findings:
             print(f"  - {finding}")
     print(f"Result: {'COMPLETE' if report.completed else 'INCOMPLETE'}")
+    # Phase 4.21: technical readiness and task-contract satisfaction are
+    # independent dimensions -- surface both rather than only the combined
+    # COMPLETE/INCOMPLETE verdict, so "ran successfully" and "did what was
+    # asked" are never conflated in what the user sees.
+    if report.completion_assessment is not None or report.requirement_assessment:
+        tech_ready = bool(getattr(report.completion_assessment, "is_ready", False))
+        print(f"  Technically ready: {'yes' if tech_ready else 'no'}")
+        if report.requirement_assessment:
+            reqs = report.requirement_assessment.get("requirements") or []
+            satisfied = bool(report.requirement_assessment.get("satisfied", False))
+            print(f"  Task contract satisfied: {'yes' if satisfied else 'no'} ({len(reqs)} requirement(s) tracked)")
+            if not satisfied:
+                for req in reqs:
+                    if req.get("importance") == "must" and req.get("state") not in ("satisfied", "not_applicable"):
+                        print(f"    - [{req.get('state')}] {req.get('requirement_id')}: {req.get('statement')}")
 
 
 def _approval_prompt(changes) -> bool:

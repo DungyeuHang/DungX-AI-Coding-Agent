@@ -27,6 +27,11 @@ from .completion import (
     EvidenceType,
     ReadinessLevel,
 )
+from .task_contract import (
+    RequirementAssessmentEngine,
+    TaskContract,
+    derive_task_contract,
+)
 from .config import AgentConfig
 from .failure import FailureAnalyzer
 from .filesystem import ProjectFilesystem, ProtectedPathError, SandboxViolation
@@ -344,6 +349,7 @@ class MultiTurnImplementationAgent:
         evidence_store: CompletionEvidenceStore | None = None,
         assessment: CompletionAssessment | None = None,
         clarification_requests: list[Any] | None = None,
+        requirement_assessment: dict[str, Any] | None = None,
     ) -> None:
         """Persists a durable checkpoint at turn boundary preserving full history."""
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -378,6 +384,8 @@ class MultiTurnImplementationAgent:
             clarification_requests=clarifications,
             completion_assessment=assessment.to_dict() if assessment else None,
             completion_evidence=evidence_store.to_dict() if evidence_store else {},
+            task_contract=task.task_contract,
+            requirement_assessment=dict(requirement_assessment) if requirement_assessment else {},
         )
 
         try:
@@ -415,6 +423,13 @@ class MultiTurnImplementationAgent:
             subtask.goal if subtask and subtask.goal
             else (plan.objective if plan.objective else task.objective)
         )
+
+        # Phase 4.21: derive the task's requirement contract once and persist
+        # it on the Task itself (see Orchestrator.run() for the same pattern
+        # and rationale).
+        if not task.task_contract:
+            task.task_contract = derive_task_contract(task, plan).to_dict()
+        requirement_engine = RequirementAssessmentEngine(self.filesystem)
 
         provider_name = getattr(provider, "provider_id", "unknown")
         model_name = getattr(provider, "model", "unknown")
@@ -463,6 +478,7 @@ class MultiTurnImplementationAgent:
         termination_reason = "in_progress"
         error_message: str | None = None
         final_assessment: CompletionAssessment | None = None
+        final_requirement_assessment: dict[str, Any] = {}
 
         emit(f"Starting multi-turn implementation (initial state: {current_state.value}).")
 
@@ -1103,37 +1119,53 @@ class MultiTurnImplementationAgent:
                 )
                 final_assessment = assessment
 
-                if assessment.is_ready:
-                    emit(f"All final verification checks and completion gates passed cleanly ({assessment.readiness_level}).")
+                # Phase 4.21: technical readiness alone is not completion --
+                # see Orchestrator.run() for the identical rationale.
+                contract_obj = TaskContract.from_dict(task.task_contract) if task.task_contract else TaskContract(task_id=task_id, objective=task_objective)
+                req_assessment = requirement_engine.assess(
+                    contract=contract_obj,
+                    evidence_store=evidence_store,
+                    applied_operations=applied_operations,
+                    current_diff=reconstructed_diff,
+                    last_review=last_review,
+                    clarification_requests=clarification_requests,
+                )
+                final_requirement_assessment = req_assessment.to_dict()
+                task.task_contract = contract_obj.to_dict()
+                final_ready = assessment.is_ready and req_assessment.satisfied
+
+                if final_ready:
+                    emit(f"All final verification checks, completion gates, and task requirements passed cleanly ({assessment.readiness_level}).")
                     turn.status = "completed"
                     turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     turns.append(turn)
-                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.VERIFYING, context, evidence_store, final_assessment, clarification_requests)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.VERIFYING, context, evidence_store, final_assessment, clarification_requests, final_requirement_assessment)
                     current_state = MultiTurnState.COMPLETED
                     termination_reason = "completed"
                     emit("Multi-turn implementation completed successfully.")
                     break
                 else:
-                    emit(f"Completion gates failed: {assessment.decision_reason}")
+                    reason = assessment.decision_reason if not assessment.is_ready else req_assessment.decision_reason
+                    emit(f"Completion gates failed: {reason}")
                     verification_turn_count += 1
                     if verification_turn_count > self.max_verification_turns:
                         turn.status = "failed"
-                        turn.error_message = f"Completion gate failure: {assessment.decision_reason}"
+                        turn.error_message = f"Completion gate failure: {reason}"
                         turns.append(turn)
                         current_state = MultiTurnState.FAILED
                         termination_reason = "verification_budget_exhausted"
                         error_message = turn.error_message
-                        self._checkpoint(task, subtask, turns, turn, MultiTurnState.FAILED, context, evidence_store, final_assessment, clarification_requests)
+                        self._checkpoint(task, subtask, turns, turn, MultiTurnState.FAILED, context, evidence_store, final_assessment, clarification_requests, final_requirement_assessment)
                         break
 
                     last_failure = FailureAnalysis(
-                        probable_root_cause=f"Completion gate failure: {assessment.decision_reason}",
-                        recommended_fix="Address missing completion evidence",
+                        probable_root_cause=f"Completion gate failure: {reason}",
+                        recommended_fix="Address missing completion evidence or unresolved task requirements",
                     )
                     turn.status = "completed"
                     turn.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     turns.append(turn)
-                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.VERIFYING, context, evidence_store, final_assessment, clarification_requests)
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.VERIFYING, context, evidence_store, final_assessment, clarification_requests, final_requirement_assessment)
                     current_state = MultiTurnState.REPAIRING
                     continue
 
@@ -1154,10 +1186,22 @@ class MultiTurnImplementationAgent:
                 worktree_id=worktree_id,
                 clarification_requests=clarification_requests,
             )
+            contract_obj = TaskContract.from_dict(task.task_contract) if task.task_contract else TaskContract(task_id=task_id, objective=task_objective)
+            final_requirement_assessment = requirement_engine.assess(
+                contract=contract_obj,
+                evidence_store=evidence_store,
+                applied_operations=applied_operations,
+                current_diff=reconstructed_diff,
+                last_review=last_review,
+                clarification_requests=clarification_requests,
+            ).to_dict()
+            task.task_contract = contract_obj.to_dict()
 
         if report is not None:
             report.completion_assessment = final_assessment
             report.completion_evidence = evidence_store.to_dict()
+            report.task_contract = task.task_contract
+            report.requirement_assessment = final_requirement_assessment
 
         return MultiTurnExecutionReport(
             task_id=task_id,
@@ -1175,4 +1219,6 @@ class MultiTurnImplementationAgent:
             error_message=error_message,
             completion_assessment=final_assessment,
             completion_evidence=evidence_store.to_dict(),
+            task_contract=task.task_contract,
+            requirement_assessment=final_requirement_assessment,
         )

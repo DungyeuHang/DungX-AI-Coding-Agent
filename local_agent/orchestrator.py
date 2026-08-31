@@ -17,6 +17,11 @@ from .completion import (
     EvidenceType,
     ReadinessLevel,
 )
+from .task_contract import (
+    RequirementAssessmentEngine,
+    TaskContract,
+    derive_task_contract,
+)
 
 import threading
 from .approval import ApprovalPolicyEngine, RISK_LEVEL_MAP
@@ -320,6 +325,14 @@ class Orchestrator:
         except Exception as e:
             LOGGER.exception("Unhandled exception during planning: %s", e)
         report.plan = plan
+        # Phase 4.21: derive the task's requirement contract once, the first
+        # time a plan exists for it, and persist it on the Task itself so it
+        # is stable across every later run()/resume for this task's lifetime
+        # -- re-deriving on each call would churn requirement ids and defeat
+        # evidence-to-requirement traceability.
+        if not task.task_contract:
+            task.task_contract = derive_task_contract(task, plan).to_dict()
+        report.task_contract = task.task_contract
         preexisting = self._git_changed_paths()
         coding_agent = CodingAgent(self.filesystem, preexisting)
         failure: FailureAnalysis | None = None
@@ -393,6 +406,22 @@ class Orchestrator:
                                 last_failure=failure,
                                 clarification_requests=getattr(task, "clarification_requests", []),
                             )
+                            # Phase 4.21: the same distrust applies to a restored
+                            # requirement_assessment -- it is always recomputed
+                            # from the live task_contract and evidence, never
+                            # trusted from the checkpoint as a satisfied claim.
+                            contract_obj = TaskContract.from_dict(task.task_contract) if task.task_contract else TaskContract(task_id=task.task_id, objective=task.objective)
+                            requirement_engine = RequirementAssessmentEngine(self.filesystem)
+                            req_assessment = requirement_engine.assess(
+                                contract=contract_obj,
+                                evidence_store=evidence_store,
+                                applied_operations=[FileOperation(action="modify", path=p) for p in checkpoint.files_changed],
+                                current_diff=reconstructed_diff,
+                                last_review=report.review,
+                                clarification_requests=getattr(task, "clarification_requests", []),
+                            )
+                            report.task_contract = contract_obj.to_dict()
+                            report.requirement_assessment = req_assessment.to_dict()
                     raw_task_plan = checkpoint.continuation_context.get("task_plan")
                     if raw_task_plan and isinstance(raw_task_plan, dict) and task.plan:
                         restored_tp = TaskPlan.from_dict(raw_task_plan)
@@ -1010,19 +1039,45 @@ class Orchestrator:
                     report.completion_assessment = assessment
                     report.completion_evidence = evidence_store.to_dict()
 
-                    if assessment.is_ready:
+                    # Phase 4.21: technical readiness alone is not completion --
+                    # the changeset must also satisfy the task's own requirement
+                    # contract (a multi-part request only partially done, a
+                    # stated constraint violated, a requested deliverable like
+                    # documentation left untouched). Both dimensions are
+                    # required; neither alone is sufficient.
+                    contract_obj = TaskContract.from_dict(task.task_contract) if task.task_contract else TaskContract(task_id=task.task_id, objective=task.objective)
+                    requirement_engine = RequirementAssessmentEngine(self.filesystem)
+                    req_assessment = requirement_engine.assess(
+                        contract=contract_obj,
+                        evidence_store=evidence_store,
+                        applied_operations=applied_ops,
+                        current_diff=current_diff,
+                        last_review=review,
+                        clarification_requests=getattr(task, "clarification_requests", []),
+                    )
+                    report.task_contract = contract_obj.to_dict()
+                    report.requirement_assessment = req_assessment.to_dict()
+                    task.task_contract = contract_obj.to_dict()
+
+                    final_ready = assessment.is_ready and req_assessment.satisfied
+
+                    if final_ready:
                         report.completed = True
                         emit(f"[6/7] Release readiness approved ({assessment.readiness_level}).")
                         break
                     else:
                         report.completed = False
-                        emit(f"[6/7] Completion gates failed ({assessment.readiness_level}): {assessment.decision_reason}")
+                        if not assessment.is_ready:
+                            emit(f"[6/7] Completion gates failed ({assessment.readiness_level}): {assessment.decision_reason}")
+                        if not req_assessment.satisfied:
+                            emit(f"[6/7] Task contract unsatisfied: {req_assessment.decision_reason}")
                         recovery_state.record_failure(FailureAnalysis(
-                            probable_root_cause=f"Completion gate failure: {assessment.decision_reason}",
-                            recommended_fix="Address missing validation evidence or syntax defect",
+                            probable_root_cause=f"Completion gate failure: {assessment.decision_reason}" if not assessment.is_ready else f"Task contract unsatisfied: {req_assessment.decision_reason}",
+                            recommended_fix="Address missing validation evidence, syntax defect, or unresolved task requirements",
                         ))
                         if iteration >= self.config.max_iterations:
-                            task.outcome = f"COMPLETION_REFUSED: {assessment.decision_reason}"
+                            refusal_reason = assessment.decision_reason if not assessment.is_ready else req_assessment.decision_reason
+                            task.outcome = f"COMPLETION_REFUSED: {refusal_reason}"
                             report.outcome = task.outcome
                             break
                 else:
@@ -1042,6 +1097,11 @@ class Orchestrator:
             if not report.plan_proposal and not getattr(report, "dag_proposal", None):
                 # Ensure completion is strictly guarded by assessment.is_ready if assessment exists
                 if report.completion_assessment is not None and not getattr(report.completion_assessment, "is_ready", False):
+                    report.completed = False
+                # Phase 4.21: and equally guarded by task-contract satisfaction --
+                # a technically-ready run whose requirement_assessment says the
+                # contract is unsatisfied must never be reported completed.
+                if report.requirement_assessment and not report.requirement_assessment.get("satisfied", False):
                     report.completed = False
 
                 if report.completed:
@@ -1086,6 +1146,9 @@ class Orchestrator:
                             report.outcome = recovery_state.abort_reason
                         elif report.completion_assessment is not None and not report.completion_assessment.is_ready:
                             task.outcome = f"COMPLETION_REFUSED: {report.completion_assessment.decision_reason}"
+                            report.outcome = task.outcome
+                        elif report.requirement_assessment and not report.requirement_assessment.get("satisfied", False):
+                            task.outcome = f"TASK_CONTRACT_UNSATISFIED: {report.requirement_assessment.get('decision_reason', '')}"
                             report.outcome = task.outcome
                         elif recovery_state.completed_iterations >= self.config.max_iterations:
                             task.outcome = "MAX_ITERATIONS_EXCEEDED"
@@ -2115,6 +2178,8 @@ class Orchestrator:
             continuation_context=continuation_context,
             completion_assessment=report.completion_assessment.to_dict() if hasattr(report.completion_assessment, "to_dict") else report.completion_assessment,
             completion_evidence=dict(report.completion_evidence) if report.completion_evidence else {},
+            task_contract=dict(report.task_contract) if report.task_contract else (dict(task.task_contract) if task.task_contract else None),
+            requirement_assessment=dict(report.requirement_assessment) if report.requirement_assessment else {},
         )
         self.storage.save_checkpoint(checkpoint)
         task.latest_checkpoint_id = checkpoint_id
@@ -2206,6 +2271,9 @@ class Orchestrator:
         review_consensus: list[ReviewConsensusRecord] = []
         specialist_routing_state: dict[str, Any] = {}
         implementation_result: ImplementationResult | None = None
+        completion_assessment = None
+        completion_evidence: dict[str, Any] = {}
+        requirement_assessment: dict[str, Any] = {}
 
         # Attempt to load from latest checkpoint if available
         if task.latest_checkpoint_id:
@@ -2244,11 +2312,17 @@ class Orchestrator:
                     completion_evidence = store.to_dict()
                 else:
                     completion_evidence = {}
+                # Phase 4.21: display-only snapshot, same as completion_assessment
+                # above -- report.completed is derived from task.status, never
+                # from these fields, so restoring them as-is for the CLI to show
+                # is safe.
+                requirement_assessment = dict(checkpoint.requirement_assessment) if checkpoint and checkpoint.requirement_assessment else {}
             except FileNotFoundError:
                 pass # Checkpoint might be missing if task is new or corrupted
         else:
             completion_assessment = None
             completion_evidence = {}
+            requirement_assessment = {}
 
         # Extract executions and failures from task.execution_history
         executions = []
@@ -2285,5 +2359,7 @@ class Orchestrator:
             implementation_result=implementation_result,
             completion_assessment=completion_assessment,
             completion_evidence=completion_evidence,
+            task_contract=task.task_contract,
+            requirement_assessment=requirement_assessment,
         )
 

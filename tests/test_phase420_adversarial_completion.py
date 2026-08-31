@@ -879,17 +879,38 @@ def test_attack_r_evidence_to_dict_redacts_payload_end_to_end(tmp_path: Path):
     assert "AKIAABCDEFGHIJKLMNOP" not in serialized
 
 
-def test_attack_r_known_limitation_generic_secret_labels_not_pattern_matched():
-    """Documents an honest limitation: a secret with no recognizable token
-    shape (e.g. a plain password under a "password" JSON key) is NOT caught
-    by regex-based redaction. This is intentionally not a hard failure -- it
-    is a recorded, known gap for the final report, not a claim of complete
-    coverage."""
-    from local_agent.completion import sanitize_text
+def test_attack_r_generic_labeled_secret_now_redacted_by_key_name(tmp_path: Path):
+    """Phase 4.21 regression test: this exact scenario was the Phase 4.20
+    'known limitation' -- a plain password under a "password" JSON key, with
+    no recognizable token shape, was NOT caught by value-shape regexes. Fixed
+    by adding a bounded, key-name-aware redaction pass: the label itself
+    ("password", "secret", "api_key", ...) is the signal when the value has
+    no shape of its own."""
+    from local_agent.completion import sanitize_text, sanitize_evidence_payload
     text = '{"password": "hunter2-not-a-recognized-token-shape"}'
     result = sanitize_text(text)
-    # This assertion documents the gap rather than hiding it.
-    assert "hunter2-not-a-recognized-token-shape" in result
+    assert "hunter2-not-a-recognized-token-shape" not in result
+    assert "[REDACTED_SECRET]" in result
+
+    # Structured (dict) form: the key is inspected directly, not via regex.
+    payload = {"password": "hunter2-not-a-recognized-token-shape", "safe": "ok"}
+    sanitized = sanitize_evidence_payload(payload)
+    assert sanitized["password"] == "[REDACTED_SECRET]"
+    assert sanitized["safe"] == "ok"
+
+
+def test_attack_r_known_limitation_unlabeled_shapeless_secret_not_caught():
+    """Documents an honest, genuinely-remaining limitation: a secret with
+    neither a recognizable token shape NOR a suggestive key/label name (e.g.
+    a bare value under a completely generic field name) still cannot be
+    distinguished from ordinary data. This is intentionally not a hard
+    failure -- it is a recorded, known gap for the final report, not a claim
+    of complete coverage. Closing it would require semantic/entropy-based
+    detection, which is out of scope as "increasingly large regex lists"."""
+    from local_agent.completion import sanitize_text
+    text = '{"value": "just-some-random-looking-string-98213"}'
+    result = sanitize_text(text)
+    assert "just-some-random-looking-string-98213" in result
 
 
 # -----------------------------------------------------------------------------

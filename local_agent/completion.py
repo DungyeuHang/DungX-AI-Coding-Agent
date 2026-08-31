@@ -24,7 +24,9 @@ from .filesystem import ProjectFilesystem, ProtectedPathError, SandboxViolation,
 from .models import FailureAnalysis, FileOperation, Plan, ProjectContext, ReviewResult, Subtask, SubtaskContract, Task
 
 
-# Regular expressions for detecting sensitive tokens / credentials in evidence
+# Regular expressions for detecting sensitive tokens / credentials in evidence.
+# These match specific, recognizable *value shapes* (a real OpenAI key always
+# looks like sk-..., a real AWS access key ID always looks like AKIA...).
 SECRET_PATTERNS = [
     re.compile(r"(?:sk-[a-zA-Z0-9_-]{20,})"),                   # Generic / OpenAI API keys
     re.compile(r"(?:sk-ant-[a-zA-Z0-9_-]{20,})"),               # Anthropic API keys
@@ -35,6 +37,35 @@ SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----"), # Private keys
 ]
 
+# Value-shape patterns can never enumerate every credential format a command
+# might print. A generic-labeled secret ("password=hunter2", "api_key": "x")
+# has no recognizable shape at all -- the only signal is the *name* attached
+# to it. This is a small, bounded list of names, not an attempt at universal
+# detection: it catches the dominant real-world pattern (an env-style
+# KEY=VALUE line, or a JSON "key": "value" pair) where the label itself is
+# the giveaway, independent of what the value looks like.
+_SENSITIVE_KEY_NAMES = (
+    r"password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|"
+    r"client[_-]?secret|private[_-]?key|secret[_-]?key|auth(?:orization)?|"
+    r"credential(?:s)?|session[_-]?id|refresh[_-]?token"
+)
+# Matches a label followed by ``:``/``=`` and a value run (stopping at the
+# next whitespace, quote, or JSON delimiter) inside flat/unstructured text
+# such as a captured stdout/stderr blob, where there is no separate "key"
+# field to inspect structurally. The optional compound-identifier prefix
+# lets this match the common env-var shape (DB_PASSWORD, AWS_SECRET_KEY)
+# and not just a bare standalone word.
+LABELED_SECRET_PATTERN = re.compile(
+    rf"(?i)((?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]*[_-])*)({_SENSITIVE_KEY_NAMES})(?![A-Za-z0-9])([\"']?\s*[:=]\s*)[\"']?([^\s\"'&,}}\]\[]+)[\"']?"
+)
+# Matches a bare key name, for use when the structure (a dict) already
+# separates the key from the value -- see sanitize_evidence_payload below.
+_SENSITIVE_KEY_PATTERN = re.compile(rf"(?i)^({_SENSITIVE_KEY_NAMES})$")
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    return bool(_SENSITIVE_KEY_PATTERN.match(str(key).strip()))
+
 
 def sanitize_text(text: str) -> str:
     """Redacts sensitive API keys, tokens, and private keys from string content."""
@@ -43,19 +74,29 @@ def sanitize_text(text: str) -> str:
     sanitized = text
     for pattern in SECRET_PATTERNS:
         sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
+    sanitized = LABELED_SECRET_PATTERN.sub(r"\1\2\3[REDACTED_SECRET]", sanitized)
     return sanitized
 
 
-def sanitize_evidence_payload(data: Any) -> Any:
-    """Recursively sanitizes sensitive content from evidence payloads."""
+def sanitize_evidence_payload(data: Any, _key: Any = None) -> Any:
+    """Recursively sanitizes sensitive content from evidence payloads.
+
+    When ``data`` is reached as the value of a dict key, that key is checked
+    against the sensitive-name list first: a structured payload already
+    separates the label from the value, so a bare value like "hunter2" under
+    a "password" key is redacted outright rather than relying on the value
+    itself matching a recognizable secret shape.
+    """
     if isinstance(data, str):
+        if data and _is_sensitive_key(_key):
+            return "[REDACTED_SECRET]"
         return sanitize_text(data)
     elif isinstance(data, dict):
-        return {str(k): sanitize_evidence_payload(v) for k, v in data.items()}
+        return {str(k): sanitize_evidence_payload(v, _key=k) for k, v in data.items()}
     elif isinstance(data, list):
-        return [sanitize_evidence_payload(v) for v in data]
+        return [sanitize_evidence_payload(v, _key=_key) for v in data]
     elif isinstance(data, tuple):
-        return tuple(sanitize_evidence_payload(v) for v in data)
+        return tuple(sanitize_evidence_payload(v, _key=_key) for v in data)
     return data
 
 
@@ -301,6 +342,21 @@ class CompletionEvidenceStore:
         self.workspace_root = Path(workspace_root).resolve()
         self.max_entries = max_entries
         self._evidence_list: list[StructuredEvidence] = []
+        # Monotonic counter for evidence_id generation. FIFO eviction in
+        # record() below shrinks _evidence_list, so an id derived from the
+        # list's current length (the old scheme) can repeat after eviction
+        # and collide with an id already held by a still-present entry.
+        self._next_seq = 0
+        # Which evidence *types* have ever been recorded in this store's
+        # lifetime, independent of whether the specific entries that first
+        # established that fact have since been evicted by the max_entries
+        # bound. Gates that ask "was X ever attempted at all" (e.g. the
+        # completion engine's "no test suite configured" shortcut) must
+        # answer from this durable, O(distinct-types)-bounded signal, not by
+        # scanning the bounded/evictable entry list -- otherwise a long
+        # enough run can silently evict the one entry proving tests were
+        # once attempted, and the shortcut wrongly reopens.
+        self._types_ever_recorded: set[str] = set()
 
     def record(
         self,
@@ -328,7 +384,8 @@ class CompletionEvidenceStore:
 
         sanitized_payload = sanitize_evidence_payload(dict(payload or {}))
 
-        ev_id = f"ev-{task_id}-{subtask_id}-t{turn_number}-{type_str}-{len(self._evidence_list) + 1}"
+        self._next_seq += 1
+        ev_id = f"ev-{task_id}-{subtask_id}-t{turn_number}-{type_str}-{self._next_seq}"
         item = StructuredEvidence(
             evidence_id=ev_id,
             task_id=task_id,
@@ -350,9 +407,17 @@ class CompletionEvidenceStore:
         )
 
         self._evidence_list.append(item)
+        self._types_ever_recorded.add(type_str)
         if len(self._evidence_list) > self.max_entries:
             del self._evidence_list[: len(self._evidence_list) - self.max_entries]
         return item
+
+    def was_ever_recorded(self, evidence_type: EvidenceType | str) -> bool:
+        """Whether an entry of this evidence type has ever been recorded in
+        this store's lifetime -- durable across FIFO eviction of the bounded
+        entry list (see ``_types_ever_recorded`` in __init__)."""
+        type_str = evidence_type.value if isinstance(evidence_type, EvidenceType) else str(evidence_type)
+        return type_str in self._types_ever_recorded
 
     def invalidate_on_file_mutation(self, modified_paths: Sequence[str], reason: str = "content_modified_in_subsequent_turn") -> list[str]:
         """Invalidates prior test, syntax, and review evidence when files are modified."""
@@ -426,6 +491,10 @@ class CompletionEvidenceStore:
             "workspace_root": str(self.workspace_root),
             "max_entries": self.max_entries,
             "entries": [e.to_dict() for e in self._evidence_list],
+            # Bounded by the fixed EvidenceType enum (currently 10 members) --
+            # this never grows with entry count or eviction.
+            "types_ever_recorded": sorted(self._types_ever_recorded),
+            "next_seq": self._next_seq,
         }
 
     @classmethod
@@ -439,6 +508,18 @@ class CompletionEvidenceStore:
             for item in (data.get("entries") or [])
             if isinstance(item, dict)
         ]
+        raw_types = data.get("types_ever_recorded")
+        if isinstance(raw_types, list) and raw_types:
+            # New-format checkpoint: trust the durable signal directly.
+            store._types_ever_recorded = {str(t) for t in raw_types}
+        else:
+            # Old checkpoint predating this field (Phase 4.20 and earlier):
+            # best-effort reconstruction from whatever entries survived,
+            # matching that era's actual behavior exactly rather than
+            # silently granting a stronger guarantee than the data supports.
+            store._types_ever_recorded = {e.evidence_type for e in store._evidence_list}
+        raw_seq = data.get("next_seq")
+        store._next_seq = int(raw_seq) if isinstance(raw_seq, int) and raw_seq > len(store._evidence_list) else len(store._evidence_list)
         return store
 
 
@@ -569,10 +650,12 @@ class CompletionDecisionEngine:
         # test evidence) must never be allowed to silently fall back to the
         # "no automated test suite configured" shortcut below -- that shortcut is
         # only safe when tests were genuinely never run for this task/subtask.
-        test_ever_attempted = any(
-            e.evidence_type == EvidenceType.TEST_EXECUTION.value
-            for e in evidence_store.all_entries()
-        )
+        # Phase 4.21: read this from the store's durable, eviction-proof
+        # signal (was_ever_recorded) rather than scanning the bounded,
+        # FIFO-evictable entry list -- a long enough run could otherwise
+        # evict the one entry proving tests were ever attempted, silently
+        # reopening the Attack C bypass this check exists to close.
+        test_ever_attempted = evidence_store.was_ever_recorded(EvidenceType.TEST_EXECUTION)
 
         if test_fail_ev:
             test_passed = False

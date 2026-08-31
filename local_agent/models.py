@@ -918,6 +918,11 @@ class MultiTurnExecutionReport:
     error_message: str | None = None
     completion_assessment: Any | None = None
     completion_evidence: dict[str, Any] = field(default_factory=dict)
+    # Phase 4.21: task-contract requirement decomposition and its last
+    # requirement-satisfaction assessment (see Checkpoint for the same
+    # fields and the resume-safety note).
+    task_contract: dict[str, Any] | None = None
+    requirement_assessment: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -936,6 +941,8 @@ class MultiTurnExecutionReport:
             "error_message": self.error_message,
             "completion_assessment": self.completion_assessment.to_dict() if hasattr(self.completion_assessment, "to_dict") else self.completion_assessment,
             "completion_evidence": dict(self.completion_evidence) if self.completion_evidence else {},
+            "task_contract": self.task_contract.to_dict() if hasattr(self.task_contract, "to_dict") else self.task_contract,
+            "requirement_assessment": self.requirement_assessment.to_dict() if hasattr(self.requirement_assessment, "to_dict") else (dict(self.requirement_assessment) if self.requirement_assessment else {}),
         }
 
     @classmethod
@@ -964,6 +971,8 @@ class MultiTurnExecutionReport:
             error_message=data.get("error_message"),
             completion_assessment=data.get("completion_assessment"),
             completion_evidence=dict(data.get("completion_evidence") or {}),
+            task_contract=data.get("task_contract"),
+            requirement_assessment=dict(data.get("requirement_assessment") or {}),
         )
 
 
@@ -1061,6 +1070,14 @@ class Checkpoint:
     clarification_requests: list[dict[str, Any]] = field(default_factory=list)
     completion_assessment: Any | None = None
     completion_evidence: dict[str, Any] = field(default_factory=dict)
+    # Phase 4.21: task-contract requirement decomposition and its last
+    # requirement-satisfaction assessment. Restoring task_contract on resume
+    # is safe (it is just the requirement list, not a satisfaction claim);
+    # restoring requirement_assessment is for audit/display only -- callers
+    # must always recompute a fresh assessment before it can influence
+    # completion, exactly as with completion_assessment (see orchestrator.py).
+    task_contract: dict[str, Any] | None = None
+    requirement_assessment: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -1095,6 +1112,8 @@ class Checkpoint:
         d.setdefault("clarification_requests", [])
         d.setdefault("completion_assessment", None)
         d.setdefault("completion_evidence", {})
+        d.setdefault("task_contract", None)
+        d.setdefault("requirement_assessment", {})
         return cls(**d)
 # Phase 4.10 / Phase 4.11: Cross-Subtask Semantic Contract & Behavioral Verification Models
 @dataclass
@@ -2349,6 +2368,13 @@ class Task:
     # Persisted so a resumed run rejoins the same integration branch instead of
     # merging onto whatever branch happens to be checked out.
     integration_branch: str | None = None
+    # Phase 4.21: durable requirement decomposition of this task's objective,
+    # persisted on the task itself (not just a transient run report) so it
+    # survives every run()/multi-turn invocation for the task's lifetime, the
+    # same way ``plan`` does. Stored pre-serialized (a plain dict) rather than
+    # a local_agent.task_contract.TaskContract instance to avoid a models.py
+    # -> task_contract.py import (task_contract.py already imports from here).
+    task_contract: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -2383,6 +2409,7 @@ class Task:
         if data.get("next_retry_at"):
             data["next_retry_at"] = datetime.datetime.fromisoformat(data["next_retry_at"])
         data.setdefault("integration_branch", None)
+        data.setdefault("task_contract", None)
         return cls(**data)
 
     @property
@@ -2587,6 +2614,13 @@ class RunReport:
     # Phase 4.18 / Phase 4.19: Completion and release readiness decision & evidence
     completion_assessment: Any | None = None
     completion_evidence: dict[str, Any] = field(default_factory=dict)
+    # Phase 4.21: task-contract requirement decomposition and its last
+    # requirement-satisfaction assessment. ``report.completed`` is only ever
+    # set True when BOTH completion_assessment.is_ready (technical readiness)
+    # AND requirement_assessment["satisfied"] (task-contract satisfaction)
+    # hold -- see Orchestrator.run() and MultiTurnImplementationAgent.execute().
+    task_contract: Any | None = None
+    requirement_assessment: dict[str, Any] = field(default_factory=dict)
 
 
 class ProviderError(RuntimeError):
