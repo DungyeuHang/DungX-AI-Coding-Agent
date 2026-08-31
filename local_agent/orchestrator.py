@@ -790,6 +790,34 @@ class Orchestrator:
                                     exercised_symbols=gap.missing_test_symbols,
                                 )
                                 report.behavioral_evidence.append(record)
+                                # Phase 4.22: record this behavioral result into the
+                                # authoritative evidence store, not just the transient
+                                # report list. Only there does it get content-fingerprinted
+                                # against the exact files it exercised and automatically
+                                # invalidated by evidence_store.invalidate_on_file_mutation()
+                                # if a later turn touches those files again -- without this,
+                                # a passing behavioral fixture from an earlier iteration could
+                                # keep being treated as current proof after the implementation
+                                # it verified was subsequently changed (or broken).
+                                evidence_store.record(
+                                    task_id=task.task_id,
+                                    subtask_id=prelim_sub.subtask_id,
+                                    turn_number=iteration,
+                                    stage="behavioral_verification",
+                                    evidence_type=EvidenceType.TEST_EXECUTION,
+                                    source="behavioral_verification_synthesizer",
+                                    trust_tier=EvidenceTrustTier.AUTHORITATIVE_EXECUTION,
+                                    target_paths=sorted({s.file_path for s in gap.missing_test_symbols if s.file_path}),
+                                    target_symbols=record.exercised_symbols,
+                                    command=record.command.split() if record.command else None,
+                                    exit_code=record.exit_code,
+                                    payload={
+                                        "synthesized": True,
+                                        "trivial": record.trivial,
+                                        "test_id": record.test_id,
+                                        "status": record.status,
+                                    },
+                                )
                                 if record.status == "passed":
                                     emit(f"[5.6/7] Behavioral verification fixture PASSED for {len(record.exercised_symbols)} symbol(s).")
                                 else:

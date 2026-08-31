@@ -1175,6 +1175,14 @@ class TestExecutionRecord:
     exercised_symbols: list[str] = field(default_factory=list)
     timestamp: datetime.datetime = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
     failure_classification: str = ""
+    # Phase 4.22: whether every assertion in this test only checks that a
+    # symbol exists/is callable (e.g. ``assert callable(x)``,
+    # ``assert x is not None``) rather than any actual return value, output
+    # content, or side effect. A trivial test passing is not behavioral
+    # proof -- see task_contract.py's acceptance-obligation assessment,
+    # which never upgrades a match against a trivial test to
+    # EXECUTABLE_BEHAVIORAL strength.
+    trivial: bool = False
 
     def __post_init__(self):
         if len(self.stdout_summary) > 500:
@@ -1199,6 +1207,7 @@ class TestExecutionRecord:
             "exercised_symbols": list(self.exercised_symbols),
             "timestamp": self.timestamp.isoformat() if isinstance(self.timestamp, datetime.datetime) else str(self.timestamp),
             "failure_classification": self.failure_classification,
+            "trivial": self.trivial,
         }
 
     @classmethod
@@ -1225,6 +1234,11 @@ class TestExecutionRecord:
             exercised_symbols=list(data.get("exercised_symbols", [])),
             timestamp=ts,
             failure_classification=str(data.get("failure_classification", "")),
+            # Fail closed: a record serialized before Phase 4.22 (or with the
+            # key stripped) carries no proof it was non-trivial, so it must
+            # not silently be trusted as behavioral proof merely because the
+            # key is absent.
+            trivial=bool(data.get("trivial", True)),
         )
 
 

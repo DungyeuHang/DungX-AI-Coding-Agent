@@ -349,6 +349,16 @@ def _print_report(report) -> None:
                 for req in reqs:
                     if req.get("importance") == "must" and req.get("state") not in ("satisfied", "not_applicable"):
                         print(f"    - [{req.get('state')}] {req.get('requirement_id')}: {req.get('statement')}")
+                        # Phase 4.22: a compound requirement's own state is
+                        # already the rollup of its acceptance obligations
+                        # (see task_contract._rollup_obligations) -- surface
+                        # which specific obligation(s) are unresolved rather
+                        # than leaving the user to guess which part of a
+                        # multi-item ask (e.g. "CSV, JSON, and XML export")
+                        # is still missing.
+                        for ob in req.get("acceptance_obligations") or []:
+                            if ob.get("state") not in ("satisfied", "not_applicable"):
+                                print(f"        - [{ob.get('state')}] {ob.get('description')}")
 
 
 def _approval_prompt(changes) -> bool:

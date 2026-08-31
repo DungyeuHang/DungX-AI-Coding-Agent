@@ -93,6 +93,65 @@ class RequirementState(str, enum.Enum):
     FAILED = "failed"
     BLOCKED = "blocked"
     NOT_APPLICABLE = "not_applicable"
+    # Phase 4.22: distinct from UNVERIFIED. UNVERIFIED means "no deterministic
+    # check has confirmed this yet, but one could in principle" (e.g. no
+    # matching diff yet). UNVERIFIABLE is the honest admission that no
+    # deterministic rule in this module *could* ever confirm this requirement
+    # on its own (e.g. "make the UI feel more polished") -- it still gates
+    # completion exactly like UNVERIFIED (never silently satisfied), but is
+    # reported truthfully rather than implying "checking is in progress".
+    UNVERIFIABLE = "unverifiable"
+
+
+class AcceptanceMethod(str, enum.Enum):
+    """How a single acceptance obligation was (or could be) checked,
+    ordered strongest-to-weakest by _METHOD_STRENGTH below. Distinguishes
+    "the diff plausibly mentions this" from "an execution actually
+    demonstrated this" -- see RequirementAssessmentEngine._assess_obligation."""
+    # A non-trivial synthesized/authored test exercised the relevant
+    # symbol(s) and passed on the current workspace state.
+    EXECUTABLE_BEHAVIORAL = "executable_behavioral"
+    # A deterministic, statically-checkable fact co-located with the
+    # requirement's own content terms (e.g. a specific target value found on
+    # the same diff line as the identifier it belongs to), stronger than
+    # blind whole-diff token correlation but weaker than execution.
+    STATIC_INVARIANT = "static_invariant"
+    # A general passing test-suite run exists, not specifically bound to
+    # this obligation's target symbols.
+    TEST_EVIDENCE = "test_evidence"
+    # Content-token overlap between the obligation's own wording and the
+    # changed paths/diff text -- textual plausibility, not proof.
+    DIFF_CORRELATION = "diff_correlation"
+    # No deterministic rule applies; only a human or a specialist review can
+    # resolve this.
+    MANUAL_CLARIFICATION = "manual_clarification"
+    # The obligation's own wording admits no observable acceptance condition
+    # at all (see RequirementState.UNVERIFIABLE).
+    UNVERIFIABLE = "unverifiable"
+
+
+_METHOD_STRENGTH: dict[str, int] = {
+    AcceptanceMethod.EXECUTABLE_BEHAVIORAL.value: 5,
+    AcceptanceMethod.STATIC_INVARIANT.value: 4,
+    AcceptanceMethod.TEST_EVIDENCE.value: 3,
+    AcceptanceMethod.DIFF_CORRELATION.value: 2,
+    AcceptanceMethod.MANUAL_CLARIFICATION.value: 1,
+    AcceptanceMethod.UNVERIFIABLE.value: 0,
+}
+
+
+class AcceptanceProvenance(str, enum.Enum):
+    """Who is responsible for an acceptance obligation's existence and
+    wording. A PROVIDER_SUGGESTED obligation may supplement a requirement's
+    verification plan but must never be the *only* obligation standing in
+    for a USER_DERIVED requirement's own words -- see derive_task_contract,
+    which never emits PROVIDER_SUGGESTED obligations itself (reserved for a
+    future provider-assisted verification-plan proposal, not yet wired to
+    any code path that can weaken a requirement by using it)."""
+    USER_DERIVED = "user_derived"
+    SYSTEM_DERIVED = "system_derived"
+    TEST_DERIVED = "test_derived"
+    PROVIDER_SUGGESTED = "provider_suggested"
 
 
 class VerificationStrategy(str, enum.Enum):
@@ -189,6 +248,92 @@ _UNAMBIGUOUS_SEPARATOR = re.compile(r"(?i)\s*(?:\n\s*(?:[-*]|\d+[.)])\s*|;\s*|\.
 _AND_SEPARATOR = re.compile(r"(?i)\s*,?\s+and\s+\s*")
 
 
+# ---------------------------------------------------------------------------
+# Phase 4.22: parallel-list obligation extraction.
+#
+# Phase 4.21 could under-split "Add CSV, JSON, and XML export" into just two
+# requirement pieces because its only splitting tool was the objective-level
+# " and " separator, which by design refuses to split short single-word
+# halves (to avoid fabricating requirements out of idiomatic verb pairs like
+# "pause and resume telemetry"). Rather than chase that with a more
+# elaborate splitting regex -- which risks re-breaking exactly the cases
+# Phase 4.21 hand-fixed -- a detected parallel list becomes multiple
+# AcceptanceObligations under ONE requirement instead of multiple top-level
+# Requirements. This sidesteps the "how many requirements is this really"
+# question (still just one: "add export support") while still making each
+# named item independently checkable and able to fail independently (see
+# _rollup_obligations) -- CSV present but XML missing must not read as this
+# requirement being satisfied.
+# ---------------------------------------------------------------------------
+_TRAILING_AND_SPLIT = re.compile(r"(?i)^(?P<left>.*?),?\s+and\s+(?P<last>\S.*)$")
+_UPPER_ACRONYM = re.compile(r"^[A-Z][A-Z0-9]{1,5}$")
+_LEADING_VERB = re.compile(
+    r"(?i)^(?:add|adds|added|support|supports|supported|implement|implements|"
+    r"implemented|provide|provides|provided|include|includes|included|"
+    r"create|creates|created)\s+"
+)
+
+
+def _extract_parallel_list(raw_clause: str) -> tuple[list[str], str] | None:
+    """Detects a safe, high-confidence parallel list of concrete deliverable
+    items within a single clause. Returns (items, shared_trailing_context)
+    or None when the clause does not match a pattern conservative enough to
+    trust.
+
+    Two shapes are accepted, deliberately narrow to avoid the false-split
+    failures Phase 4.21 hit:
+
+    1. An explicit Oxford-comma enumeration of 3+ items ("A, B, and C") --
+       comma syntax is itself the user's own unambiguous enumeration signal,
+       regardless of what the items look like.
+    2. A bare two-item "A and B" pair, ONLY when both items are short
+       uppercase acronym/format-shaped tokens as literally written by the
+       user (e.g. "CSV and JSON") -- this is what distinguishes a genuine
+       enumerated pair from idiomatic verb coordination ("pause and
+       resume", "reading and writing"), which must never be split.
+    """
+    clause = raw_clause.strip().rstrip(".")
+    match = _TRAILING_AND_SPLIT.search(clause)
+    if not match:
+        return None
+    left, last = match.group("left").strip(), match.group("last").strip()
+    if not left or not last:
+        return None
+
+    if "," in left:
+        comma_items = [p.strip() for p in left.split(",") if p.strip()]
+    else:
+        comma_items = [left]
+    if not comma_items:
+        return None
+    comma_items[0] = _LEADING_VERB.sub("", comma_items[0]).strip()
+    comma_items = [c for c in comma_items if c]
+    if not comma_items:
+        return None
+
+    has_comma_list = len(comma_items) >= 2
+    items = list(comma_items)
+    shared_context = ""
+    last_words = last.split()
+    all_prior_short_upper = all(_UPPER_ACRONYM.match(c) for c in comma_items if " " not in c)
+
+    if len(last_words) == 2 and _UPPER_ACRONYM.match(last_words[0]) and all_prior_short_upper:
+        items.append(last_words[0])
+        shared_context = last_words[1]
+    else:
+        items.append(last)
+
+    if has_comma_list:
+        if len(items) < 3:
+            return None
+        return items, shared_context
+
+    if len(items) == 2 and all(_UPPER_ACRONYM.match(it) for it in items):
+        return items, shared_context
+
+    return None
+
+
 def _split_objective_clauses(objective: str) -> list[str]:
     text = (objective or "").strip()
     if not text:
@@ -199,6 +344,15 @@ def _split_objective_clauses(objective: str) -> list[str]:
 
     clauses: list[str] = []
     for part in sentence_parts:
+        # Phase 4.22: a safe, high-confidence parallel list ("CSV, JSON, and
+        # XML export") must reach derive_task_contract's obligation-set
+        # handling whole -- if the generic " and " splitter below fires
+        # first, it fragments the list into two mismatched top-level
+        # clauses ("Add CSV, JSON," / "XML export") before the parallel-list
+        # detector ever sees the full sentence.
+        if _extract_parallel_list(part) is not None:
+            clauses.append(part)
+            continue
         and_parts = [p.strip().rstrip(".").strip() for p in _AND_SEPARATOR.split(part)]
         and_parts = [p for p in and_parts if p]
         if len(and_parts) > 1 and all(len(p.split()) >= 2 for p in and_parts):
@@ -227,8 +381,159 @@ def _has_strong_signal(text: str) -> bool:
     return bool(_STRONG_SIGNAL.search(text))
 
 
+# Phase 4.22 (Attack A defense): "change the timeout from 30 to 60 seconds"
+# names a specific new value. Plain whole-diff token correlation is
+# satisfied merely by "60" appearing *anywhere* in the diff -- including on
+# an entirely unrelated line, which is exactly how Attack A hides a wrong
+# implementation (changing some other value to 60 while leaving the real
+# target untouched). This does not require parsing the diff as code (a
+# unified diff is not valid Python); it only requires that the new value and
+# at least one of the requirement's own content words appear on the *same*
+# diff line -- a cheap, deterministic, explainable proxy for "the value was
+# set at the place this requirement is talking about", stronger than blind
+# whole-text correlation without attempting full semantic verification.
+_FROM_TO_VALUE = re.compile(
+    r"(?i)\bfrom\b\s*[`\"']?(-?\d+(?:\.\d+)?)[`\"']?\s*(?:[a-z]+\s+)?\bto\b\s*[`\"']?(-?\d+(?:\.\d+)?)[`\"']?"
+)
+
+
+def _extract_from_to_value(statement: str) -> str | None:
+    """Returns the target ("to") value of a "from A to B" phrase in the
+    statement, or None when the statement does not name one."""
+    match = _FROM_TO_VALUE.search(statement)
+    return match.group(2) if match else None
+
+
+def _value_colocated_with_context(diff_text: str, value: str, context_tokens: set[str]) -> bool:
+    """True when some line of diff_text contains both `value` as a
+    standalone token and at least one of context_tokens."""
+    if not context_tokens:
+        return True
+    value_pattern = re.compile(rf"(?<!\d){re.escape(value)}(?!\d)")
+    for line in diff_text.splitlines():
+        if not value_pattern.search(line):
+            continue
+        lowered = line.lower()
+        if any(t in lowered for t in context_tokens):
+            return True
+    return False
+
+
 def _clean_path_token(raw: str) -> str:
     return raw.strip().strip("`\"'").replace("\\", "/")
+
+
+MAX_OBLIGATIONS_PER_REQUIREMENT = 8
+MAX_OBLIGATION_DESC_CHARS = 200
+MAX_OBLIGATION_TOKENS = 20
+
+
+@dataclass
+class AcceptanceObligation:
+    """One observable, checkable fact standing in for part of a
+    requirement's acceptance. Introduced so a compound ask ("CSV, JSON, and
+    XML export") does not have to be force-split into independent top-level
+    Requirements -- an operation Phase 4.21 showed is unreliable to do
+    correctly by grammar alone (see derive_task_contract / _extract_parallel_list).
+    Instead it becomes multiple obligations *under one* requirement, each
+    independently checkable, whose rollup (see _rollup_obligations) can
+    represent partial satisfaction honestly rather than an all-or-nothing
+    guess."""
+    obligation_id: str
+    description: str
+    method: str = AcceptanceMethod.DIFF_CORRELATION.value
+    provenance: str = AcceptanceProvenance.SYSTEM_DERIVED.value
+    state: str = RequirementState.UNVERIFIED.value
+    target_tokens: list[str] = field(default_factory=list)
+    target_paths: list[str] = field(default_factory=list)
+    target_symbols: list[str] = field(default_factory=list)
+    evidence_ids: list[str] = field(default_factory=list)
+    unsatisfied_reason: str = ""
+    created_at: str = field(default_factory=_now_iso)
+    updated_at: str = field(default_factory=_now_iso)
+
+    def __post_init__(self) -> None:
+        if len(self.description) > MAX_OBLIGATION_DESC_CHARS:
+            self.description = self.description[: MAX_OBLIGATION_DESC_CHARS - 3] + "..."
+        if len(self.target_tokens) > MAX_OBLIGATION_TOKENS:
+            self.target_tokens = self.target_tokens[:MAX_OBLIGATION_TOKENS]
+        if len(self.target_paths) > MAX_TARGET_PATHS_PER_REQUIREMENT:
+            self.target_paths = self.target_paths[:MAX_TARGET_PATHS_PER_REQUIREMENT]
+        if len(self.target_symbols) > MAX_OBLIGATION_TOKENS:
+            self.target_symbols = self.target_symbols[:MAX_OBLIGATION_TOKENS]
+        if len(self.evidence_ids) > MAX_EVIDENCE_IDS_PER_REQUIREMENT:
+            self.evidence_ids = self.evidence_ids[-MAX_EVIDENCE_IDS_PER_REQUIREMENT:]
+        if len(self.unsatisfied_reason) > MAX_REASON_CHARS:
+            self.unsatisfied_reason = self.unsatisfied_reason[: MAX_REASON_CHARS - 3] + "..."
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "obligation_id": self.obligation_id,
+            "description": sanitize_text(self.description),
+            "method": self.method,
+            "provenance": self.provenance,
+            "state": self.state,
+            "target_tokens": list(self.target_tokens),
+            "target_paths": list(self.target_paths),
+            "target_symbols": list(self.target_symbols),
+            "evidence_ids": list(self.evidence_ids),
+            "unsatisfied_reason": sanitize_text(self.unsatisfied_reason),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AcceptanceObligation:
+        if not isinstance(data, dict):
+            return cls(obligation_id="", description="", state=RequirementState.UNVERIFIED.value)
+        valid_methods = {m.value for m in AcceptanceMethod}
+        valid_provenance = {p.value for p in AcceptanceProvenance}
+        valid_states = {s.value for s in RequirementState}
+
+        raw_method = str(data.get("method", AcceptanceMethod.MANUAL_CLARIFICATION.value))
+        raw_provenance = str(data.get("provenance", AcceptanceProvenance.SYSTEM_DERIVED.value))
+        raw_state = str(data.get("state", RequirementState.UNVERIFIED.value))
+
+        return cls(
+            obligation_id=str(data.get("obligation_id", "")),
+            description=str(data.get("description", "")),
+            # Fail closed: an unrecognized method must not silently claim a
+            # strength (e.g. EXECUTABLE_BEHAVIORAL) it never earned.
+            method=raw_method if raw_method in valid_methods else AcceptanceMethod.MANUAL_CLARIFICATION.value,
+            provenance=raw_provenance if raw_provenance in valid_provenance else AcceptanceProvenance.SYSTEM_DERIVED.value,
+            state=raw_state if raw_state in valid_states else RequirementState.UNVERIFIED.value,
+            target_tokens=[str(t) for t in (data.get("target_tokens") or [])],
+            target_paths=[str(p) for p in (data.get("target_paths") or [])],
+            target_symbols=[str(s) for s in (data.get("target_symbols") or [])],
+            evidence_ids=[str(e) for e in (data.get("evidence_ids") or [])],
+            unsatisfied_reason=str(data.get("unsatisfied_reason", "")),
+            created_at=str(data.get("created_at", "")) or _now_iso(),
+            updated_at=str(data.get("updated_at", "")) or _now_iso(),
+        )
+
+
+def _rollup_obligations(obligations: Sequence[AcceptanceObligation]) -> tuple[RequirementState, str]:
+    """Combines a requirement's acceptance obligations into one state.
+    Failure dominates (a failed obligation can never be outvoted by other
+    passing obligations -- S5), and satisfaction requires *every* obligation
+    resolved (a partially-satisfied compound requirement is never reported
+    as SATISFIED -- S6)."""
+    total = len(obligations)
+    failed = [o for o in obligations if o.state == RequirementState.FAILED.value]
+    if failed:
+        names = ", ".join(o.obligation_id for o in failed[:5])
+        return RequirementState.FAILED, f"{len(failed)}/{total} acceptance obligation(s) failed: {names}"
+    blocked = [o for o in obligations if o.state == RequirementState.BLOCKED.value]
+    if blocked:
+        return RequirementState.BLOCKED, "Awaiting clarification for one or more acceptance obligations"
+    unresolved = [
+        o for o in obligations
+        if o.state not in (RequirementState.SATISFIED.value, RequirementState.NOT_APPLICABLE.value)
+    ]
+    if unresolved:
+        names = ", ".join(o.obligation_id for o in unresolved[:5])
+        return RequirementState.UNVERIFIED, f"{len(unresolved)}/{total} acceptance obligation(s) not yet satisfied: {names}"
+    return RequirementState.SATISFIED, ""
 
 
 @dataclass
@@ -247,6 +552,15 @@ class Requirement:
     evidence_ids: list[str] = field(default_factory=list)
     unsatisfied_reason: str = ""
     clarification_id: str | None = None
+    # Phase 4.22: zero or more independently-checkable acceptance
+    # obligations. Empty (the common case for a simple requirement) means
+    # "assess via verification_strategy alone", exactly the Phase 4.21
+    # behavior -- fully backward compatible. Non-empty means the
+    # requirement's state is instead the rollup of its obligations (see
+    # _rollup_obligations), which verification_strategy/target_paths above
+    # are not used to compute (they are retained for display/backward
+    # compatibility only).
+    acceptance_obligations: list[AcceptanceObligation] = field(default_factory=list)
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
 
@@ -259,6 +573,8 @@ class Requirement:
             self.evidence_ids = self.evidence_ids[-MAX_EVIDENCE_IDS_PER_REQUIREMENT:]
         if len(self.unsatisfied_reason) > MAX_REASON_CHARS:
             self.unsatisfied_reason = self.unsatisfied_reason[: MAX_REASON_CHARS - 3] + "..."
+        if len(self.acceptance_obligations) > MAX_OBLIGATIONS_PER_REQUIREMENT:
+            self.acceptance_obligations = self.acceptance_obligations[:MAX_OBLIGATIONS_PER_REQUIREMENT]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -273,6 +589,7 @@ class Requirement:
             "evidence_ids": list(self.evidence_ids),
             "unsatisfied_reason": sanitize_text(self.unsatisfied_reason),
             "clarification_id": self.clarification_id,
+            "acceptance_obligations": [o.to_dict() for o in self.acceptance_obligations],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -292,6 +609,7 @@ class Requirement:
         # SATISFIED -- the safe unknown-state default is UNVERIFIED.
         raw_state = str(data.get("state", RequirementState.UNVERIFIED.value))
         raw_strategy = str(data.get("verification_strategy", VerificationStrategy.MANUAL_CLARIFICATION.value))
+        raw_obligations = data.get("acceptance_obligations") or []
 
         return cls(
             requirement_id=str(data.get("requirement_id", "")),
@@ -305,6 +623,10 @@ class Requirement:
             evidence_ids=[str(e) for e in (data.get("evidence_ids") or [])],
             unsatisfied_reason=str(data.get("unsatisfied_reason", "")),
             clarification_id=data.get("clarification_id"),
+            acceptance_obligations=(
+                [AcceptanceObligation.from_dict(o) for o in raw_obligations if isinstance(o, dict)]
+                if isinstance(raw_obligations, list) else []
+            ),
             created_at=str(data.get("created_at", "")) or _now_iso(),
             updated_at=str(data.get("updated_at", "")) or _now_iso(),
         )
@@ -428,6 +750,49 @@ def derive_task_contract(task: Task, plan: Plan | None) -> TaskContract:
         # harder-to-satisfy requirement duplicating the same ask.
         if _DOC_HINT.search(clause) or _TEST_HINT.search(clause):
             continue
+
+        # Phase 4.22: a clause naming a safe, high-confidence parallel list
+        # ("CSV, JSON, and XML export") becomes ONE requirement with one
+        # acceptance obligation per item, rather than either (a) one
+        # requirement that a diff mentioning any single format would
+        # leniently satisfy, or (b) an attempt to force it into multiple
+        # top-level Requirements via grammar alone (see
+        # _extract_parallel_list's docstring for why that is unreliable).
+        parallel = _extract_parallel_list(clause)
+        if parallel is not None:
+            items, shared_context = parallel
+            req_id = next_id()
+            obligations: list[AcceptanceObligation] = []
+            for i, item in enumerate(items, start=1):
+                phrase = f"{item} {shared_context}".strip()
+                # target_tokens deliberately covers only the item's own
+                # words, not the shared trailing context ("export"): that
+                # word is common to every obligation in the list, so
+                # including it would let one obligation's behavioral/diff
+                # evidence cross-match another's (e.g. a passing "export"
+                # match for CSV incorrectly also "covering" JSON). The
+                # description keeps the full phrase for human readability.
+                item_tokens = sorted(_content_tokens(item)) or [item.lower()]
+                obligations.append(AcceptanceObligation(
+                    obligation_id=f"{req_id}-OB{i}",
+                    description=phrase,
+                    method=AcceptanceMethod.DIFF_CORRELATION.value,
+                    provenance=AcceptanceProvenance.USER_DERIVED.value,
+                    target_tokens=item_tokens,
+                    target_paths=plan_files,
+                ))
+            requirements.append(Requirement(
+                requirement_id=req_id,
+                statement=clause,
+                requirement_type=RequirementType.FUNCTIONAL.value,
+                importance=RequirementImportance.MUST.value,
+                verification_strategy=VerificationStrategy.DIFF_PRESENCE.value,
+                source="user_task",
+                target_paths=plan_files,
+                acceptance_obligations=obligations,
+            ))
+            continue
+
         requirements.append(Requirement(
             requirement_id=next_id(),
             statement=clause,
@@ -602,32 +967,59 @@ class RequirementAssessmentEngine:
 
         results: list[Requirement] = []
         for req in contract.requirements:
-            lenient = functional_count <= 1 and not _has_strong_signal(req.statement)
-            state, reason, evidence_ids = self._assess_one(
-                req, changed_paths, diff_text, evidence_store, last_review, clarified_by_id,
-                lenient,
-            )
-            results.append(replace(
-                req,
-                state=state.value,
-                unsatisfied_reason=reason,
-                evidence_ids=(req.evidence_ids + evidence_ids)[-MAX_EVIDENCE_IDS_PER_REQUIREMENT:],
-                updated_at=_now_iso(),
-            ))
+            if req.acceptance_obligations:
+                obligations = [
+                    self._assess_obligation(req, ob, changed_paths, diff_text, evidence_store, clarified_by_id)
+                    for ob in req.acceptance_obligations
+                ]
+                state, reason = _rollup_obligations(obligations)
+                evidence_ids = sorted({eid for ob in obligations for eid in ob.evidence_ids})
+                results.append(replace(
+                    req,
+                    state=state.value,
+                    unsatisfied_reason=reason,
+                    acceptance_obligations=obligations,
+                    evidence_ids=(req.evidence_ids + evidence_ids)[-MAX_EVIDENCE_IDS_PER_REQUIREMENT:],
+                    updated_at=_now_iso(),
+                ))
+            else:
+                lenient = functional_count <= 1 and not _has_strong_signal(req.statement)
+                state, reason, evidence_ids = self._assess_one(
+                    req, changed_paths, diff_text, evidence_store, last_review, clarified_by_id,
+                    lenient,
+                )
+                results.append(replace(
+                    req,
+                    state=state.value,
+                    unsatisfied_reason=reason,
+                    evidence_ids=(req.evidence_ids + evidence_ids)[-MAX_EVIDENCE_IDS_PER_REQUIREMENT:],
+                    updated_at=_now_iso(),
+                ))
             # Durable, auditable trace of the assessment itself, reusing the
             # same evidence store / trust-tier vocabulary as the technical
             # completion engine rather than a parallel logging mechanism.
-            evidence_store.record(
-                task_id=contract.task_id,
-                subtask_id=req.requirement_id,
-                turn_number=0,
-                stage="requirement_assessment",
-                evidence_type=EvidenceType.CONTRACT_COMPLIANCE,
-                source="requirement_assessment_engine",
-                trust_tier=EvidenceTrustTier.SYSTEM_INTEGRITY,
-                target_paths=req.target_paths,
-                payload={"requirement_id": req.requirement_id, "state": state.value, "reason": reason},
-            )
+            # Phase 4.22 (Residual Concern B): assess() can be called many
+            # times per task run (every iteration, plus checkpoint-resume
+            # recompute), and a requirement's outcome is usually unchanged
+            # between consecutive calls -- recording a fresh entry every
+            # single time churns the evidence store's bounded FIFO window
+            # with near-duplicates, risking eviction of unrelated evidence
+            # that hasn't actually gone stale. Only record when the
+            # requirement's (state, reason) actually differ from the last
+            # entry recorded for this requirement_id.
+            prior = self._last_recorded_compliance(evidence_store, req.requirement_id)
+            if prior != (state.value, reason):
+                evidence_store.record(
+                    task_id=contract.task_id,
+                    subtask_id=req.requirement_id,
+                    turn_number=0,
+                    stage="requirement_assessment",
+                    evidence_type=EvidenceType.CONTRACT_COMPLIANCE,
+                    source="requirement_assessment_engine",
+                    trust_tier=EvidenceTrustTier.SYSTEM_INTEGRITY,
+                    target_paths=req.target_paths,
+                    payload={"requirement_id": req.requirement_id, "state": state.value, "reason": reason},
+                )
 
         unsatisfied_must = [
             r for r in results
@@ -650,6 +1042,112 @@ class RequirementAssessmentEngine:
             unsatisfied_requirement_ids=[r.requirement_id for r in unsatisfied_must],
             failed_requirement_ids=[r.requirement_id for r in failed],
             decision_reason=reason,
+        )
+
+    @staticmethod
+    def _last_recorded_compliance(evidence_store: CompletionEvidenceStore, requirement_id: str) -> tuple[str, str] | None:
+        matches = [
+            e for e in evidence_store.all_entries()
+            if e.evidence_type == EvidenceType.CONTRACT_COMPLIANCE.value and e.subtask_id == requirement_id
+        ]
+        if not matches:
+            return None
+        last = matches[-1]
+        return str(last.payload.get("state", "")), str(last.payload.get("reason", ""))
+
+    def _assess_obligation(
+        self,
+        req: Requirement,
+        ob: AcceptanceObligation,
+        changed_paths: set[str],
+        diff_text: str,
+        evidence_store: CompletionEvidenceStore,
+        clarified_by_id: dict[str, Any],
+    ) -> AcceptanceObligation:
+        """Evaluates one acceptance obligation. Tries, in order of
+        preference, the strongest evidence that could plausibly apply:
+        1. A non-trivial synthesized/authored test whose exercised symbols
+           correlate with this obligation (EXECUTABLE_BEHAVIORAL) --
+           dominant in both directions: a matching failure fails the
+           obligation even if diff correlation alone would pass (S3/S5),
+           and a matching pass satisfies it without needing diff
+           correlation too.
+        2. Whole-diff content-token correlation (DIFF_CORRELATION), the
+           same proxy used for a non-obligation requirement.
+        """
+        tokens = set(ob.target_tokens) or _content_tokens(ob.description)
+
+        behavioral_matches = [
+            e for e in evidence_store.get_valid_evidence(EvidenceType.TEST_EXECUTION)
+            if e.payload.get("synthesized") is True
+            and tokens
+            and any(t in (sym or "").lower() for sym in e.target_symbols for t in tokens)
+        ]
+        if behavioral_matches:
+            failing = [e for e in behavioral_matches if e.exit_code != 0]
+            # A trivial (existence-only) test passing is not behavioral
+            # proof (S7) and must not be used to grant EXECUTABLE_BEHAVIORAL
+            # strength -- but a trivial test's FAILURE (e.g. the symbol
+            # doesn't even exist/import) is still real, dominant evidence
+            # of absence, so failures are never filtered by triviality.
+            non_trivial_passing = [e for e in behavioral_matches if e.exit_code == 0 and not e.payload.get("trivial", True)]
+            if failing:
+                return replace(
+                    ob,
+                    state=RequirementState.FAILED.value,
+                    method=AcceptanceMethod.EXECUTABLE_BEHAVIORAL.value,
+                    provenance=AcceptanceProvenance.TEST_DERIVED.value,
+                    unsatisfied_reason=f"Behavioral verification failed for this obligation ({len(failing)} failure(s))",
+                    evidence_ids=[e.evidence_id for e in failing],
+                    updated_at=_now_iso(),
+                )
+            if non_trivial_passing:
+                return replace(
+                    ob,
+                    state=RequirementState.SATISFIED.value,
+                    method=AcceptanceMethod.EXECUTABLE_BEHAVIORAL.value,
+                    provenance=AcceptanceProvenance.TEST_DERIVED.value,
+                    unsatisfied_reason="",
+                    evidence_ids=[e.evidence_id for e in non_trivial_passing],
+                    updated_at=_now_iso(),
+                )
+            # Only trivial passing matches -- fall through to diff
+            # correlation rather than claiming behavioral proof.
+
+        if not changed_paths and not diff_text.strip():
+            return replace(
+                ob,
+                state=RequirementState.UNVERIFIED.value,
+                method=AcceptanceMethod.DIFF_CORRELATION.value,
+                unsatisfied_reason="No workspace changes to evaluate against this obligation",
+                updated_at=_now_iso(),
+            )
+        if not tokens:
+            satisfied = bool(changed_paths)
+            return replace(
+                ob,
+                state=(RequirementState.SATISFIED if satisfied else RequirementState.UNVERIFIED).value,
+                method=AcceptanceMethod.DIFF_CORRELATION.value,
+                unsatisfied_reason="" if satisfied else "No workspace changes to evaluate against this obligation",
+                updated_at=_now_iso(),
+            )
+        haystack = " ".join(sorted(changed_paths)).lower() + "\n" + diff_text.lower()
+        found = sum(1 for t in tokens if t in haystack)
+        required = len(tokens) if len(tokens) <= 4 else math.ceil(len(tokens) * 0.75)
+        if found >= required:
+            return replace(
+                ob,
+                state=RequirementState.SATISFIED.value,
+                method=AcceptanceMethod.DIFF_CORRELATION.value,
+                unsatisfied_reason="",
+                updated_at=_now_iso(),
+            )
+        return replace(
+            ob,
+            state=RequirementState.UNVERIFIED.value,
+            method=AcceptanceMethod.DIFF_CORRELATION.value,
+            unsatisfied_reason=f"Changeset does not evidently address '{ob.description}' ({found}/{len(tokens)} content terms found)",
+            updated_at=_now_iso(),
         )
 
     def _assess_one(
@@ -731,17 +1229,39 @@ class RequirementAssessmentEngine:
             haystack = " ".join(sorted(changed_paths)).lower() + "\n" + diff_text.lower()
             found = sum(1 for t in tokens if t in haystack)
             required = len(tokens) if len(tokens) <= 4 else math.ceil(len(tokens) * 0.75)
-            if found >= required:
-                return RequirementState.SATISFIED, "", []
-            return (
-                RequirementState.UNVERIFIED,
-                f"Changeset does not evidently address this requirement ({found}/{len(tokens)} content terms found)",
-                [],
-            )
+            if found < required:
+                return (
+                    RequirementState.UNVERIFIED,
+                    f"Changeset does not evidently address this requirement ({found}/{len(tokens)} content terms found)",
+                    [],
+                )
+
+            # Phase 4.22 (Attack A): a "from A to B" requirement is not
+            # satisfied merely because B appears somewhere in a diff that
+            # also happens to mention the requirement's other content words
+            # -- both could be true while the wrong value was changed. Also
+            # require B to appear on the same diff line as at least one
+            # content word, a cheap static-invariant-style proxy for "set at
+            # the place this requirement names", without pretending to
+            # parse the diff as code.
+            target_value = _extract_from_to_value(req.statement)
+            if target_value is not None and not _value_colocated_with_context(diff_text, target_value, tokens):
+                return (
+                    RequirementState.UNVERIFIED,
+                    f"Target value '{target_value}' appears in the diff but not alongside this requirement's own wording; cannot confirm the correct location was changed",
+                    [],
+                )
+            return RequirementState.SATISFIED, "", []
 
         # MANUAL_CLARIFICATION (or any strategy this engine does not know how
-        # to auto-verify): fails closed to UNVERIFIED rather than assuming
-        # satisfaction. A requirement can only leave this state via an
-        # explicit clarification binding (handled above) or contract
-        # amendment -- never implicitly.
-        return RequirementState.UNVERIFIED, "No deterministic verification strategy could confirm this requirement", []
+        # to auto-verify): fails closed rather than assuming satisfaction. A
+        # requirement can only leave this state via an explicit
+        # clarification binding (handled above) or contract amendment --
+        # never implicitly. Phase 4.22: labeled UNVERIFIABLE rather than
+        # UNVERIFIED -- the honest fact is not "not yet checked" but "no
+        # rule in this module could ever check this on its own" (section 20:
+        # unverifiable requirements must be disclosed truthfully, not
+        # implied to be a pending check). Gating behavior is identical --
+        # this state still blocks a MUST requirement exactly like UNVERIFIED
+        # (see RequirementAssessmentEngine.assess's unsatisfied_must filter).
+        return RequirementState.UNVERIFIABLE, "No deterministic verification strategy could confirm this requirement; needs clarification or manual review", []

@@ -298,9 +298,12 @@ def test_attack_5_compatibility_violation(tmp_path):
     compat = [r for r in result.requirements if r.requirement_type == RequirementType.COMPATIBILITY.value]
     assert len(compat) == 1
     # No authoritative compatibility evidence exists -- it must stay
-    # unverified, never silently satisfied by the fact that *some* change
-    # was made and review approved it.
-    assert compat[0].state == RequirementState.UNVERIFIED.value
+    # unresolved, never silently satisfied by the fact that *some* change
+    # was made and review approved it. Phase 4.22: MANUAL_CLARIFICATION
+    # requirements are now labeled UNVERIFIABLE (honest: no rule could ever
+    # auto-check this) rather than UNVERIFIED (implies a pending check) --
+    # gating behavior is identical, this is a purely honest relabeling.
+    assert compat[0].state == RequirementState.UNVERIFIABLE.value
 
 
 def test_attack_6_provider_lies_have_no_input_to_lie_through(tmp_path):

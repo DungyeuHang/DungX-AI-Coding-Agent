@@ -31,6 +31,83 @@ _DANGEROUS_PATTERNS = [
     re.compile(r"\b(db:migrate:reset|db:drop|prisma\s+migrate\s+reset)\b", re.I),
 ]
 
+# Phase 4.22: names of calls that only prove a symbol *exists* and is of a
+# recognizable shape (callable, a class, not None) -- never that it does
+# anything correct. A test built entirely out of these is indistinguishable,
+# from the completion engine's point of view, from ``assert True``: it can
+# never fail against a wrong-but-present implementation (Attack B/C in the
+# Phase 4.22 adversarial matrix: a function that exists but returns invalid
+# output). See classify_test_triviality below.
+_EXISTENCE_ONLY_CALL_NAMES = frozenset({
+    "callable", "isclass", "isfunction", "ismethod", "isroutine", "isbuiltin",
+})
+
+
+def _is_existence_only_assert(test_node: ast.AST) -> bool:
+    # ``assert True`` / ``assert 1`` -- unconditionally vacuous.
+    if isinstance(test_node, ast.Constant) and bool(test_node.value):
+        return True
+    # ``assert x is not None`` / ``assert x is None``.
+    if (
+        isinstance(test_node, ast.Compare)
+        and len(test_node.ops) == 1
+        and isinstance(test_node.ops[0], (ast.Is, ast.IsNot))
+        and len(test_node.comparators) == 1
+        and isinstance(test_node.comparators[0], ast.Constant)
+        and test_node.comparators[0].value is None
+    ):
+        return True
+    # ``assert callable(x)`` / ``assert inspect.isclass(x)`` etc.
+    if isinstance(test_node, ast.Call):
+        func = test_node.func
+        name = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else "")
+        if name in _EXISTENCE_ONLY_CALL_NAMES:
+            return True
+    return False
+
+
+def _function_has_nontrivial_assertion(fn: ast.AST) -> bool:
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assert):
+            if not _is_existence_only_assert(node.test):
+                return True
+        elif isinstance(node, ast.With):
+            # ``with pytest.raises(...):`` genuinely exercises behavior
+            # (an expected exception path), not merely existence.
+            for item in node.items:
+                call = item.context_expr
+                if isinstance(call, ast.Call):
+                    func = call.func
+                    name = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else "")
+                    if name == "raises":
+                        return True
+    return False
+
+
+def classify_test_triviality(code: str) -> bool:
+    """True when this test code cannot possibly distinguish a correct
+    implementation from a superficially-matching wrong one: every ``test_``
+    function's assertions only check that a symbol exists/is callable/is
+    non-None, never an actual return value, output, or side effect.
+
+    Fails closed: unparseable code, or a fixture with no ``test_`` function
+    at all, is treated as trivial (never granted behavioral-proof strength).
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return True
+    test_funcs = [
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")
+    ]
+    if not test_funcs:
+        return True
+    for fn in test_funcs:
+        if not _function_has_nontrivial_assertion(fn):
+            return True
+    return False
+
 
 class VerificationGapAnalyzer:
     """
@@ -299,6 +376,7 @@ class BehavioralVerifier:
 
         start_time = time.time()
         exercised_names = [s.name for s in (exercised_symbols or [])]
+        trivial = classify_test_triviality(test_code)
 
         try:
             # Write ephemeral fixture
@@ -334,6 +412,7 @@ class BehavioralVerifier:
                 exercised_symbols=exercised_names,
                 timestamp=datetime.datetime.now(datetime.timezone.utc),
                 failure_classification=failure_cls,
+                trivial=trivial,
             )
 
         except Exception as e:
@@ -350,6 +429,7 @@ class BehavioralVerifier:
                 exercised_symbols=exercised_names,
                 timestamp=datetime.datetime.now(datetime.timezone.utc),
                 failure_classification="VERIFICATION_EXECUTION_ERROR",
+                trivial=trivial,
             )
         finally:
             # Clean up ephemeral fixture
