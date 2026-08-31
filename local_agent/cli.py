@@ -159,6 +159,10 @@ def build_parser() -> argparse.ArgumentParser:
         ("recommendations", "show ranked recommendations with their priority explanations"),
         ("status", "show the most recent maintenance run and what remains unresolved"),
         ("dry-run", "score, select and plan candidates without executing anything"),
+        # Phase 4.23: the signal inventory as an operator artefact rather than
+        # a docstring. It answers "why is this signal not automated?" from the
+        # same records the executor's gate reads.
+        ("signals", "show every maintenance signal, its execution oracle and its ceiling"),
     ):
         sub = maintenance_sub.add_parser(name, help=description)
         add_common_arguments(sub)
@@ -825,7 +829,7 @@ def _print_execution_report(executor, want_execute: bool, want_apply: bool, resu
         return
 
     results = list(getattr(executor, "results", []) or [])
-    print("\n  Narrow maintenance execution (Phase 4.22)")
+    print("\n  Narrow maintenance execution (Phase 4.23 oracle framework)")
     print(f"    authoritative apply permitted: {'yes' if want_apply else 'no (--apply not given)'}")
     if not results:
         print("    ATTEMPTED: 0 - no candidate reached the executor. A candidate must be")
@@ -845,15 +849,94 @@ def _print_execution_report(executor, want_execute: bool, want_apply: bool, resu
         print(f"    - {entry.candidate_id} [{entry.signal_kind}] -> {entry.status}")
         print(f"        applied={entry.applied} rolled_back={entry.rolled_back} "
               f"post-apply validation={_verdict_text(entry.validation_passed)}")
+        if entry.oracle_name:
+            print(f"        oracle: {entry.oracle_name} ({entry.oracle_class})")
+            for label, observation in (
+                ("precondition ", entry.oracle_precondition),
+                ("postcondition", entry.oracle_postcondition),
+            ):
+                if not observation:
+                    print(f"        {label}: not reached")
+                    continue
+                clauses = ", ".join(
+                    f"{name}={'ok' if ok else 'FAILED'}"
+                    for name, ok in observation.get("clauses") or ()
+                ) or "no clauses evaluated"
+                print(f"        {label}: {observation.get('outcome')} [{clauses}]")
+                print(f"          {observation.get('detail', '')}")
         if entry.changed_files:
             print(f"        changed: {', '.join(entry.changed_files)}")
-        if entry.post_apply_commands:
-            print("        validation commands actually executed: "
-                  + "; ".join(" ".join(command) for command in entry.post_apply_commands))
+        # Executed and skipped are printed apart. Phase 4.22 printed every
+        # selected command under the heading "actually executed", which meant a
+        # run whose tool was missing reported validation coverage it did not
+        # have - precisely the metric the specification forbids.
+        if entry.post_apply_executed_commands:
+            print("        validation commands that actually executed: "
+                  + "; ".join(
+                      " ".join(command)
+                      for command in entry.post_apply_executed_commands
+                  ))
+        else:
+            print("        validation commands that actually executed: none")
+        if entry.post_apply_skipped_commands:
+            print("        validation commands SKIPPED (no evidence either way): "
+                  + "; ".join(
+                      " ".join(command)
+                      for command in entry.post_apply_skipped_commands
+                  ))
         for reason in entry.reasons[:6]:
             print(f"        note: {reason}")
         for error in entry.errors[:4]:
             print(f"        error: {error}")
+
+
+def _print_signal_inventory(emit_json) -> int:
+    """Phase 4.23: every signal, its oracle, its ceiling and why.
+
+    Reads the live :data:`~local_agent.maintenance_oracle.SIGNAL_INVENTORY` and
+    the live oracle registry rather than a copy, so what an operator is shown
+    is what the executor's gate actually consults.
+    """
+    from .maintenance_oracle import (
+        AUTONOMOUS_SIGNAL_KINDS,
+        SIGNAL_INVENTORY,
+        inventory_rows,
+        oracle_for,
+    )
+
+    if emit_json is not None:
+        emit_json({
+            "autonomous_signals": sorted(AUTONOMOUS_SIGNAL_KINDS),
+            "signals": inventory_rows(),
+        })
+        return 0
+
+    print("Maintenance Signal Inventory")
+    print("=" * 28)
+    print(f"  {len(SIGNAL_INVENTORY)} signal(s) defined; "
+          f"{len(AUTONOMOUS_SIGNAL_KINDS)} executed autonomously.")
+    print("  A signal is executed autonomously only when its oracle is")
+    print("  deterministic AND its inventory entry says so. Both are checked")
+    print("  live; neither can be granted by configuration or persisted state.")
+    for row in inventory_rows():
+        oracle = oracle_for(row["signal"])
+        marker = "AUTONOMOUS" if row["autonomous_execution"] else "gated"
+        print()
+        print(f"  {row['signal']}  [{marker}]")
+        print(f"    producer:      {row['producer']}")
+        print(f"    detection:     {row['detection_mechanism']}")
+        print(f"    evidence:      {row['evidence_source']}")
+        print(f"    confidence:    {row['confidence_source']}")
+        print(f"    oracle:        {oracle.name} ({row['oracle_class']})")
+        print(f"    failure test:  {oracle.describe_failure_predicate()}")
+        print(f"    success test:  {oracle.describe_success_predicate()}")
+        print(f"    policy ceiling:{row['policy_max_tier']}")
+        print(f"    test coverage: {row['test_coverage']}")
+        for reason in row["rejection_reasons"]:
+            print(f"    NOT AUTOMATED: {reason}")
+        for limitation in row["residual_limitations"]:
+            print(f"    STILL UNPROVEN: {limitation}")
+    return 0
 
 
 def _verdict_text(value) -> str:
@@ -884,6 +967,9 @@ def _handle_maintenance_command(args, config, storage) -> int:
 
     def _emit(payload: dict) -> None:
         print(json.dumps(payload, indent=2, default=str))
+
+    if command == "signals":
+        return _print_signal_inventory(_emit if as_json else None)
 
     manager = MaintenanceManager(
         storage,
