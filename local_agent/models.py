@@ -57,6 +57,138 @@ class SpecialistRole(str, Enum):
     REVIEW = "review"
     VERIFICATION = "verification"
 
+class ProviderHealthStatus(str, Enum):
+    """Structured operational status of an AI provider for a specialist role."""
+    HEALTHY_REAL_PROVIDER = "healthy_real_provider"
+    EXPLICIT_OFFLINE_MOCK = "explicit_offline_mock"
+    DEGRADED_FALLBACK = "degraded_fallback"
+    UNAVAILABLE = "unavailable"
+
+@dataclass(frozen=True)
+class RoleHealthReport:
+    """Structured health and configuration report for a specialist role."""
+    role: str
+    status: str  # ProviderHealthStatus value
+    configured_provider: str
+    configured_model: str | None = None
+    active_provider: str = ""
+    active_model: str | None = None
+    fallback_chain: list[str] = field(default_factory=list)
+    degradation_reason: str | None = None
+    is_real_provider: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "status": self.status,
+            "configured_provider": self.configured_provider,
+            "configured_model": self.configured_model,
+            "active_provider": self.active_provider,
+            "active_model": self.active_model,
+            "fallback_chain": list(self.fallback_chain),
+            "degradation_reason": self.degradation_reason,
+            "is_real_provider": self.is_real_provider,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        if not isinstance(data, dict):
+            return cls(role="", status=ProviderHealthStatus.UNAVAILABLE.value, configured_provider="")
+        return cls(
+            role=str(data.get("role", "")),
+            status=str(data.get("status", ProviderHealthStatus.UNAVAILABLE.value)),
+            configured_provider=str(data.get("configured_provider", "")),
+            configured_model=data.get("configured_model"),
+            active_provider=str(data.get("active_provider", "")),
+            active_model=data.get("active_model"),
+            fallback_chain=list(data.get("fallback_chain", [])),
+            degradation_reason=data.get("degradation_reason"),
+            is_real_provider=bool(data.get("is_real_provider", False)),
+        )
+
+class PreflightCheckCategory(str, Enum):
+    PROVIDERS = "providers"
+    REPOSITORY = "repository"
+    TOOLS = "tools"
+    STORAGE = "storage"
+    SAFETY = "safety"
+    EXECUTION = "execution"
+    KNOWLEDGE = "knowledge"
+
+class PreflightCheckStatus(str, Enum):
+    PASSED = "passed"
+    WARNING = "warning"
+    BLOCKED = "blocked"
+    INFO = "info"
+
+@dataclass
+class PreflightCheckItem:
+    name: str
+    category: str  # PreflightCheckCategory value
+    status: str    # PreflightCheckStatus value
+    message: str
+    remediation: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "category": self.category,
+            "status": self.status,
+            "message": self.message,
+            "remediation": self.remediation,
+            "details": self.details,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        if not isinstance(data, dict):
+            return cls(name="", category=PreflightCheckCategory.PROVIDERS.value, status=PreflightCheckStatus.BLOCKED.value, message="")
+        return cls(
+            name=str(data.get("name", "")),
+            category=str(data.get("category", PreflightCheckCategory.PROVIDERS.value)),
+            status=str(data.get("status", PreflightCheckStatus.BLOCKED.value)),
+            message=str(data.get("message", "")),
+            remediation=str(data.get("remediation", "")),
+            details=dict(data.get("details", {})),
+        )
+
+@dataclass
+class PreflightReport:
+    overall_status: str  # "READY", "READY_WITH_WARNINGS", "BLOCKED"
+    is_ready: bool
+    checks: list[PreflightCheckItem] = field(default_factory=list)
+    roles_health: dict[str, Any] = field(default_factory=dict)
+    summary: str = ""
+
+    @property
+    def blocker_summary(self) -> str:
+        blockers = [c.message for c in self.checks if c.status == PreflightCheckStatus.BLOCKED.value]
+        return "; ".join(blockers) if blockers else "No blockers"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "overall_status": self.overall_status,
+            "is_ready": self.is_ready,
+            "checks": [c.to_dict() for c in self.checks],
+            "roles_health": self.roles_health,
+            "summary": self.summary,
+            "blocker_summary": self.blocker_summary,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        if not isinstance(data, dict):
+            return cls(overall_status="BLOCKED", is_ready=False)
+        checks = [PreflightCheckItem.from_dict(c) for c in data.get("checks", [])]
+        return cls(
+            overall_status=str(data.get("overall_status", "BLOCKED")),
+            is_ready=bool(data.get("is_ready", False)),
+            checks=checks,
+            roles_health=dict(data.get("roles_health", {})),
+            summary=str(data.get("summary", "")),
+        )
+
 class ProviderAvailability(str, Enum):
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
@@ -2635,6 +2767,9 @@ class RunReport:
     # hold -- see Orchestrator.run() and MultiTurnImplementationAgent.execute().
     task_contract: Any | None = None
     requirement_assessment: dict[str, Any] = field(default_factory=dict)
+    # Phase 4.25: Production preflight and specialist provider health tracking
+    preflight_report: dict[str, Any] | None = None
+    provider_health: dict[str, Any] = field(default_factory=dict)
 
 
 class ProviderError(RuntimeError):

@@ -88,6 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="run a health check on the agent and project environment")
     add_common_arguments(doctor)
 
+    preflight = subparsers.add_parser("preflight", help="check production readiness, specialist providers, and environment")
+    add_common_arguments(preflight, include_provider_args=True)
+    preflight.add_argument("--require-real-providers", action="store_true", help="require real AI providers (fail if any role uses mock)")
+
     # New for Phase 3.23
     ci_repair = subparsers.add_parser("ci-repair", help="create an autonomous task to repair a CI failure")
     add_common_arguments(ci_repair)
@@ -1630,6 +1634,25 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as e:
                 print(f"  - Could not determine provider status: {e}")
             return 0
+
+        if args.command == "preflight":
+            from .preflight import PreflightChecker
+            checker = PreflightChecker(config, storage=storage)
+            report = checker.check(require_real_providers=getattr(args, "require_real_providers", False))
+            print("\nDungX AI Coding Agent Preflight Readiness Check")
+            print("=" * 48)
+            print(f"Overall Status: {report.overall_status}")
+            print(f"Summary: {report.summary}\n")
+            print("Specialist Provider Health:")
+            for role, rinfo in report.roles_health.items():
+                print(f"  - [{role.upper()}] Status: {rinfo.get('status')} | Active: {rinfo.get('active_provider')}")
+                if rinfo.get('degradation_reason'):
+                    print(f"    Reason: {rinfo.get('degradation_reason')}")
+            print("\nPreflight Checks:")
+            for check in report.checks:
+                status_tag = "PASS" if check.status == "passed" else ("INFO" if check.status == "info" else ("WARN" if check.status == "warning" else "BLCK"))
+                print(f"  [{status_tag}] [{check.status.upper()}] {check.name}: {check.message}")
+            return 0 if report.is_ready else 1
 
         if args.command == "show-config":
             # Exclude sensitive fields like api_key

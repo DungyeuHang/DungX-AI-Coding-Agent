@@ -28,10 +28,12 @@ from .models import (
     ProjectContext,
     ProviderCapability,
     ProviderError,
+    ProviderHealthStatus,
     ProviderMetric,
     QuotaExceededError,
     RateLimitError,
     ReviewResult,
+    RoleHealthReport,
     SpecialistRole,
     TaskPlan,
     ToolCall,
@@ -2481,6 +2483,7 @@ class SpecialistModelRouter:
         self.scheduler_state = scheduler_state
         self.provider_factory = provider_factory or build_provider
         self._provider_cache: dict[tuple[str, str, str], AIProvider] = {}
+        self._role_degradations: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def get_role_config(self, role: SpecialistRole | str) -> tuple[str, str | None, list[str]]:
@@ -2501,6 +2504,108 @@ class SpecialistModelRouter:
             fallbacks.append(self.base_config.provider)
 
         return provider_name, model_name, fallbacks
+
+    def get_role_health(self, role: SpecialistRole | str) -> RoleHealthReport:
+        """
+        Calculates the structured health status and operational tier of a specialist role.
+        Distinguishes explicit mock from degraded fallback and healthy real providers.
+        """
+        role_str = role.value if isinstance(role, SpecialistRole) else str(role).lower()
+        primary_id, primary_model, fallbacks = self.get_role_config(role)
+        is_explicit_mock = (
+            primary_id in {"mock", "provider_mock"}
+            or primary_id.startswith("mock")
+            or primary_id.startswith("provider_")
+        )
+
+        # 1. Test primary provider
+        p = self._build_provider_for_spec(primary_id, primary_model)
+        if p is not None and not isinstance(p, MockProvider):
+            return RoleHealthReport(
+                role=role_str,
+                status=ProviderHealthStatus.HEALTHY_REAL_PROVIDER.value,
+                configured_provider=primary_id,
+                configured_model=primary_model,
+                active_provider=primary_id,
+                active_model=primary_model,
+                fallback_chain=fallbacks,
+                is_real_provider=True,
+            )
+        elif is_explicit_mock:
+            return RoleHealthReport(
+                role=role_str,
+                status=ProviderHealthStatus.EXPLICIT_OFFLINE_MOCK.value,
+                configured_provider=primary_id,
+                configured_model=primary_model,
+                active_provider="mock",
+                active_model=primary_model,
+                fallback_chain=fallbacks,
+                is_real_provider=False,
+            )
+
+        # 2. Test fallbacks
+        for fb_id in fallbacks:
+            if fb_id and fb_id not in {"mock", "provider_mock"} and not fb_id.startswith("mock"):
+                fb_p = self._build_provider_for_spec(fb_id)
+                if fb_p is not None and not isinstance(fb_p, MockProvider):
+                    return RoleHealthReport(
+                        role=role_str,
+                        status=ProviderHealthStatus.HEALTHY_REAL_PROVIDER.value,
+                        configured_provider=primary_id,
+                        configured_model=primary_model,
+                        active_provider=fb_id,
+                        active_model=None,
+                        fallback_chain=fallbacks,
+                        degradation_reason=f"Primary provider '{primary_id}' failed to initialize; using fallback '{fb_id}'",
+                        is_real_provider=True,
+                    )
+
+        # 3. Test global fallback
+        glob_id = self.base_config.provider
+        if glob_id not in {"mock", "provider_mock"} and not glob_id.startswith("mock") and glob_id != primary_id and glob_id not in fallbacks:
+            glob_p = self._build_provider_for_spec(glob_id, self.base_config.model)
+            if glob_p is not None and not isinstance(glob_p, MockProvider):
+                return RoleHealthReport(
+                    role=role_str,
+                    status=ProviderHealthStatus.HEALTHY_REAL_PROVIDER.value,
+                    configured_provider=primary_id,
+                    configured_model=primary_model,
+                    active_provider=glob_id,
+                    active_model=self.base_config.model,
+                    fallback_chain=fallbacks,
+                    degradation_reason=f"Primary '{primary_id}' and fallbacks failed; using global '{glob_id}'",
+                    is_real_provider=True,
+                )
+
+        # 4. All configured real providers failed -> DEGRADED_FALLBACK
+        reason = f"All configured real providers for role '{role_str}' failed to initialize (configured: {primary_id}, fallbacks: {fallbacks})"
+        return RoleHealthReport(
+            role=role_str,
+            status=ProviderHealthStatus.DEGRADED_FALLBACK.value,
+            configured_provider=primary_id,
+            configured_model=primary_model,
+            active_provider="mock",
+            active_model=None,
+            fallback_chain=fallbacks,
+            degradation_reason=reason,
+            is_real_provider=False,
+        )
+
+    def get_all_roles_health(self) -> dict[str, RoleHealthReport]:
+        """Returns health reports for all known specialist roles."""
+        return {
+            role.value: self.get_role_health(role)
+            for role in SpecialistRole
+        }
+
+    def is_role_degraded(self, role: SpecialistRole | str) -> bool:
+        """Returns True if the role degraded to MockProvider due to real provider failure."""
+        health = self.get_role_health(role)
+        return health.status == ProviderHealthStatus.DEGRADED_FALLBACK.value
+
+    def has_any_degradation(self) -> bool:
+        """Returns True if any specialist role is in degraded fallback state."""
+        return any(self.is_role_degraded(role) for role in SpecialistRole)
 
     def _build_provider_for_spec(self, provider_id: str, model_override: str | None = None) -> AIProvider | None:
         cache_key = (provider_id, model_override or "", getattr(self.base_config, "api_base_url", ""))
@@ -2580,24 +2685,25 @@ class SpecialistModelRouter:
 
         # 4. If all fail or empty, fallback to MockProvider
         if not chain:
-            # Phase 4.24: distinct from an explicit `provider="mock"` config
-            # (which builds a MockProvider as the PRIMARY above and never
-            # reaches this branch) -- this fires only when every configured
-            # real provider for this role failed to even instantiate (bad
-            # API key, network issue at build time, misconfiguration). The
-            # per-provider build failures were already logged as warnings
-            # above (see `_build_provider_for_spec`); this is the loud,
-            # unmissable signal that the role has now silently degraded to
-            # the offline no-op stub for the rest of this run -- surfaced at
-            # error level specifically so it is not lost among routine
-            # per-provider warnings during a long autonomous run.
-            LOGGER.error(
-                "All configured providers for role '%s' failed to initialize; "
-                "falling back to the offline MockProvider (no real AI generation "
-                "will occur for this role until configuration is fixed).",
-                role,
+            role_str = role.value if isinstance(role, SpecialistRole) else str(role).lower()
+            is_explicit_mock = (
+                primary_id in {"mock", "provider_mock"}
+                or primary_id.startswith("mock")
+                or primary_id.startswith("provider_")
             )
-            chain.append(MockProvider())
+            mock_inst = MockProvider()
+            if not is_explicit_mock:
+                reason = f"All configured real providers for role '{role_str}' failed to initialize (configured: {primary_id}, fallbacks: {fallbacks}); degraded to MockProvider."
+                self._role_degradations[role_str] = reason
+                setattr(mock_inst, "_is_degraded_fallback", True)
+                setattr(mock_inst, "_degradation_reason", reason)
+                LOGGER.error(
+                    "All configured providers for role '%s' failed to initialize; "
+                    "falling back to the offline MockProvider (no real AI generation "
+                    "will occur for this role until configuration is fixed).",
+                    role_str,
+                )
+            chain.append(mock_inst)
 
         return chain
 

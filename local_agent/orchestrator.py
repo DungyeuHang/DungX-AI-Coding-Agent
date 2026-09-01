@@ -87,6 +87,7 @@ from .models import (
 from .contract_extractor import ContractExtractor
 from .models import MemoryCategory
 from .planner import GraphValidator, Planner
+from .preflight import PreflightChecker
 from .providers import (
     AIProvider,
     ProviderError,
@@ -209,6 +210,8 @@ class Orchestrator:
         #: The iteration id of the most recent lifecycle iteration, so the next
         #: repair can point at it as its causal parent.
         self._last_iteration_id: str = ""
+        # Phase 4.25: Production Preflight Validator
+        self.preflight_checker = PreflightChecker(config, storage=storage, router=self.router)
 
     def analyze(self):
         return self.analyzer.analyze()
@@ -222,6 +225,31 @@ class Orchestrator:
         if isinstance(task, str):
             task = self._create_new_task(task)
 
+        # Phase 4.25: Production Preflight Readiness Check
+        preflight_report = self.preflight_checker.check(
+            require_real_providers=getattr(self.config, "require_real_providers", False)
+        )
+        roles_health = {r: h.to_dict() for r, h in self.router.get_all_roles_health().items()}
+
+        if not preflight_report.is_ready:
+            emit(f"[0/7] Preflight check BLOCKED: {preflight_report.blocker_summary}")
+            task.status = TaskStatus.FAILED
+            task.outcome = f"PREFLIGHT_BLOCKED: {preflight_report.blocker_summary}"
+            failed_report = RunReport(
+                project=None,
+                task_id=task.task_id,
+                subtask_id=subtask_id,
+                preflight_report=preflight_report.to_dict(),
+                provider_health=roles_health,
+            )
+            failed_report.completed = False
+            failed_report.outcome = task.outcome
+            return failed_report
+        elif preflight_report.overall_status == "READY_WITH_WARNINGS":
+            emit(f"[0/7] Preflight passed with warnings: {preflight_report.summary}")
+        else:
+            emit("[0/7] Preflight validation PASSED.")
+
         emit("[1/7] Analyzing project...")
         context = self.analyzer.scan()
         if self.knowledge_manager and getattr(self.config, "knowledge_graph_enabled", True):
@@ -229,7 +257,7 @@ class Orchestrator:
         project_memory = self.storage.load_project_memory() if self.config.memory_enabled else ProjectMemory()
         if self.config.validation_commands:
             context.validation_commands = [CommandSpec(f"explicit-{index}", tuple(shlex.split(command)), "explicit CLI configuration") for index, command in enumerate(self.config.validation_commands, 1)]
-        current_subtask = next((s for s in (task.plan.subtasks if task.plan else []) if s.subtask_id == subtask_id), None)
+        current_subtask = next((s for s in (getattr(task.plan, "subtasks", []) if task.plan else []) if s.subtask_id == subtask_id), None)
         task.current_subtask_id = subtask_id
 
         # Phase 4.10: Resolve upstream contracts for the current subtask
@@ -263,7 +291,13 @@ class Orchestrator:
         context.metadata["change_impact"] = impact.to_dict()
         context.metadata["current_subtask_id"] = subtask_id
 
-        report = RunReport(project=context, task_id=task.task_id, subtask_id=subtask_id)
+        report = RunReport(
+            project=context,
+            task_id=task.task_id,
+            subtask_id=subtask_id,
+            preflight_report=preflight_report.to_dict(),
+            provider_health=roles_health,
+        )
         report.impact = impact
 
         discovered_commands = self.validation_intelligence.discover_commands(context.repository_map) if context.repository_map else []

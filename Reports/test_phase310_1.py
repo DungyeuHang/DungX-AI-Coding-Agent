@@ -9,8 +9,7 @@ from unittest import mock
 from local_agent.config import AgentConfig
 from local_agent.credentials import MockCredentialStore
 from local_agent.models import (
-    ProviderAvailability, ProviderConfig, SchedulerState, Task, TaskStatus,
-)
+    Checkpoint, ProviderAvailability, ProviderConfig, SchedulerState, Task, TaskStatus,
 from local_agent.scheduler import Scheduler
 from local_agent.storage import JsonFileStorage
 
@@ -101,12 +100,10 @@ class Phase310_1_Tests(unittest.TestCase):
             orchestrator_instance = mock_orchestrator.return_value
             orchestrator_instance.storage.save_task(task)
             # Manually create a checkpoint as the real orchestrator would
-            checkpoint = __import__("local_agent.models").Checkpoint(
+            checkpoint = Checkpoint(
                 checkpoint_id="chk-1", task_id=task.task_id, subtask_id="sub-1",
-                timestamp=__import__("datetime").datetime.now(),
                 current_state_description="test state", files_changed=[], repository_diff="",
                 validation_state={}, last_provider_result={"outcome": "TEST"},
-                next_recommended_action="resume", continuation_context={"objective": "Test"}
             )
             orchestrator_instance.storage.save_checkpoint(checkpoint)
             task.latest_checkpoint_id = "chk-1"

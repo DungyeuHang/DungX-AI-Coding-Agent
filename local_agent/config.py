@@ -44,6 +44,7 @@ class AgentConfig:
     git_hosting_provider: str = "github" # New for Phase 3.25
     max_parallel_subtasks: int = 1 # New for Phase 3.21
     autonomous_mode: bool = False # New for autonomous mode
+    require_real_providers: bool = False # New for Phase 4.25
     approval_policies: list[dict[str, Any]] = field(default_factory=list)
     max_context_files: int = 24
     max_context_file_bytes: int = 5000
@@ -384,18 +385,31 @@ class AgentConfig:
 
         explicit_api_key = overrides.get("api_key")
         if explicit_api_key is None:
-            credential_name = "DEEPSEEK_API_KEY" if provider_name == "deepseek" else \
-                              "GEMINI_API_KEY" if provider_name in {"gemini", "antigravity"} else \
-                              "OPENAI_API_KEY"
+            credential_name = (
+                "DEEPSEEK_API_KEY" if provider_name == "deepseek" else
+                "GEMINI_API_KEY" if provider_name in {"gemini", "antigravity"} else
+                "ANTHROPIC_API_KEY" if provider_name == "anthropic" else
+                "OPENAI_API_KEY"
+            )
             configured_api_key = os.environ.get(credential_name)
         else:
             configured_api_key = str(explicit_api_key) or None
         configured_model = overrides.get("model")
         if configured_model is None:
-            model_env = "GEMINI_MODEL" if provider_name in {"gemini", "antigravity"} else "OPENAI_MODEL"
-            configured_model = os.environ.get(model_env, "gemini-2.5-flash" if provider_name == "gemini" else "gpt-4.1-mini")
-            if provider_name == "antigravity" and model_env not in os.environ:
-                configured_model = "gemini-3.7-flash"
+            model_env = (
+                "GEMINI_MODEL" if provider_name in {"gemini", "antigravity"} else
+                "ANTHROPIC_MODEL" if provider_name == "anthropic" else
+                "DEEPSEEK_MODEL" if provider_name == "deepseek" else
+                "OPENAI_MODEL"
+            )
+            default_model = (
+                "claude-3-7-sonnet-20250219" if provider_name == "anthropic" else
+                "gemini-2.5-flash" if provider_name == "gemini" else
+                "gemini-3.7-flash" if provider_name == "antigravity" else
+                "deepseek-chat" if provider_name == "deepseek" else
+                "gpt-4.1-mini"
+            )
+            configured_model = os.environ.get(model_env, default_model)
 
         def _parse_fallbacks(val: object) -> list[str]:
             if isinstance(val, str) and val.strip():
