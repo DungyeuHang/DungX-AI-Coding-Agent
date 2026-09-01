@@ -395,6 +395,31 @@ def _symbol_components(name: str) -> set[str]:
     return {c.lower() for c in components if c}
 
 
+# Phase 4.24: a unified diff's text is not an undifferentiated bag of words.
+# It carries removed (``-``) lines, unchanged context lines, and file/hunk
+# headers (``--- a/x``, ``+++ b/x``, ``@@ ... @@``) alongside genuinely
+# *added* (``+``) lines -- and a token search over the raw text cannot tell
+# them apart. Reproduced: an obligation "Add JSON export" was marked
+# SATISFIED by a diff that only *removed* a stale "# TODO: json export"
+# comment and implemented something unrelated, because "json" still
+# appeared somewhere in diff_text.lower(). Diff-correlation is meant to
+# answer "does the NEW code address this obligation" -- only ``+`` lines
+# are new code; every other line is either gone, unchanged, or not code at
+# all, so none of them can be evidence that something was implemented.
+def _added_diff_content(diff_text: str) -> str:
+    """Returns only the content of lines actually added by a unified diff
+    (the ``+`` prefix stripped), excluding the ``+++ b/...`` file header.
+    Removed lines, context lines, and header/hunk lines are excluded --
+    none of them represent code that was newly written."""
+    added: list[str] = []
+    for line in diff_text.splitlines():
+        if line.startswith("+++"):
+            continue
+        if line.startswith("+"):
+            added.append(line[1:])
+    return "\n".join(added)
+
+
 # A vague, generic ask ("implement a new feature", "fix the bug") gives no
 # specific, checkable claim to hold the diff to, so it is verified leniently
 # (any real change counts). A *specific* one names a concrete value to
@@ -433,15 +458,20 @@ def _extract_from_to_value(statement: str) -> str | None:
 
 
 def _value_colocated_with_context(diff_text: str, value: str, context_tokens: set[str]) -> bool:
-    """True when some line of diff_text contains both `value` as a
-    standalone token and at least one of context_tokens."""
+    """True when some ADDED line of diff_text contains both `value` as a
+    standalone token and at least one of context_tokens. Phase 4.24:
+    restricted to ``+`` lines -- a value that merely appears on a removed
+    or unchanged context line was not "set" by this change at all."""
     if not context_tokens:
         return True
     value_pattern = re.compile(rf"(?<!\d){re.escape(value)}(?!\d)")
     for line in diff_text.splitlines():
-        if not value_pattern.search(line):
+        if line.startswith("+++") or not line.startswith("+"):
             continue
-        lowered = line.lower()
+        content = line[1:]
+        if not value_pattern.search(content):
+            continue
+        lowered = content.lower()
         if any(t in lowered for t in context_tokens):
             return True
     return False
@@ -1220,17 +1250,46 @@ class RequirementAssessmentEngine:
                     updated_at=_now_iso(),
                 )
             if non_trivial_passing:
-                return replace(
-                    ob,
-                    state=RequirementState.SATISFIED.value,
-                    method=AcceptanceMethod.EXECUTABLE_BEHAVIORAL.value,
-                    provenance=AcceptanceProvenance.TEST_DERIVED.value,
-                    unsatisfied_reason="",
-                    evidence_ids=[e.evidence_id for e in non_trivial_passing],
-                    updated_at=_now_iso(),
-                )
-            # Only trivial passing matches -- fall through to diff
-            # correlation rather than claiming behavioral proof.
+                # Phase 4.24: when neither this obligation nor its parent
+                # requirement names a target path (a real, anticipated case
+                # -- see derive_task_contract's own docstring on minimal/
+                # offline planners), _collect_obligation_candidates's path
+                # check is a no-op, so a passing match here is corroborated
+                # by component-token overlap alone. A single common word
+                # ("csv", "auth", "cache") can then coincidentally name-
+                # match an entirely unrelated, pre-existing symbol that this
+                # obligation's own work never touched. Reproduced: a stray
+                # passing test for an unrelated pre-existing "csv config
+                # parsing" helper satisfied "Add CSV export" at this
+                # strongest tier purely by sharing the "csv" component.
+                # Failing matches above are never subject to this check --
+                # dominance of a real failure must not depend on whether we
+                # can independently corroborate it. As a substitute anchor
+                # for the missing path, require the matched symbol to
+                # appear in this task's own tracked diff: proof it is
+                # something this task's changeset actually concerns, not
+                # merely something that happens to exist and pass
+                # elsewhere in the repository.
+                scope_paths = ob.target_paths or req.target_paths
+                if not scope_paths:
+                    added = _added_diff_content(diff_text).lower()
+                    non_trivial_passing = [
+                        e for e in non_trivial_passing
+                        if any(sym and sym.lower() in added for sym in e.target_symbols)
+                    ]
+                if non_trivial_passing:
+                    return replace(
+                        ob,
+                        state=RequirementState.SATISFIED.value,
+                        method=AcceptanceMethod.EXECUTABLE_BEHAVIORAL.value,
+                        provenance=AcceptanceProvenance.TEST_DERIVED.value,
+                        unsatisfied_reason="",
+                        evidence_ids=[e.evidence_id for e in non_trivial_passing],
+                        updated_at=_now_iso(),
+                    )
+            # Only trivial passing matches, or an uncorroborated no-path
+            # match -- fall through to diff correlation rather than
+            # claiming behavioral proof.
 
         if not changed_paths and not diff_text.strip():
             return replace(
@@ -1249,7 +1308,7 @@ class RequirementAssessmentEngine:
                 unsatisfied_reason="" if satisfied else "No workspace changes to evaluate against this obligation",
                 updated_at=_now_iso(),
             )
-        haystack = " ".join(sorted(changed_paths)).lower() + "\n" + diff_text.lower()
+        haystack = " ".join(sorted(changed_paths)).lower() + "\n" + _added_diff_content(diff_text).lower()
         found = sum(1 for t in tokens if t in haystack)
         required = len(tokens) if len(tokens) <= 4 else math.ceil(len(tokens) * 0.75)
         if found >= required:
@@ -1293,8 +1352,22 @@ class RequirementAssessmentEngine:
         strategy = req.verification_strategy
 
         if strategy == VerificationStrategy.CONSTRAINT_ABSENCE.value:
+            # Phase 4.24: target_paths here is a free-text path token
+            # extracted from the user's own "do not modify X" wording (see
+            # _CONSTRAINT_TRIGGERS), not a machine-derived path -- it can
+            # legitimately differ in case from the real file path it refers
+            # to (Windows/macOS default filesystems are case-insensitive,
+            # so a user typing "Config.py" and an on-disk "config.py" name
+            # the same file). A case-sensitive substring compare would
+            # silently miss that violation. Both sides are lowercased for
+            # the comparison only; the reported message keeps the user's
+            # original wording.
             norm_targets = {p.replace("\\", "/") for p in req.target_paths}
-            violated = sorted(p for p in norm_targets if any(p in c or c in p for c in changed_paths))
+            changed_lower = {c.lower() for c in changed_paths}
+            violated = sorted(
+                p for p in norm_targets
+                if any(p.lower() in c or c in p.lower() for c in changed_lower)
+            )
             if violated:
                 return RequirementState.FAILED, f"Constraint violated: modified {', '.join(violated)}", []
             return RequirementState.SATISFIED, "", []
@@ -1345,7 +1418,7 @@ class RequirementAssessmentEngine:
                 return (RequirementState.SATISFIED, "", []) if changed_paths else (
                     RequirementState.UNVERIFIED, "No workspace changes to evaluate against this requirement", []
                 )
-            haystack = " ".join(sorted(changed_paths)).lower() + "\n" + diff_text.lower()
+            haystack = " ".join(sorted(changed_paths)).lower() + "\n" + _added_diff_content(diff_text).lower()
             found = sum(1 for t in tokens if t in haystack)
             required = len(tokens) if len(tokens) <= 4 else math.ceil(len(tokens) * 0.75)
             if found < required:
