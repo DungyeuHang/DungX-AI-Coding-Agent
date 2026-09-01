@@ -420,7 +420,31 @@ class CompletionEvidenceStore:
         return type_str in self._types_ever_recorded
 
     def invalidate_on_file_mutation(self, modified_paths: Sequence[str], reason: str = "content_modified_in_subsequent_turn") -> list[str]:
-        """Invalidates prior test, syntax, and review evidence when files are modified."""
+        """Invalidates prior test, syntax, and review evidence when files are modified.
+
+        Phase 4.24: a TEST_EXECUTION/CODE_REVIEW/DIFF_INSPECTION entry's
+        ``target_paths`` records which files were part of the change-set *at
+        recording time* -- it is a correlation aid, not the entry's actual
+        claim. A full test run or a code review certifies the *entire*
+        tracked change-set as it stood at that moment, not merely the files
+        that happen to be listed. Previously this method only re-checked the
+        fingerprint of an entry's own ``target_paths``, so a mutation to a
+        file the entry had never seen (e.g. a new file introduced by a later
+        repair turn) left it ``VALID`` -- a passing test/review recorded
+        before that file existed could then be read as if it had verified
+        the file's current (possibly broken) content. Reproduced end-to-end:
+        recorded PASS test evidence over {a.py}, a later turn rewrites a NEW
+        file b.py with a runtime bug, a genuine live review of the resulting
+        two-file diff approves it (LLM review is imperfect) -- ``evaluate()``
+        reached ``is_ready=True`` on test evidence that never observed b.py.
+        Any mutation now invalidates every VALID global-validation entry
+        unconditionally, regardless of whether the mutated path is one the
+        entry already knew about: the entry's certification is stale the
+        moment *anything* in the tracked tree changes, full stop. Per-file
+        evidence (SYNTAX_VERIFICATION, SAFETY_INVARIANT, etc.) keeps its
+        original narrower behaviour -- it only claims to cover the specific
+        file(s) it names, so an unrelated mutation correctly leaves it alone.
+        """
         invalidated_ids: list[str] = []
         mod_set = {str(p).replace("\\", "/") for p in modified_paths if p}
         if not mod_set:
@@ -430,24 +454,30 @@ class CompletionEvidenceStore:
             if ev.status != EvidenceStatus.VALID.value:
                 continue
 
-            intersects = bool(set(ev.target_paths) & mod_set)
             is_global_validation = ev.evidence_type in {
                 EvidenceType.TEST_EXECUTION.value,
                 EvidenceType.CODE_REVIEW.value,
                 EvidenceType.DIFF_INSPECTION.value,
             }
 
-            if intersects or is_global_validation:
-                if ev.target_paths:
-                    current_fp = compute_state_fingerprint(self.workspace_root, ev.target_paths)
-                    if current_fp != ev.content_fingerprint:
-                        ev.status = EvidenceStatus.INVALIDATED.value
-                        ev.invalidation_reason = reason
-                        invalidated_ids.append(ev.evidence_id)
-                else:
+            if is_global_validation:
+                ev.status = EvidenceStatus.INVALIDATED.value
+                ev.invalidation_reason = reason
+                invalidated_ids.append(ev.evidence_id)
+                continue
+
+            if not (set(ev.target_paths) & mod_set):
+                continue
+            if ev.target_paths:
+                current_fp = compute_state_fingerprint(self.workspace_root, ev.target_paths)
+                if current_fp != ev.content_fingerprint:
                     ev.status = EvidenceStatus.INVALIDATED.value
                     ev.invalidation_reason = reason
                     invalidated_ids.append(ev.evidence_id)
+            else:
+                ev.status = EvidenceStatus.INVALIDATED.value
+                ev.invalidation_reason = reason
+                invalidated_ids.append(ev.evidence_id)
 
         return invalidated_ids
 
