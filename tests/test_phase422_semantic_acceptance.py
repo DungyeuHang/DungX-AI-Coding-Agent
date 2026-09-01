@@ -464,7 +464,8 @@ class TestAdversarialAttacks:
         # Direct obligation-level check of the dominance guarantee:
         ob = AcceptanceObligation(obligation_id="X", description="authenticate", target_tokens=["authenticate"])
         req = Requirement(requirement_id="REQ-001", statement="Add authentication", acceptance_obligations=[ob])
-        assessed = engine._assess_obligation(req, ob, {"auth.py"}, "+def authenticate(): return True", store, {})
+        cands = engine._collect_obligation_candidates(req, ob, store, task.task_id)
+        assessed = engine._assess_obligation(req, ob, {"auth.py"}, "+def authenticate(): return True", cands, {})
         assert assessed.state == RequirementState.FAILED.value
 
     # --- remaining named attacks from the Phase 4.21 matrix, re-verified
@@ -490,7 +491,8 @@ class TestAdversarialAttacks:
         engine = RequirementAssessmentEngine(fs)
         ob = AcceptanceObligation(obligation_id="X", description="JSON export", target_tokens=["json"])
         req = Requirement(requirement_id="REQ-001", statement="Add JSON export", acceptance_obligations=[ob])
-        assessed = engine._assess_obligation(req, ob, set(), "", store, {})
+        cands = engine._collect_obligation_candidates(req, ob, store, "t1")
+        assessed = engine._assess_obligation(req, ob, set(), "", cands, {})
         assert assessed.method != AcceptanceMethod.EXECUTABLE_BEHAVIORAL.value
         assert assessed.state != RequirementState.SATISFIED.value  # no changes either -> UNVERIFIED
 
@@ -553,7 +555,8 @@ class TestEvidenceIntegrity:
         engine = RequirementAssessmentEngine(fs)
         ob = AcceptanceObligation(obligation_id="X", description="JSON export", target_tokens=["json"])
         req = Requirement(requirement_id="REQ-001", statement="Add JSON export", acceptance_obligations=[ob])
-        assessed = engine._assess_obligation(req, ob, {"impl.py"}, "+def export_json(): ...", store, {})
+        cands = engine._collect_obligation_candidates(req, ob, store, "t1")
+        assessed = engine._assess_obligation(req, ob, {"impl.py"}, "+def export_json(): ...", cands, {})
         assert assessed.state == RequirementState.FAILED.value
 
     def test_checkpoint_replay_does_not_trust_stored_requirement_assessment(self, tmp_path):
@@ -648,7 +651,8 @@ class TestInvariants:
         engine = RequirementAssessmentEngine(fs)
         ob = AcceptanceObligation(obligation_id="X", description="JSON export", target_tokens=["json", "export"])
         req = Requirement(requirement_id="REQ-001", statement="Add JSON export", acceptance_obligations=[ob])
-        assessed = engine._assess_obligation(req, ob, {"exporter.py"}, "+def export_json(): return bad", store, {})
+        cands = engine._collect_obligation_candidates(req, ob, store, task.task_id)
+        assessed = engine._assess_obligation(req, ob, {"exporter.py"}, "+def export_json(): return bad", cands, {})
         assert assessed.state == RequirementState.FAILED.value  # not SATISFIED merely by textual overlap
 
     def test_s2_provider_assertion_cannot_satisfy_obligation(self, tmp_path):
@@ -674,7 +678,8 @@ class TestInvariants:
         # the per-obligation check below (which is what actually drives the
         # rollup) never even sees last_review -- it can only be driven by
         # evidence.
-        assessed = engine._assess_obligation(req, ob, {"exporter.py"}, "+def export_json(): ...", store, {})
+        cands = engine._collect_obligation_candidates(req, ob, store, task.task_id)
+        assessed = engine._assess_obligation(req, ob, {"exporter.py"}, "+def export_json(): ...", cands, {})
         assert assessed.state == RequirementState.FAILED.value
 
     def test_s4_behavioral_pass_becomes_stale_after_mutation(self, tmp_path):
@@ -710,7 +715,8 @@ class TestInvariants:
         engine = RequirementAssessmentEngine(fs)
         ob = AcceptanceObligation(obligation_id="X", description="JSON export", target_tokens=["json"])
         req = Requirement(requirement_id="REQ-001", statement="Add JSON export", acceptance_obligations=[ob])
-        assessed = engine._assess_obligation(req, ob, {"exporter.py"}, "+def export_json(): ...", store, {})
+        cands = engine._collect_obligation_candidates(req, ob, store, "t1")
+        assessed = engine._assess_obligation(req, ob, {"exporter.py"}, "+def export_json(): ...", cands, {})
         # Falls through to diff correlation instead of being upgraded to
         # EXECUTABLE_BEHAVIORAL strength by a trivial pass.
         assert assessed.method != AcceptanceMethod.EXECUTABLE_BEHAVIORAL.value

@@ -475,12 +475,32 @@ class CompletionEvidenceStore:
 
         return invalidated_ids
 
-    def get_valid_evidence(self, evidence_type: EvidenceType | str | None = None) -> list[StructuredEvidence]:
-        """Returns all currently valid evidence items, optionally filtered by type."""
+    def get_valid_evidence(
+        self,
+        evidence_type: EvidenceType | str | None = None,
+        task_id: str | None = None,
+    ) -> list[StructuredEvidence]:
+        """Returns all currently valid evidence items, optionally filtered by
+        type and by owning task.
+
+        Phase 4.23: a ``CompletionEvidenceStore`` is designed to hold exactly
+        one task's evidence, but nothing previously enforced that at read
+        time -- every entry already carries the ``task_id`` it was recorded
+        under (see ``record()``), yet no caller ever checked it. If a store
+        instance were ever shared or a checkpoint's evidence blob were ever
+        loaded against the wrong task (a storage bug, a copied checkpoint
+        file), evidence recorded for one task would silently satisfy another
+        with no defense at all. Every production caller in this module and
+        in task_contract.py now passes the current task's id; ``task_id=None``
+        (the default) preserves the exact prior behavior for any other
+        caller, so this is purely additive.
+        """
         type_filter = evidence_type.value if isinstance(evidence_type, EvidenceType) else evidence_type
         return [
             ev for ev in self._evidence_list
-            if ev.status == EvidenceStatus.VALID.value and (type_filter is None or ev.evidence_type == type_filter)
+            if ev.status == EvidenceStatus.VALID.value
+            and (type_filter is None or ev.evidence_type == type_filter)
+            and (task_id is None or ev.task_id == task_id)
         ]
 
     def all_entries(self) -> list[StructuredEvidence]:
@@ -554,7 +574,9 @@ class CompletionDecisionEngine:
         missing_evidence: list[str] = []
         unresolved_risks: list[str] = []
 
-        valid_entries = evidence_store.get_valid_evidence()
+        # Phase 4.23: scope every gate below to this task's own evidence --
+        # see get_valid_evidence's docstring for why this matters.
+        valid_entries = evidence_store.get_valid_evidence(task_id=task_id)
 
         # ----------------------------------------------------------------------
         # Gate 1: Safety Invariants Intact (Protected files & secrets)

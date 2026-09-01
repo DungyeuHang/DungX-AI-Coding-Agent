@@ -39,6 +39,7 @@ from .completion import (
     CompletionEvidenceStore,
     EvidenceTrustTier,
     EvidenceType,
+    StructuredEvidence,
     sanitize_text,
 )
 from .filesystem import ProjectFilesystem
@@ -365,6 +366,33 @@ def _split_objective_clauses(objective: str) -> list[str]:
 def _content_tokens(text: str) -> set[str]:
     words = re.findall(r"[A-Za-z0-9_]{3,}", text.lower())
     return {w for w in words if w not in _STOPWORDS}
+
+
+# Phase 4.23: word-boundary-safe symbol matching for behavioral-evidence
+# binding. Phase 4.22 matched an obligation token against an exercised
+# symbol name via raw substring containment (``token in symbol.lower()``),
+# which false-positives on any symbol that merely *contains* the token as a
+# fragment of a longer word -- "import" inside "important_config", or (the
+# reproduced Phase 4.23 vulnerability) both "csv" and "json" inside a single
+# unrelated symbol "convert_csv_to_jsonlike" ("json" is a substring of
+# "jsonlike" despite naming a different identifier component entirely).
+# Splitting into real identifier components (snake_case and camelCase
+# boundaries) and requiring an exact component match closes the fuzzy
+# substring hole; it does not (and cannot, without execution tracing) rule
+# out a symbol whose name genuinely contains multiple obligations' words as
+# distinct components -- that residual case is handled by cross-obligation
+# ambiguity exclusion in RequirementAssessmentEngine.assess (see P1/P3).
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _symbol_components(name: str) -> set[str]:
+    if not name:
+        return set()
+    parts = re.split(r"[_\-.\s]+", name)
+    components: list[str] = []
+    for part in parts:
+        components.extend(p for p in _CAMEL_BOUNDARY.split(part) if p)
+    return {c.lower() for c in components if c}
 
 
 # A vague, generic ask ("implement a new feature", "fix the bug") gives no
@@ -965,11 +993,40 @@ class RequirementAssessmentEngine:
             and r.verification_strategy == VerificationStrategy.DIFF_PRESENCE.value
         )
 
+        # Phase 4.23: gather every obligation's candidate behavioral evidence
+        # in ONE pass across the WHOLE contract before assessing any single
+        # obligation. A piece of evidence that -- by symbol-name coincidence
+        # -- matches more than one obligation (anywhere in the contract, not
+        # just siblings under the same requirement) cannot be independent
+        # proof of either one specifically: it is excluded from strong
+        # (EXECUTABLE_BEHAVIORAL) consideration for all of them, falling
+        # back to diff correlation instead. This is the direct fix for the
+        # reproduced Phase 4.23 vulnerability where a single unrelated
+        # symbol whose name happened to contain two obligations' tokens
+        # ("convert_csv_to_jsonlike" for both a "csv" and a "json"
+        # obligation) let one stray passing test satisfy both. See P1/P3/P4.
+        candidates_by_obligation: dict[str, list[StructuredEvidence]] = {}
+        matched_obligation_ids_by_evidence: dict[str, set[str]] = {}
+        for req_c in contract.requirements:
+            for ob_c in req_c.acceptance_obligations:
+                cands = self._collect_obligation_candidates(req_c, ob_c, evidence_store, contract.task_id)
+                candidates_by_obligation[ob_c.obligation_id] = cands
+                for e in cands:
+                    matched_obligation_ids_by_evidence.setdefault(e.evidence_id, set()).add(ob_c.obligation_id)
+        ambiguous_evidence_ids = {
+            eid for eid, obligation_ids in matched_obligation_ids_by_evidence.items()
+            if len(obligation_ids) > 1
+        }
+
         results: list[Requirement] = []
         for req in contract.requirements:
             if req.acceptance_obligations:
                 obligations = [
-                    self._assess_obligation(req, ob, changed_paths, diff_text, evidence_store, clarified_by_id)
+                    self._assess_obligation(
+                        req, ob, changed_paths, diff_text,
+                        [e for e in candidates_by_obligation.get(ob.obligation_id, []) if e.evidence_id not in ambiguous_evidence_ids],
+                        clarified_by_id,
+                    )
                     for ob in req.acceptance_obligations
                 ]
                 state, reason = _rollup_obligations(obligations)
@@ -986,7 +1043,7 @@ class RequirementAssessmentEngine:
                 lenient = functional_count <= 1 and not _has_strong_signal(req.statement)
                 state, reason, evidence_ids = self._assess_one(
                     req, changed_paths, diff_text, evidence_store, last_review, clarified_by_id,
-                    lenient,
+                    lenient, contract.task_id,
                 )
                 results.append(replace(
                     req,
@@ -1007,7 +1064,7 @@ class RequirementAssessmentEngine:
             # that hasn't actually gone stale. Only record when the
             # requirement's (state, reason) actually differ from the last
             # entry recorded for this requirement_id.
-            prior = self._last_recorded_compliance(evidence_store, req.requirement_id)
+            prior = self._last_recorded_compliance(evidence_store, req.requirement_id, contract.task_id)
             if prior != (state.value, reason):
                 evidence_store.record(
                     task_id=contract.task_id,
@@ -1045,15 +1102,75 @@ class RequirementAssessmentEngine:
         )
 
     @staticmethod
-    def _last_recorded_compliance(evidence_store: CompletionEvidenceStore, requirement_id: str) -> tuple[str, str] | None:
+    def _last_recorded_compliance(
+        evidence_store: CompletionEvidenceStore, requirement_id: str, task_id: str,
+    ) -> tuple[str, str] | None:
         matches = [
             e for e in evidence_store.all_entries()
-            if e.evidence_type == EvidenceType.CONTRACT_COMPLIANCE.value and e.subtask_id == requirement_id
+            if e.evidence_type == EvidenceType.CONTRACT_COMPLIANCE.value
+            and e.subtask_id == requirement_id
+            and e.task_id == task_id
         ]
         if not matches:
             return None
         last = matches[-1]
         return str(last.payload.get("state", "")), str(last.payload.get("reason", ""))
+
+    @staticmethod
+    def _collect_obligation_candidates(
+        req: Requirement,
+        ob: AcceptanceObligation,
+        evidence_store: CompletionEvidenceStore,
+        task_id: str,
+    ) -> list[StructuredEvidence]:
+        """Finds behavioral (synthesized TEST_EXECUTION) evidence that could
+        plausibly bind to this specific obligation. Three independent
+        narrowing checks, all must pass:
+
+        1. Task-scoped (Phase 4.23 / P5): only evidence recorded for this
+           same task_id -- never another task's leftover evidence.
+        2. Path-scoped: when both the requirement and the evidence entry
+           know target paths, they must intersect. This does not
+           distinguish between sibling obligations of the same requirement
+           (they share the requirement's plan-derived target_paths), but it
+           does exclude evidence for a file this task's plan never touched
+           at all.
+        3. Component-matched (Phase 4.23): an obligation token must equal a
+           whole identifier component of an exercised symbol name (split on
+           snake_case/camelCase boundaries), not merely appear as a raw
+           substring -- see _symbol_components.
+
+        Ambiguity across obligations (the same evidence matching more than
+        one) is deliberately NOT resolved here -- see assess()'s pre-pass,
+        which needs every obligation's raw candidate list first in order to
+        detect and exclude cross-obligation collisions.
+        """
+        tokens = set(ob.target_tokens) or _content_tokens(ob.description)
+        if not tokens:
+            return []
+        # The obligation's own target_paths (when set) are a more specific
+        # claim than the parent requirement's -- derive_task_contract
+        # currently always sets them equal (both from the same plan-derived
+        # file list), but scoping to the obligation's own field first keeps
+        # this correct even if a future extension gives obligations finer-
+        # grained paths of their own, rather than silently falling back to
+        # the coarser requirement-level set.
+        scope_paths = ob.target_paths or req.target_paths
+        req_paths = {p.replace("\\", "/") for p in scope_paths}
+        candidates: list[StructuredEvidence] = []
+        for e in evidence_store.get_valid_evidence(EvidenceType.TEST_EXECUTION, task_id=task_id):
+            if e.payload.get("synthesized") is not True:
+                continue
+            if req_paths and e.target_paths:
+                ev_paths = {p.replace("\\", "/") for p in e.target_paths}
+                if not (req_paths & ev_paths):
+                    continue
+            components: set[str] = set()
+            for sym in e.target_symbols:
+                components |= _symbol_components(sym)
+            if tokens & components:
+                candidates.append(e)
+        return candidates
 
     def _assess_obligation(
         self,
@@ -1061,7 +1178,7 @@ class RequirementAssessmentEngine:
         ob: AcceptanceObligation,
         changed_paths: set[str],
         diff_text: str,
-        evidence_store: CompletionEvidenceStore,
+        behavioral_candidates: Sequence[StructuredEvidence],
         clarified_by_id: dict[str, Any],
     ) -> AcceptanceObligation:
         """Evaluates one acceptance obligation. Tries, in order of
@@ -1077,12 +1194,13 @@ class RequirementAssessmentEngine:
         """
         tokens = set(ob.target_tokens) or _content_tokens(ob.description)
 
-        behavioral_matches = [
-            e for e in evidence_store.get_valid_evidence(EvidenceType.TEST_EXECUTION)
-            if e.payload.get("synthesized") is True
-            and tokens
-            and any(t in (sym or "").lower() for sym in e.target_symbols for t in tokens)
-        ]
+        # Phase 4.23: candidates are computed once, up front, across the
+        # whole contract by assess() -- see _collect_obligation_candidates
+        # and the cross-obligation ambiguity exclusion around its call site.
+        # This method never re-queries the evidence store for behavioral
+        # matches itself, so it cannot silently reintroduce the
+        # unqualified-substring/cross-task binding this phase closed.
+        behavioral_matches = list(behavioral_candidates)
         if behavioral_matches:
             failing = [e for e in behavioral_matches if e.exit_code != 0]
             # A trivial (existence-only) test passing is not behavioral
@@ -1159,6 +1277,7 @@ class RequirementAssessmentEngine:
         last_review: ReviewResult | None,
         clarified_by_id: dict[str, Any],
         lenient_diff_presence: bool,
+        task_id: str,
     ) -> tuple[RequirementState, str, list[str]]:
         # A BLOCKED requirement pinned to a clarification is only ever
         # unblocked by that specific clarification being answered -- a
@@ -1181,7 +1300,7 @@ class RequirementAssessmentEngine:
             return RequirementState.SATISFIED, "", []
 
         if strategy == VerificationStrategy.TEST_EVIDENCE.value:
-            valid_tests = evidence_store.get_valid_evidence(EvidenceType.TEST_EXECUTION)
+            valid_tests = evidence_store.get_valid_evidence(EvidenceType.TEST_EXECUTION, task_id=task_id)
             passing = [e for e in valid_tests if e.exit_code == 0]
             failing = [e for e in valid_tests if e.exit_code != 0]
             if failing:
