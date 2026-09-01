@@ -2580,6 +2580,23 @@ class SpecialistModelRouter:
 
         # 4. If all fail or empty, fallback to MockProvider
         if not chain:
+            # Phase 4.24: distinct from an explicit `provider="mock"` config
+            # (which builds a MockProvider as the PRIMARY above and never
+            # reaches this branch) -- this fires only when every configured
+            # real provider for this role failed to even instantiate (bad
+            # API key, network issue at build time, misconfiguration). The
+            # per-provider build failures were already logged as warnings
+            # above (see `_build_provider_for_spec`); this is the loud,
+            # unmissable signal that the role has now silently degraded to
+            # the offline no-op stub for the rest of this run -- surfaced at
+            # error level specifically so it is not lost among routine
+            # per-provider warnings during a long autonomous run.
+            LOGGER.error(
+                "All configured providers for role '%s' failed to initialize; "
+                "falling back to the offline MockProvider (no real AI generation "
+                "will occur for this role until configuration is fixed).",
+                role,
+            )
             chain.append(MockProvider())
 
         return chain

@@ -197,7 +197,17 @@ class AgentUI:
             )
             report = orchestrator.run(task, progress=lambda message: self.events.put(("output", message)), approval_callback=self._approval_callback)
             self.events.put(("finished", report))
-        except (ProviderError, ValueError, OSError) as exc:
+        except Exception as exc:
+            # Phase 4.24: this is a background daemon thread's top-level
+            # boundary -- an exception that escapes it is not raised
+            # anywhere the caller can see; Python just terminates the
+            # thread silently, leaving the UI spinning forever with no
+            # "finished"/"error" event ever delivered (e.g. a corrupted
+            # checkpoint raising TypeError, which the narrower exception
+            # tuple below did not catch). Catching broadly here and always
+            # emitting an "error" event is the correct fail-safe behavior
+            # at a thread boundary, regardless of what specific exception
+            # type orchestrator.run() (or anything it calls) might raise.
             self.events.put(("error", str(exc)))
 
     def _approval_callback(self, changes: list[PreparedChange]) -> bool:

@@ -355,6 +355,21 @@ class Orchestrator:
         if latest_checkpoint_id:
             try:
                 checkpoint = self.storage.load_checkpoint(latest_checkpoint_id)
+                # Phase 4.24: `task.latest_checkpoint_id` is a task-wide pointer
+                # overwritten by every subtask's checkpoints (_create_checkpoint
+                # always sets it, regardless of which subtask ran) -- it is only
+                # a safe fallback when there is no current subtask at all. When
+                # `current_subtask` is set but has never checkpointed yet, the
+                # `or` above silently falls back to whichever OTHER subtask most
+                # recently checkpointed, and everything below would restore that
+                # unrelated subtask's plan/recovery_state/evidence into this
+                # subtask's run. Require the loaded checkpoint's own subtask_id
+                # to match before trusting any of it -- the same invariant
+                # already enforced for the multi-turn rehydration path below
+                # (see `sub_match` near the ToolEngine/MultiTurn checkpoint
+                # rehydration further down this method).
+                if checkpoint is not None and current_subtask is not None and checkpoint.subtask_id != current_subtask.subtask_id:
+                    checkpoint = None
                 if checkpoint is not None:
                     raw_plan = checkpoint.continuation_context.get("plan")
                     if raw_plan and isinstance(raw_plan, dict):
@@ -438,8 +453,14 @@ class Orchestrator:
                         failure = FailureAnalysis.from_dict(last_failures[0])
                     else:
                         failure = None
-            except FileNotFoundError:
-                pass  # Checkpoint may be missing if the task is new or corrupted
+            except (FileNotFoundError, ValueError):
+                # Checkpoint may be missing, or storage.load_checkpoint may have
+                # classified it as malformed (unparseable JSON, or a schema-
+                # mismatched/corrupted record missing required fields) and
+                # raised ValueError -- either way, fail safe by proceeding with
+                # no checkpoint rather than letting the whole run crash on
+                # corrupted persisted state.
+                pass
 
         report.recovery_state = recovery_state
 
@@ -2345,8 +2366,8 @@ class Orchestrator:
                 # from these fields, so restoring them as-is for the CLI to show
                 # is safe.
                 requirement_assessment = dict(checkpoint.requirement_assessment) if checkpoint and checkpoint.requirement_assessment else {}
-            except FileNotFoundError:
-                pass # Checkpoint might be missing if task is new or corrupted
+            except (FileNotFoundError, ValueError):
+                pass  # Checkpoint might be missing, or malformed (see the resume path's identical fix above)
         else:
             completion_assessment = None
             completion_evidence = {}

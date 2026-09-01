@@ -80,6 +80,33 @@ DEFAULT_MAX_VERIFICATION_TURNS = 2
 DEFAULT_MAX_TOOL_STEPS = 15
 
 
+def _repair_ops_signature(ops: Sequence[FileOperation]) -> str:
+    """Deterministic fingerprint of a proposed repair's actual content,
+    independent of surrounding workspace state.
+
+    Phase 4.24: the Orchestrator's single-turn repair loop has had duplicate-
+    patch detection since Phase 4.5 (see RecoveryState.is_duplicate_patch /
+    normalize_diff_for_signature in models.py), but MultiTurnImplementationAgent's
+    REPAIRING stage had none at all -- only the turn-count budget
+    (max_repair_turns) bounded it, so a provider that regenerates the exact
+    same ineffective patch on every attempt could silently burn the entire
+    repair budget on one distinct attempt instead of `max_repair_turns`
+    genuinely different ones. This can't reuse `_compute_workspace_diff` /
+    `normalize_diff_for_signature` for the signature: `_compute_workspace_diff`
+    returns the *whole-repository* `git diff` when the project is a git repo,
+    which grows every turn regardless of what this specific repair changed --
+    comparing that across turns would never detect a real repeat. Hashing the
+    proposed FileOperations' own content directly is scoped correctly to
+    "what did THIS repair attempt actually propose".
+    """
+    parts: list[str] = []
+    for op in sorted(ops, key=lambda o: (getattr(o, "path", "") or "", getattr(o, "action", "") or "")):
+        body = (getattr(op, "content", None) or getattr(op, "patch", None) or "").strip()
+        parts.append(f"{getattr(op, 'action', '')}\0{getattr(op, 'path', '')}\0{body}")
+    normalized = "\n".join(parts)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
 class MultiTurnImplementationAgent:
     """Bounded, autonomous multi-turn implementation agent with evidence lifecycle.
 
@@ -447,6 +474,22 @@ class MultiTurnImplementationAgent:
         repair_turn_count = sum(1 for t in turns if t.stage == MultiTurnState.REPAIRING.value)
         review_turn_count = sum(1 for t in turns if t.stage == MultiTurnState.REVIEWING.value)
         verification_turn_count = sum(1 for t in turns if t.stage == MultiTurnState.VERIFYING.value)
+        # Phase 4.24: anti-repeat history for the REPAIRING stage, recomputed
+        # from persisted turn history on resume (same pattern as
+        # repair_turn_count above) so a checkpoint resume doesn't forget
+        # which repairs were already tried and reopen an already-exhausted
+        # repetition.
+        repair_patch_hashes: set[str] = set()
+        for t in turns:
+            if t.stage == MultiTurnState.REPAIRING.value and t.file_operations:
+                try:
+                    reconstructed = [
+                        FileOperation(**op) if isinstance(op, dict) else op
+                        for op in t.file_operations
+                    ]
+                    repair_patch_hashes.add(_repair_ops_signature(reconstructed))
+                except (TypeError, ValueError):
+                    pass
 
         last_failure = failure
         last_review = review
@@ -861,6 +904,24 @@ class MultiTurnImplementationAgent:
                     )
                     current_state = MultiTurnState.ANALYZING_FAILURE
                     continue
+
+                # Phase 4.24: reject an exact repeat of a previously-tried
+                # repair before writing it again -- see _repair_ops_signature
+                # for why the Orchestrator's existing anti-repeat mechanism
+                # (Phase 4.5) can't simply be reused here as-is.
+                repair_sig = _repair_ops_signature(ops)
+                if repair_sig in repair_patch_hashes:
+                    emit(f"Repeated identical repair patch detected (signature {repair_sig}); stopping to prevent loop.")
+                    turn.failures_detected = [{"type": "repeated_repair", "error": "Identical repair patch generated without progress"}]
+                    turn.status = "failed"
+                    turn.error_message = "Repeated identical repair patch generated without progress."
+                    turns.append(turn)
+                    current_state = MultiTurnState.FAILED
+                    termination_reason = "repeated_repair_detected"
+                    error_message = turn.error_message
+                    self._checkpoint(task, subtask, turns, turn, MultiTurnState.FAILED, context, evidence_store, final_assessment, clarification_requests)
+                    break
+                repair_patch_hashes.add(repair_sig)
 
                 applied, apply_err = self._apply_file_operations(ops, plan)
                 if not applied:

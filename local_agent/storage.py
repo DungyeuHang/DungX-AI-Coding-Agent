@@ -56,7 +56,7 @@ class TaskStorage(ABC):
     def list_checkpoints_for_task(self, task_id: str) -> list[Checkpoint]:
         return []
 
-    def load_latest_checkpoint(self, task_id: str) -> Checkpoint | None:
+    def load_latest_checkpoint(self, task_id: str, subtask_id: str | None = None) -> Checkpoint | None:
         return None
 
     @abstractmethod
@@ -215,7 +215,12 @@ class JsonFileStorage(TaskStorage):
             with path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             return Checkpoint.from_dict(data)
-        except (json.JSONDecodeError, KeyError) as e:
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            # TypeError covers Checkpoint.from_dict's `cls(**d)` call raising on
+            # a schema-mismatched or corrupted record (a required field like
+            # current_state_description missing, or an unexpected key from a
+            # different schema version) -- classified as the same "malformed
+            # data" condition as unparseable JSON, not a crash.
             raise ValueError(f"Failed to load checkpoint {checkpoint_id} due to malformed data: {e}")
 
     def list_checkpoints_for_task(self, task_id: str) -> list[Checkpoint]:
@@ -230,8 +235,10 @@ class JsonFileStorage(TaskStorage):
         checkpoints.sort(key=lambda c: (c.timestamp, c.checkpoint_id))
         return checkpoints
 
-    def load_latest_checkpoint(self, task_id: str) -> Checkpoint | None:
+    def load_latest_checkpoint(self, task_id: str, subtask_id: str | None = None) -> Checkpoint | None:
         cps = self.list_checkpoints_for_task(task_id)
+        if subtask_id is not None:
+            cps = [cp for cp in cps if cp.subtask_id == subtask_id]
         return cps[-1] if cps else None
 
     def save_scheduler_state(self, state: SchedulerState) -> None:
